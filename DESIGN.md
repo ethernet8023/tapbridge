@@ -8,7 +8,7 @@ Earlier sources stay at `../2fa-sync-before-rebuild` (historical evidence, not p
 
 - **Windows desktop app** (`crates/desktop`, binary `tapbridge.exe`): tray icon (`tray-icon`), gpui windows only where UI is needed (pairing QR, status). Runs the host service, attaches the bundled usbip-win2 client to `127.0.0.1:3240` busid `1-1`, detaches on quit. Starts at login. Single instance. Supersedes the old `tapbridge-host` CLI.
 - **Host library** (`crates/host`): USB/IP/CCID reader, phone session service, DPAPI-protected state. No CLI.
-- **Android app** (`android/`, `dev.tapbridge.app`, Play Store): Jetpack Compose + Material 3, motion graphics, CameraX + ML Kit QR pairing, FCM wake, registered keys.
+- **Android app** (`android/`, package `computer.ethernet.tapbridge`, Play Store): Jetpack Compose + Material 3, motion graphics, CameraX + ML Kit QR pairing, FCM wake, registered keys.
 - **Phone native** (`crates/phone`): Rust JNI endpoint/session runtime. Kotlin owns NFC, lifecycle and notifications. One native library, no C++ wrapper.
 - **Relay** (`relay/`): Cloudflare Worker that turns a desktop wake request into an FCM high-priority data message. It holds the FCM service account; the desktop never does.
 - **Installer** (`installer/`): Inno Setup, x64 + arm64, bundles the pinned, hash-checked official usbip-win2 installer (BSD-2, WHLK-signed drivers) and runs it silently when the driver is missing.
@@ -17,11 +17,11 @@ Earlier sources stay at `../2fa-sync-before-rebuild` (historical evidence, not p
 
 No always-on phone connection: iroh heartbeats every 5 s (`iroh/src/socket.rs` `HEARTBEAT_INTERVAL`) would keep the cellular radio awake. The phone connects on demand:
 
-1. Trigger on the PC: the Windows Security security-key dialog appears (WinEvent hook), or the user picks "Request tap" in the tray. Generic CCID polling does not identify a WebAuthn ceremony, so the trigger is UI-level.
+1. Trigger on the PC: Windows starts a WebAuthn ceremony, or the user picks "Request tap" in the tray. Generic CCID polling does not identify a ceremony, so the desktop subscribes (`EvtSubscribe`, no elevation) to the `Microsoft-Windows-WebAuthN/Operational` log for event 1000 (MakeCredential started) and 1003 (GetAssertion started). Measured on build 28120. The dialog window is not used as a signal: `CredentialUIBroker.exe` (class `Credential Dialog Xaml Host`, title "Windows Security") also hosts password prompts, and its content is not readable by UI Automation from another process.
 2. If a phone session is already live, the host sends `ReadCard` (phone shows "tap now"). Otherwise, if a push token is stored, the desktop POSTs `{token, host, hint}` to the relay.
 3. Relay sends an FCM data message (`priority: high`, `ttl: 60s`): `{"t":"wake","host":ID,"hint":HINT}`.
 4. Phone checks `host` == paired host (anything else is dropped), starts a `connectedDevice` foreground service, connects using the hint, posts a heads-up "Tap your key for <PC>" notification, and enables the NFC tap gate for 120 s.
-5. Session idles out 60 s after the last card/APDU activity; the service stops and the gate is disabled.
+5. Session idles out 60 s after the last card/APDU activity (or after connect, if nothing happens) while the app is not visible; the service stops and the gate is disabled. A visible app keeps its session.
 
 The wake message is an unauthenticated hint. Authority is always the iroh-authenticated pinned identity. A forged wake can at most make the phone dial its own paired PC.
 
@@ -53,7 +53,7 @@ Host state is DPAPI-protected (`%LOCALAPPDATA%\tapbridge`): host key, paired pho
 
 ## Relay API
 
-`POST /v1/wake`, JSON `{"token": str<=4096, "host": str<=128, "hint": str<=1024}`. Responses: `202` FCM accepted, `400` malformed, `429` rate limited (10/min per token), `502` FCM failure. Tokens are never logged. Secret: `FCM_SERVICE_ACCOUNT` (JSON); project id comes from it.
+`POST /v1/wake`, JSON `{"token": str<=4096, "host": str<=128, "hint": str<=1024}`. Responses: `202` FCM accepted, `400` malformed, `410` token unregistered at FCM (the phone app must connect once to send a fresh token), `429` rate limited (10/min per token; the limiter key is the SHA-256 of the token), `502` FCM/OAuth failure. Tokens are never logged. Secret: `FCM_SERVICE_ACCOUNT` (JSON); project id comes from it.
 
 ## Reader invariants
 

@@ -1,13 +1,14 @@
 //! Blocking interface for the Android-owned connection and NFC workers.
 //! Kotlin owns tag lifecycle; this module owns only encrypted network I/O.
 use iroh::{
-    Endpoint, EndpointId, SecretKey,
+    Endpoint, SecretKey,
     endpoint::{Connection, RecvStream, SendStream},
 };
 use std::{io, sync::Mutex, time::Duration};
 use tapbridge_core::{
     pairing::Invitation,
     transport,
+    wake::Hint,
     wire::{self, Frame},
 };
 
@@ -23,45 +24,59 @@ pub struct Session {
     connection: Connection,
     reader: Mutex<RecvStream>,
     writer: Mutex<SendStream>,
+    /// Host display name from the `Accepted` handshake reply.
+    host_name: String,
+    /// The hint text that was dialed, for the phone to cache for reconnects.
+    used_hint: String,
 }
 
 impl Session {
     /// Called on a worker thread. Keys are loaded and protected by Android.
+    ///
+    /// `hint` is a [`Hint`] text form: `HOSTID[;r=RELAY][;d=IP:PORT]*`. A bare
+    /// host id is a valid hint. An empty hint (paired reconnect without a
+    /// cached address) dials the host id alone, letting iroh discovery and
+    /// relays locate the PC.
     pub fn connect(
         key: [u8; 32],
-        host: &str,
+        hint: &str,
         invitation: &str,
         name: &str,
         push: Option<String>,
     ) -> io::Result<Self> {
-        let host: EndpointId = host
-            .parse()
-            .map_err(|_| io::Error::other("invalid host identity"))?;
+        let parsed: Hint = if hint.is_empty() {
+            return Err(io::Error::other("no cached host hint"));
+        } else {
+            hint.parse::<Hint>()
+                .map_err(|_| io::Error::other("invalid wake hint"))?
+        };
         let capability = if invitation.is_empty() {
             None
         } else {
             let invitation = Invitation::parse(invitation).map_err(io::Error::other)?;
-            if invitation.host_id() != host {
+            if invitation.host_id() != parsed.host {
                 return Err(io::Error::other("invitation host mismatch"));
             }
             Some(invitation.capability())
         };
-        Self::connect_to(
+        let (session, _) = Self::connect_to(
             transport::production_builder(&SecretKey::from_bytes(&key)),
-            host.into(),
+            parsed.endpoint_addr(),
             transport::ClientHello {
                 capability,
                 name: name.into(),
                 push,
             },
-        )
+        )?;
+        Ok(session)
     }
 
     fn connect_to(
         builder: iroh::endpoint::Builder,
         host: iroh::EndpointAddr,
         hello: transport::ClientHello,
-    ) -> io::Result<Self> {
+    ) -> io::Result<(Self, String)> {
+        let used_hint = hint_text(&host);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -75,28 +90,34 @@ impl Session {
                     .map_err(io::Error::other)?;
                 let (mut writer, mut reader) =
                     connection.open_bi().await.map_err(io::Error::other)?;
-                if !matches!(
-                    transport::client_hello(&mut writer, &mut reader, hello).await?,
-                    transport::HelloReply::Accepted { .. }
-                ) {
-                    transport::close(&connection);
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "host rejected connection",
-                    ));
-                }
-                Ok((connection, reader, writer))
+                let accepted =
+                    match transport::client_hello(&mut writer, &mut reader, hello).await? {
+                        transport::HelloReply::Accepted { host_name } => host_name,
+                        transport::HelloReply::Rejected => {
+                            transport::close(&connection);
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "host rejected connection",
+                            ));
+                        }
+                    };
+                Ok((connection, reader, writer, accepted))
             })
             .await
         });
         match connected {
-            Ok(Ok((connection, reader, writer))) => Ok(Self {
-                runtime,
-                endpoint,
-                connection,
-                reader: Mutex::new(reader),
-                writer: Mutex::new(writer),
-            }),
+            Ok(Ok((connection, reader, writer, host_name))) => Ok((
+                Self {
+                    runtime,
+                    endpoint,
+                    connection,
+                    reader: Mutex::new(reader),
+                    writer: Mutex::new(writer),
+                    host_name,
+                    used_hint: used_hint.clone(),
+                },
+                used_hint,
+            )),
             error => {
                 runtime.block_on(endpoint.close());
                 match error {
@@ -109,6 +130,17 @@ impl Session {
                 }
             }
         }
+    }
+
+    /// Host display name from the `Accepted` reply (1..=64 UTF-8 bytes).
+    pub fn host_name(&self) -> &str {
+        &self.host_name
+    }
+
+    /// Hint text actually used for the dial, so the phone can cache it and
+    /// skip discovery on later reconnects.
+    pub fn used_hint(&self) -> &str {
+        &self.used_hint
     }
 
     pub fn read(&self) -> io::Result<Frame> {
@@ -168,4 +200,9 @@ impl Drop for Session {
         self.close();
         self.runtime.block_on(self.endpoint.close());
     }
+}
+
+/// Encode the dialed address as a hint text so the phone can cache it.
+fn hint_text(addr: &iroh::EndpointAddr) -> String {
+    Hint::from_endpoint_addr(addr).to_string()
 }

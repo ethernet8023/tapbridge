@@ -17,7 +17,8 @@ fn actual_phone_session_relays_frames_and_close_unblocks_reader() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let endpoint = builder().bind().await.unwrap();
-            address_tx.send(endpoint.addr()).unwrap();
+            let addr = endpoint.addr();
+            address_tx.send(addr.clone()).unwrap();
             let conn = transport::accept(&endpoint).await.unwrap();
             let (mut send, mut recv, hello) = transport::host_receive_hello(&conn).await.unwrap();
             assert_eq!(
@@ -55,18 +56,19 @@ fn actual_phone_session_relays_frames_and_close_unblocks_reader() {
             endpoint.close().await;
         });
     });
-    let session = Arc::new(
-        Session::connect_to(
-            builder(),
-            address_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
-            transport::ClientHello {
-                capability: None,
-                name: "phone".into(),
-                push: None,
-            },
-        )
-        .unwrap(),
-    );
+    let (session, used) = Session::connect_to(
+        builder(),
+        address_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        transport::ClientHello {
+            capability: None,
+            name: "phone".into(),
+            push: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(session.host_name(), "PC");
+    assert!(!used.is_empty());
+    let session = Arc::new(session);
     session
         .send(&Frame::Card {
             generation: 1,

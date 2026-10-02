@@ -1,66 +1,93 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.util.Properties
 
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
+// The google-services plugin applies only when the real Firebase config is
+// present (gitignored, user-provided). Without it debug builds work with push
+// disabled (Hello.push = null) and release/bundle tasks fail with a clear
+// message. Never ship a fake google-services.json.
+val hasFirebaseConfig = file("google-services.json").exists()
+
+// Single source of truth for versioning.
+val tapbridgeProps = Properties().apply {
+    val f = rootProject.file("version.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+val versionCodeValue = (tapbridgeProps.getProperty("versionCode") ?: "2").toInt()
+val versionNameValue = tapbridgeProps.getProperty("versionName") ?: "0.2.0"
+
 android {
-    namespace = "dev.tapbridge.app"
-    compileSdk = 35
+    namespace = "computer.ethernet.tapbridge"
+    compileSdk = 36
     ndkVersion = "27.2.12479018"
 
     defaultConfig {
-        applicationId = "dev.tapbridge.app"
+        applicationId = "computer.ethernet.tapbridge"
         minSdk = 26
-        targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        targetSdk = 36
+        versionCode = versionCodeValue
+        versionName = versionNameValue
 
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
     }
 
-    // Task that stages the prebuilt Rust shared library
-    // (libtapbridge_phone.so, arm64-v8a, 16 KB page-aligned) into
-    // $buildDir/rustJniLibs so AGP packages it into the APK. The .so is built
-    // by the parent workspace: cargo ndk -t arm64-v8a -P26 build -p
-    // tapbridge-phone --release --locked, with
-    // CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS containing
-    // -C link-arg=-Wl,-z,max-page-size=16384, output to target/android-jni.
-    val rebuildRoot = rootDir.parentFile
-    val rustSoDir = file("$rebuildRoot/target/android-jni/arm64-v8a")
-    val jniLibsDir = file("$buildDir/rustJniLibs/arm64-v8a")
-
-    val buildRust = tasks.register<Exec>("buildRust") {
-        workingDir(rebuildRoot)
-        environment("ANDROID_NDK_HOME", android.sdkDirectory.resolve("ndk/27.2.12479018").absolutePath)
-        environment("CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS", "-C link-arg=-Wl,-z,max-page-size=16384")
-        commandLine("cargo", "ndk", "-t", "arm64-v8a", "-P", "26", "-o", file("$rebuildRoot/target/android-jni").absolutePath, "build", "-p", "tapbridge-phone", "--release", "--locked")
-    }
-    tasks.register<Copy>("stageRustJniLib") {
-        dependsOn(buildRust)
-        from(rustSoDir) { include("libtapbridge_phone.so") }
-        into(jniLibsDir)
-        inputs.file(file("$rustSoDir/libtapbridge_phone.so"))
-    }
-
-    sourceSets["main"].jniLibs.srcDir(jniLibsDir.parentFile)
-
-    tasks.matching { it.name == "mergeDebugJniLibFolders" || it.name == "mergeReleaseJniLibFolders" }.configureEach {
-        dependsOn("stageRustJniLib")
-    }
-
-    packaging {
-        jniLibs {
-            // The .so is built by cargo with 16 KB alignment; AGP just packages it.
+    // Upload-key signing reads Gradle properties (values are never printed).
+    // The keystore lives outside the repo; when the properties are missing the
+    // release build fails at the signing step with Gradle's own message.
+    signingConfigs {
+        create("upload") {
+            val props = Properties().apply {
+                val gradleUserHome = System.getenv("GRADLE_USER_HOME")
+                    ?: "${System.getProperty("user.home")}/.gradle"
+                val f = file("$gradleUserHome/gradle.properties")
+                if (f.exists()) f.inputStream().use { load(it) }
+            }
+            val store = System.getenv("TAPBRIDGE_UPLOAD_STORE_FILE")
+                ?: props.getProperty("TAPBRIDGE_UPLOAD_STORE_FILE")
+            val alias = System.getenv("TAPBRIDGE_UPLOAD_KEY_ALIAS")
+                ?: props.getProperty("TAPBRIDGE_UPLOAD_KEY_ALIAS")
+            val storePass = System.getenv("TAPBRIDGE_UPLOAD_STORE_PASSWORD")
+                ?: props.getProperty("TAPBRIDGE_UPLOAD_STORE_PASSWORD")
+            val keyPass = System.getenv("TAPBRIDGE_UPLOAD_KEY_PASSWORD")
+                ?: props.getProperty("TAPBRIDGE_UPLOAD_KEY_PASSWORD")
+            if (store != null && alias != null && storePass != null && keyPass != null) {
+                val candidates = listOf(
+                    rootProject.file(store),
+                    rootProject.file("../../" + store),
+                    rootProject.file(store.replace('\\', '/').takeLastWhile { it != '/' }),
+                )
+                storeFile = candidates.firstOrNull { it.exists() } ?: rootProject.file(store)
+                storePassword = storePass
+                keyAlias = alias
+                keyPassword = keyPass
+                enableV1Signing = false
+                enableV2Signing = true
+                enableV3Signing = true
+            }
         }
+    }
+
+    buildFeatures {
+        compose = true
+        buildConfig = true
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+            signingConfig = signingConfigs.getByName("upload")
         }
     }
 
@@ -72,11 +99,98 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    lint {
+        warningsAsErrors = false
+        abortOnError = true
+    }
+
+    sourceSets {
+        getByName("main") {
+            jniLibs.srcDir(file("$buildDir/rustJniLibs"))
+        }
+    }
+}
+
+// Task that stages the freshly built Rust shared library
+// (libtapbridge_phone.so, arm64-v8a, 16 KB page-aligned) into
+// $buildDir/rustJniLibs so AGP packages it into the APK. Built by the parent
+// workspace via cargo-ndk with -C link-arg=-Wl,-z,max-page-size=16384, output
+// to target/android-jni.
+val rebuildRoot = rootDir.parentFile
+val rustSoDir = file("$rebuildRoot/target/android-jni/arm64-v8a")
+val jniLibsDir = file("$buildDir/rustJniLibs/arm64-v8a")
+
+val buildRust = tasks.register<Exec>("buildRust") {
+    workingDir(rebuildRoot)
+    val cargoHome = System.getenv("CARGO_HOME") ?: "${System.getProperty("user.home")}/.cargo"
+    val cargoBin = if (org.gradle.internal.os.OperatingSystem.current().isWindows) "$cargoHome/bin" else "$cargoHome/bin"
+    val pathSep = if (org.gradle.internal.os.OperatingSystem.current().isWindows) ";" else ":"
+    environment("PATH", listOf(cargoBin, System.getenv("PATH")).joinToString(pathSep) { it ?: "" })
+    environment("ANDROID_NDK_HOME", android.sdkDirectory.resolve("ndk/27.2.12479018").absolutePath)
+    environment(
+        "CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS",
+        "-C link-arg=-Wl,-z,max-page-size=16384"
+    )
+    val cargo = listOf("$cargoHome/bin/cargo.exe", "$cargoHome/bin/cargo")
+        .firstOrNull { file(it).exists() } ?: "cargo"
+    commandLine(
+        cargo, "ndk", "-t", "arm64-v8a", "-P", "26",
+        "-o", file("$rebuildRoot/target/android-jni").absolutePath,
+        "build", "-p", "tapbridge-phone", "--release", "--locked"
+    )
+}
+tasks.register<Copy>("stageRustJniLib") {
+    dependsOn(buildRust)
+    from(rustSoDir) { include("libtapbridge_phone.so") }
+    into(jniLibsDir)
+    inputs.file(file("$rustSoDir/libtapbridge_phone.so"))
+}
+
+tasks.matching { it.name == "mergeDebugJniLibFolders" || it.name == "mergeReleaseJniLibFolders" }.configureEach {
+    dependsOn("stageRustJniLib")
+}
+
+// Clear failure for release packaging without Firebase config.
+tasks.matching {
+    it.name == "assembleRelease" || it.name == "bundleRelease"
+        || it.name == "assembleReleaseAndroidTest"
+}.configureEach {
+    doFirst {
+        if (!file("google-services.json").exists()) {
+            throw GradleException(
+                "Release build requires android/app/google-services.json (the Firebase " +
+                    "project config for computer.ethernet.tapbridge). Debug builds work " +
+                    "without it with push disabled (Hello.push = null). Add the real " +
+                    "config, never a fake one."
+            )
+        }
+    }
 }
 
 dependencies {
     testImplementation("junit:junit:4.13.2")
-    implementation("androidx.core:core-ktx:1.13.1")
-    implementation("androidx.appcompat:appcompat:1.7.0")
-    implementation("com.google.android.material:material:1.12.0")
+    implementation("androidx.core:core-ktx:1.15.0")
+    implementation("androidx.activity:activity-compose:1.9.3")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
+
+    val composeBom = platform("androidx.compose:compose-bom:2025.05.00")
+    implementation(composeBom)
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material:material-icons-extended")
+    debugImplementation("androidx.compose.ui:ui-tooling")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
+
+    implementation("androidx.camera:camera-core:1.3.4")
+    implementation("androidx.camera:camera-camera2:1.3.4")
+    implementation("androidx.camera:camera-lifecycle:1.3.4")
+    implementation("androidx.camera:camera-view:1.3.4")
+
+    implementation("com.google.mlkit:barcode-scanning:17.3.0")
+
+    // Firebase (FCM wake), aligned via BoM.
+    implementation(platform("com.google.firebase:firebase-bom:33.9.0"))
+    implementation("com.google.firebase:firebase-messaging-ktx")
 }

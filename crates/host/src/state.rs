@@ -1,4 +1,9 @@
 //! One atomic host identity/pairing record, protected by the operating system.
+//!
+//! Record format `TBID2` (plaintext before DPAPI):
+//! `"TBID2" | key[32] | peer_flag | peer[32]? | name_len(u16) name | push_len(u16) push`
+//! The name and push fields are present only when a peer is recorded.
+//! No migration: the product is unreleased; a `TBID1` record is corrupt state.
 
 use iroh::{EndpointId, SecretKey};
 use std::{
@@ -10,6 +15,10 @@ use std::{
 pub struct Store {
     pub key: SecretKey,
     pub peer: Option<EndpointId>,
+    /// Phone display name from the newest accepted Hello, if stored.
+    pub peer_name: Option<String>,
+    /// Newest push token from any accepted Hello, if stored.
+    pub push_token: Option<String>,
     path: PathBuf,
 }
 
@@ -26,22 +35,58 @@ impl Store {
             Ok(data) => {
                 let mut plain = unprotect(&data)?;
                 let result = (|| {
-                    if plain.len() != 38 && plain.len() != 70 {
-                        return Err(invalid());
-                    }
-                    if &plain[..5] != b"TBID1" {
+                    if plain.len() < 38 || &plain[..5] != b"TBID2" {
                         return Err(invalid());
                     }
                     let key = SecretKey::from_bytes(plain[5..37].try_into().unwrap());
-                    let peer = match (plain[37], plain.len()) {
-                        (0, 38) => None,
-                        (1, 70) => Some(
-                            EndpointId::from_bytes(plain[38..].try_into().unwrap())
-                                .map_err(|_| invalid())?,
-                        ),
-                        _ => return Err(invalid()),
+                    let mut store = Self {
+                        key,
+                        peer: None,
+                        peer_name: None,
+                        push_token: None,
+                        path,
                     };
-                    Ok(Self { key, peer, path })
+                    match (plain[37], plain.len()) {
+                        (0, 38) => {}
+                        (1, _) if plain.len() >= 70 => {
+                            store.peer = Some(
+                                EndpointId::from_bytes(plain[38..70].try_into().unwrap())
+                                    .map_err(|_| invalid())?,
+                            );
+                            let mut at = 70usize;
+                            while at < plain.len() {
+                                let Some(len) = read_u16(&plain[at..]) else {
+                                    return Err(invalid());
+                                };
+                                at += 2;
+                                if at + len > plain.len() {
+                                    return Err(invalid());
+                                }
+                                if len > 0 {
+                                    let bytes = &plain[at..at + len];
+                                    if store.peer_name.is_none() {
+                                        store.peer_name = Some(
+                                            std::str::from_utf8(bytes)
+                                                .map_err(|_| invalid())?
+                                                .to_owned(),
+                                        );
+                                    } else {
+                                        store.push_token = Some(
+                                            std::str::from_utf8(bytes)
+                                                .map_err(|_| invalid())?
+                                                .to_owned(),
+                                        );
+                                    }
+                                }
+                                at += len;
+                            }
+                            if at != plain.len() {
+                                return Err(invalid());
+                            }
+                        }
+                        _ => return Err(invalid()),
+                    }
+                    Ok(store)
                 })();
                 plain.fill(0);
                 result
@@ -50,27 +95,70 @@ impl Store {
                 let store = Self {
                     key: SecretKey::generate(),
                     peer: None,
+                    peer_name: None,
+                    push_token: None,
                     path,
                 };
-                store.persist(None, true)?;
+                store.persist(&Record::default(), true)?;
                 Ok(store)
             }
             Err(e) => Err(e),
         }
     }
 
+    /// Pair with `peer`, dropping any remembered phone name or push token.
     pub fn set_peer(&mut self, peer: Option<EndpointId>) -> io::Result<()> {
-        self.persist(peer, false)?;
+        let record = Record {
+            peer,
+            name: None,
+            push: None,
+        };
+        self.persist(&record, false)?;
         self.peer = peer;
+        self.peer_name = None;
+        self.push_token = None;
         Ok(())
     }
 
-    fn persist(&self, peer: Option<EndpointId>, create: bool) -> io::Result<()> {
-        let mut plain = b"TBID1".to_vec();
+    /// Persist the newest phone name and/or push token from an accepted Hello.
+    pub fn set_phone_info(
+        &mut self,
+        peer: Option<EndpointId>,
+        name: Option<&str>,
+        push: Option<&str>,
+    ) -> io::Result<()> {
+        if peer.is_none() && name.is_none() && push.is_none() {
+            return Ok(());
+        }
+        let peer = peer.or(self.peer);
+        let name = name.or(self.peer_name.as_deref());
+        let push = push.or(self.push_token.as_deref());
+        let record = Record {
+            peer,
+            name: name.map(str::to_owned),
+            push: push.map(str::to_owned),
+        };
+        self.persist(&record, false)?;
+        self.peer = peer;
+        self.peer_name = name.map(str::to_owned);
+        self.push_token = push.map(str::to_owned);
+        Ok(())
+    }
+
+    fn persist(&self, record: &Record, create: bool) -> io::Result<()> {
+        let mut plain = b"TBID2".to_vec();
         plain.extend_from_slice(&self.key.to_bytes());
-        plain.push(u8::from(peer.is_some()));
-        if let Some(peer) = peer {
+        plain.push(u8::from(record.peer.is_some()));
+        if let Some(peer) = record.peer {
             plain.extend_from_slice(peer.as_bytes());
+        }
+        if let Some(_peer) = record.peer {
+            for field in [record.name.as_deref(), record.push.as_deref()] {
+                write_u16(&mut plain, field.map_or(0, str::len).try_into().unwrap());
+                if let Some(field) = field {
+                    plain.extend_from_slice(field.as_bytes());
+                }
+            }
         }
         let protected = protect(&plain);
         plain.fill(0);
@@ -89,6 +177,24 @@ impl Store {
         fs::File::open(parent)?.sync_all()?;
         Ok(())
     }
+}
+
+#[derive(Default)]
+struct Record {
+    peer: Option<EndpointId>,
+    name: Option<String>,
+    push: Option<String>,
+}
+
+fn write_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn read_u16(input: &[u8]) -> Option<usize> {
+    if input.len() < 2 {
+        return None;
+    }
+    Some(u16::from_le_bytes([input[0], input[1]]) as usize)
 }
 
 fn invalid() -> io::Error {
@@ -210,6 +316,8 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         assert_eq!(store.key.public(), id);
         assert!(store.peer.is_none());
+        assert!(store.peer_name.is_none());
+        assert!(store.push_token.is_none());
     }
 
     #[cfg(windows)]
@@ -220,7 +328,8 @@ mod tests {
         let disk = fs::read(dir.path().join("identity.bin")).unwrap();
         assert!(!disk.windows(32).any(|bytes| bytes == store.key.to_bytes()));
         assert!(!disk.starts_with(b"TBID1"));
-        assert_eq!(&unprotect(&disk).unwrap()[..5], b"TBID1");
+        assert!(!disk.starts_with(b"TBID2"));
+        assert_eq!(&unprotect(&disk).unwrap()[..5], b"TBID2");
     }
 
     #[test]
@@ -235,5 +344,72 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         assert_eq!(store.key.public(), id);
         assert_eq!(store.peer, Some(peer));
+    }
+
+    #[test]
+    fn phone_name_and_push_token_persist_and_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = SecretKey::generate().public();
+        {
+            let mut store = Store::open(dir.path()).unwrap();
+            store.set_peer(Some(peer)).unwrap();
+            store
+                .set_phone_info(None, Some("Pixel 9"), Some("fcm-token-1"))
+                .unwrap();
+        }
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.peer, Some(peer));
+        assert_eq!(store.peer_name.as_deref(), Some("Pixel 9"));
+        assert_eq!(store.push_token.as_deref(), Some("fcm-token-1"));
+    }
+
+    #[test]
+    fn newest_accepted_hello_name_and_token_win() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = SecretKey::generate().public();
+        let mut store = Store::open(dir.path()).unwrap();
+        store
+            .set_phone_info(Some(peer), Some("Pixel 9"), Some("tok-1"))
+            .unwrap();
+        store
+            .set_phone_info(None, Some("Renamed"), Some("tok-2"))
+            .unwrap();
+        assert_eq!(store.peer_name.as_deref(), Some("Renamed"));
+        assert_eq!(store.push_token.as_deref(), Some("tok-2"));
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.peer_name.as_deref(), Some("Renamed"));
+        assert_eq!(store.push_token.as_deref(), Some("tok-2"));
+    }
+
+    #[test]
+    fn set_peer_clears_remembered_phone_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let peer = SecretKey::generate().public();
+        store
+            .set_phone_info(Some(peer), Some("Pixel 9"), Some("tok"))
+            .unwrap();
+        let new_peer = SecretKey::generate().public();
+        store.set_peer(Some(new_peer)).unwrap();
+        assert!(store.peer_name.is_none());
+        assert!(store.push_token.is_none());
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.peer, Some(new_peer));
+        assert!(store.peer_name.is_none());
+        assert!(store.push_token.is_none());
+    }
+
+    #[test]
+    fn token_can_persist_without_pairing_yet() {
+        // A pinned phone cannot exist before pairing, but the API must not
+        // silently drop a push-only update when called defensively.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let peer = SecretKey::generate().public();
+        store
+            .set_phone_info(Some(peer), Some("Pixel"), Some("tok"))
+            .unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.push_token.as_deref(), Some("tok"));
     }
 }

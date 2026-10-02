@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+exclude = ["tools"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,4 +15,6 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-threa
 
 [profile.release]
 strip = "debuginfo"
-lto = "thin"
+# lto = "thin" crashes rustc (0xc0000005 STATUS_ACCESS_VIOLATION) linking
+# tapbridge.exe on rustc 1.98.0 aarch64-pc-windows-msvc; LTO off builds clean.
+lto = "off"

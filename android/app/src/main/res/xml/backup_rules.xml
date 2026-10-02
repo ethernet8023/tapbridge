@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Exclude everything from cloud backup / device transfer: the pairing
+     identity is Android Keystore-wrapped and MUST NOT be restored (a restored
+     ciphertext without the in-device wrapping key is corrupt state). -->
+<full-backup-content>
+    <exclude domain="sharedpref" path="." />
+</full-backup-content>

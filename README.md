@@ -1,45 +1,59 @@
 # tapbridge
 
-Use an Android phone as the NFC reader for a Windows PC. The physical FIDO card remains the authenticator. APDUs and response status words cross an authenticated, encrypted iroh connection unchanged.
+Use your Android phone as the NFC reader for your Windows PC. You tap your FIDO security key (card) on the phone, and Windows signs you in as if the key were plugged into the PC. The key does all the cryptography. tapbridge only carries the card commands, unchanged, over an encrypted connection.
+
+## How it works
+
+- **PC:** the tapbridge tray app makes Windows see a smart-card reader (USB/IP, loopback only). When Windows asks for a security key, the app wakes your phone.
+- **Phone:** the app is closed until it is needed. A push message (FCM) wakes it. It connects to your PC, shows "Tap your key", and sends the card commands both ways.
+- **Relay:** a small Cloudflare Worker sends the push message. It sees only "wake phone X for PC Y", never card data.
+
+Nothing stays connected while you are not signing in, so tapbridge does not drain the phone battery.
+
+## Install
+
+1. On the PC, run `tapbridge-<version>-<arch>-setup.exe` (arm64 or x64). It also installs the usbip-win2 USB/IP driver if it is missing. tapbridge starts at login and shows a tray icon.
+2. On the phone, install tapbridge from Google Play.
+3. On the PC, select tray icon → **Pair phone...**. On the phone, scan the QR code. The code works once and expires after 5 minutes.
+4. On the phone, open **Keys** → **Add key** and tap your security key. Only registered keys open the app when the PC asks for a tap.
+
+## Use
+
+1. Start a sign-in that asks for a security key (passkey) on the PC.
+2. Your phone shows "Tap your security key". Unlock the phone (most phones turn NFC off while locked).
+3. Hold the key against the back of the phone until Windows finishes.
+
+You can also open the phone app first, or select tray icon → **Request tap**.
+
+## Security
+
+- Each PC and phone has its own identity key. The PC key is protected by Windows DPAPI. The phone key is wrapped by Android Keystore and is not backed up.
+- A pairing works only for the one phone that scanned the QR code. To pair again, select **Forget phone** first.
+- The iroh connection is end-to-end encrypted. Public iroh relays and the wake relay see connection metadata only.
+- Logs never contain keys, invitations, push tokens, PINs or card data.
+
+## Limits
+
+- Windows PCs only (usbip-win2). Android phones with NFC only.
+- NFC-A ISO-DEP keys are supported. NFC-B is not.
+- Android shows the tap request as a notification. It cannot open an app over the lockscreen by itself.
+- A wake needs Google Play services on the phone. Without it, open the app before you sign in.
+- PIN-protected keys: on the tested key, Windows PIN flows fail with `PIN_AUTH_INVALID` after the PIN is accepted (cause not proven). Workaround: register the key with the phone's browser, then sign in from Windows.
 
 ## Build
 
-Requirements: Rust 1.91+, Windows C++ build tools, LLVM clang on Windows ARM64, JDK 17, Android SDK 35, NDK 27.2.12479018, and cargo-ndk. The Android target is `aarch64-linux-android`.
+Requirements: Rust 1.91+, LLVM clang and the MSVC build tools (arm64 and x64 libraries), Inno Setup 6, JDK 17, Android SDK 36 with NDK 27.2.12479018, cargo-ndk, and Node.js for the relay.
 
-- Host: `powershell -File scripts/build-host.ps1 -Release`
-- Android: `powershell -File scripts/build-android.ps1`
-- Rust tests: `powershell -File scripts/build-host.ps1 -Test`
-- Android tests/lint: from `android`, `gradlew.bat testDebugUnitTest lintDebug`
+| What | Command |
+|---|---|
+| Rust tests, clippy, fmt | `powershell -File scripts\check.ps1` |
+| Desktop installers (`dist\`) | `$env:TAPBRIDGE_RELAY_URL='https://...'; powershell -File scripts\build-desktop.ps1 -Arch both` |
+| Android tests, lint, debug APK | in `android\`: `gradlew.bat testDebugUnitTest lintDebug assembleDebug` |
+| Play bundle (AAB) | in `android\`: `gradlew.bat bundleRelease` |
+| Relay | see `relay\README.md` |
 
-Gradle builds the Rust phone library before packaging it; a stale prebuilt library is not a source dependency. Debug APK output is `android/app/build/outputs/apk/debug/app-debug.apk`. Host output is `target/release/tapbridge-host.exe`.
+Release signing reads `TAPBRIDGE_UPLOAD_*` from your user `~/.gradle/gradle.properties`. A release build fails without `android/app/google-services.json`. Neither file is in the repository.
 
-## Pair and use
+`tapbridge.exe --trace-apdu` logs one line per card command (command name and status only, never payload bytes) for debugging.
 
-1. Run `tapbridge-host pair`. Open the private HTML pairing page whose path it prints. The invitation expires after five minutes and can pair one phone.
-2. Install the debug APK on your Android phone. Paste the invitation into tapbridge and connect. Keep the host running.
-3. With usbip-win2 installed, attach once: `usbip attach -r 127.0.0.1 -b 1-1 --once`. Windows sees a CCID smart-card reader.
-4. Open tapbridge on the phone, tap and hold an NFC-A ISO-DEP FIDO card, and use the security-key flow on Windows.
-
-On later starts use `tapbridge-host run` and reconnect the paired phone. `tapbridge-host forget` explicitly revokes the pairing while retaining the host identity. Stop the host before changing its saved pairing. Use `usbip port` to find the attached port and `usbip detach -p N` to detach it.
-
-Host state lives in `%LOCALAPPDATA%/tapbridge`, or the explicit `--state-dir` directory. Windows identity/pairing is DPAPI protected; Android identity is Android Keystore wrapped and excluded from backup. Keep invitations private. Logs must not contain keys, capabilities, PINs, APDUs, or credential data.
-
-## Debugging a card exchange
-
-`tapbridge-host run --trace-apdu` (off by default) prints one stderr line per APDU between PC and phone: CLA/INS, the CTAP2 command name, status words and CTAP status such as `NO_CREDENTIALS`. It never prints payload bytes, credential ids, or PIN material.
-
-## Known issue: PIN-protected cards
-
-On the tested card, Windows' PIN-authenticated flows (registering a key, or sites requiring user verification) stall: after the PIN is accepted, the card rejects Windows's second command with `PIN_AUTH_INVALID`. The trace shows no altered data; this looks like a Windows/card interaction, not proven. Workaround: register the card from the phone (Chrome with NFC, enter the PIN there), then sign in from Windows through tapbridge. A card that does not hold a site's credential makes Windows say "this security key doesn't look familiar".
-
-## Limits and verification
-
-- This is a development build, not a signed production release or an audited authentication product.
-- NFC reader mode requires the Android Activity to be open. A foreground-service notification does not bypass the lockscreen or launch an Activity automatically.
-- NFC-A ISO-DEP is supported. NFC-B is explicitly rejected. Tag loss is reported when Android NFC I/O fails or the Activity is paused; immediate physical-removal detection between commands is not guaranteed.
-- USB/IP listens on loopback only. Wireless pairing uses iroh endpoint identities and public relay/discovery infrastructure; relays can observe traffic metadata, not plaintext card commands.
-- Windows ARM64 release executable and Android ARM64 APK have been built. Native ELF and APK alignment have been checked for 16 KB pages.
-- A real usbip-win2 attachment enumerated `Microsoft Usbccid Smartcard Reader (WUDF)` with status OK, VID 1209/PID 7A71; the verification attachment was detached afterward.
-- Full wireless phone/card authentication has not been verified. No phone is currently attached to the build machine's ADB server. Protocol tests are not proof of a completed FIDO ceremony.
-
-See `DESIGN.md` for the replacement design. The previous implementation and recovered historical notes are preserved separately rather than mixed into the new runtime.
+See `DESIGN.md` for the protocol and design, and `VERIFICATION.md` for what was tested and what was not.

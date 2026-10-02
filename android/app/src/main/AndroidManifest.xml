@@ -6,14 +6,18 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
-    <!-- Prerequisite for the connectedDevice foreground service type -->
-    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
 
     <uses-feature android:name="android.hardware.nfc" android:required="true" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <application
         android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
         android:label="TapBridge"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:enableOnBackInvokedCallback="true"
         android:theme="@style/Theme.TapBridge"
         android:usesCleartextTraffic="false">
 
@@ -28,9 +32,44 @@
             </intent-filter>
         </activity>
 
+        <!--
+          NFC tap gate: TECH_DISCOVERED dispatch happens through this alias
+          which is DISABLED by default. It is enabled only during a wake
+          window (PackageManager.setComponentEnabledSetting, DONT_KILL_APP).
+          The NFC permission satisfies the API 34 connectedDevice FGS
+          prerequisite. See DESIGN "Registered keys and the tap gate".
+        -->
+        <activity
+            android:name=".TapGateActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@style/Theme.TapBridge.Translucent" />
+
+        <activity-alias
+            android:name=".TapGate"
+            android:targetActivity=".TapGateActivity"
+            android:exported="true"
+            android:enabled="false">
+            <intent-filter>
+                <action android:name="android.nfc.action.TECH_DISCOVERED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.nfc.action.TECH_DISCOVERED"
+                android:resource="@xml/nfc_tech_filter" />
+        </activity-alias>
+
         <service
             android:name=".TapBridgeService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+
+        <service
+            android:name=".WakeService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

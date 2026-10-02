@@ -3,7 +3,7 @@ use crate::Session;
 use jni::{
     JNIEnv,
     objects::{GlobalRef, JByteArray, JClass, JObject, JString, JValue},
-    sys::{jboolean, jbyteArray, jint, jlong},
+    sys::{jboolean, jbyteArray, jint, jlong, jstring},
 };
 use std::{
     io,
@@ -28,7 +28,7 @@ unsafe fn session<'a>(handle: jlong) -> io::Result<&'a Session> {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tapbridge_app_NativeBridge_initialize(
+pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_initialize(
     mut env: JNIEnv,
     _class: JClass,
     context: JObject,
@@ -54,7 +54,7 @@ pub extern "system" fn Java_dev_tapbridge_app_NativeBridge_initialize(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tapbridge_app_NativeBridge_generateKey(
+pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_generateKey(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jbyteArray {
@@ -68,27 +68,30 @@ pub extern "system" fn Java_dev_tapbridge_app_NativeBridge_generateKey(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tapbridge_app_NativeBridge_connect(
+pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_connect(
     mut env: JNIEnv,
     _class: JClass,
     key: JByteArray,
-    host: JString,
+    hint: JString,
     invitation: JString,
+    name: JString,
+    push_token: JString,
 ) -> jlong {
     let result = (|| -> Result<Session, Box<dyn std::error::Error>> {
         let bytes = env.convert_byte_array(key)?;
         let key: [u8; 32] = bytes
             .try_into()
             .map_err(|_| "identity must contain 32 bytes")?;
-        let host: String = env.get_string(&host)?.into();
+        let hint: String = env.get_string(&hint)?.into();
         let invitation: String = env.get_string(&invitation)?.into();
-        Ok(Session::connect(
-            key,
-            &host,
-            &invitation,
-            "Android phone",
-            None,
-        )?)
+        let name: String = env.get_string(&name)?.into();
+        let push_token: String = env.get_string(&push_token)?.into();
+        let push = if push_token.is_empty() {
+            None
+        } else {
+            Some(push_token)
+        };
+        Ok(Session::connect(key, &hint, &invitation, &name, push)?)
     })();
     match result {
         Ok(session) => Box::into_raw(Box::new(session)) as jlong,
@@ -99,8 +102,53 @@ pub extern "system" fn Java_dev_tapbridge_app_NativeBridge_connect(
     }
 }
 
+/// Host display name from the `Accepted` handshake reply.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tapbridge_app_NativeBridge_read(
+pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_hostName(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jstring {
+    match unsafe { session(handle) } {
+        Ok(s) => match env.new_string(s.host_name()) {
+            Ok(text) => text.into_raw(),
+            Err(error) => {
+                report(&mut env, error);
+                std::ptr::null_mut()
+            }
+        },
+        Err(error) => {
+            report(&mut env, error);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Hint text actually used for the dial, so Kotlin can cache it for later
+/// reconnects instead of re-discovering the host every time.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_usedHint(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jstring {
+    match unsafe { session(handle) } {
+        Ok(s) => match env.new_string(s.used_hint()) {
+            Ok(text) => text.into_raw(),
+            Err(error) => {
+                report(&mut env, error);
+                std::ptr::null_mut()
+            }
+        },
+        Err(error) => {
+            report(&mut env, error);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_read(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -146,7 +194,7 @@ pub extern "system" fn Java_dev_tapbridge_app_NativeBridge_read(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tapbridge_app_NativeBridge_card(
+pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_card(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -169,7 +217,7 @@ pub extern "system" fn Java_dev_tapbridge_app_NativeBridge_card(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tapbridge_app_NativeBridge_response(
+pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_response(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -192,7 +240,7 @@ pub extern "system" fn Java_dev_tapbridge_app_NativeBridge_response(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tapbridge_app_NativeBridge_failed(
+pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_failed(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -211,7 +259,7 @@ pub extern "system" fn Java_dev_tapbridge_app_NativeBridge_failed(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tapbridge_app_NativeBridge_close(
+pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_close(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -223,7 +271,7 @@ pub extern "system" fn Java_dev_tapbridge_app_NativeBridge_close(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tapbridge_app_NativeBridge_release(
+pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_release(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,

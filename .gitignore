@@ -12,3 +12,7 @@
 *.keystore
 /dist/
 /android/app/google-services.json
+/tools/*/target/
+/installer/usbip/*.exe
+/relay/node_modules/
+/relay/dist/

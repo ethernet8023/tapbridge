@@ -1,4 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">TapBridge</string>
+    <string name="wake_title">Tap your security key</string>
+    <string name="wake_body">Your PC is waiting — tap your key on this phone</string>
+    <string name="wake_body_named">%1$s is waiting — tap your key on this phone</string>
 </resources>

@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Themed (monochrome) icon: the glyph only. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="1024"
+    android:viewportHeight="1024">
+    <group
+        android:scaleX="0.72"
+        android:scaleY="0.72"
+        android:pivotX="512"
+        android:pivotY="512">
+        <group
+            android:rotation="-14"
+            android:pivotX="412"
+            android:pivotY="562">
+            <path
+                android:pathData="M318,362 H506 A56,56 0 0 1 562,418 V706 A56,56 0 0 1 506,762 H318 A56,56 0 0 1 262,706 V418 A56,56 0 0 1 318,362 Z"
+                android:strokeColor="#FFFFFFFF"
+                android:strokeWidth="64"
+                android:strokeLineCap="round"
+                android:fillColor="#00000000" />
+        </group>
+        <path
+            android:pathData="M610,400 a150,150 0 0,1 0,212"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="64"
+            android:strokeLineCap="round"
+            android:fillColor="#00000000" />
+        <path
+            android:pathData="M690,330 a250,250 0 0,1 0,352"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="64"
+            android:strokeLineCap="round"
+            android:fillColor="#00000000" />
+        <path
+            android:pathData="M770,260 a350,350 0 0,1 0,492"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeAlpha="0.55"
+            android:strokeWidth="64"
+            android:strokeLineCap="round"
+            android:fillColor="#00000000" />
+    </group>
+</vector>

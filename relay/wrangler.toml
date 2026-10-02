@@ -1,0 +1,8 @@
+name = "tapbridge-relay"
+main = "src/worker.ts"
+compatibility_date = "2026-10-02"
+
+[[ratelimits]]
+name = "WAKE_LIMIT"
+namespace_id = "tapbridge_wake_v1"
+simple = { limit = 10, period = 60 }

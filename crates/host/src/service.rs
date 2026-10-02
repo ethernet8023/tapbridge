@@ -1,0 +1,737 @@
+//! Joins authenticated phone sessions to the local reader, behind a service
+//! API the desktop drives. No CLI lives here.
+//!
+//! Threading model: [`start`] is async and awaited inside the caller's
+//! runtime (the desktop drives it from one dedicated runtime thread). The
+//! returned [`ServiceHandle`] is fully synchronous — plain `std` channels —
+//! so the gpui UI thread calls it directly without crossing into tokio.
+use crate::{state::Store, trace::Tracer};
+use iroh::{
+    Endpoint,
+    endpoint::{Connection, SendStream},
+};
+use std::{io, net::SocketAddr, path::PathBuf, sync::mpsc, thread, time::Duration};
+use tapbridge_core::{
+    pairing::{Invitation, PairingGate},
+    transport,
+    wake::Hint,
+    wire::{self, Frame},
+};
+use tokio::sync::{mpsc as tokio_mpsc, watch};
+
+/// Settings for [`start`].
+pub struct Settings {
+    /// `%LOCALAPPDATA%\tapbridge` in production; tests use a temp dir.
+    pub state_dir: PathBuf,
+    /// USB/IP listener address; loopback only (`127.0.0.1:3240`).
+    pub usbip_addr: SocketAddr,
+    /// Host display name sent in `Accepted` (the Windows computer name).
+    pub host_name: String,
+    /// Payload-free APDU summaries (`--trace-apdu`).
+    pub trace: bool,
+}
+
+/// Status transitions the desktop reflects in tray and windows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Event {
+    PhoneConnected {
+        name: String,
+    },
+    PhoneDisconnected,
+    CardPresent {
+        present: bool,
+    },
+    /// A previously unknown phone completed pairing.
+    PairingCompleted,
+    /// One payload-free APDU trace line (`Settings::trace` only): command
+    /// name and status, never payload bytes.
+    Trace(String),
+}
+
+/// Everything the desktop needs to draw the status line in one query.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Status {
+    pub paired: bool,
+    pub phone_connected: bool,
+    pub phone_name: Option<String>,
+    pub card_present: bool,
+    pub push_stored: bool,
+}
+
+/// What happened after a [`ServiceHandle::request_tap`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TapOutcome {
+    /// A session is live: `ReadCard` was sent; the phone shows "tap now".
+    ReadCardSent,
+    /// No live session: the desktop must POST this token and hint to the relay.
+    Wake { token: String, hint: Hint },
+    /// Not paired yet.
+    #[default]
+    NotPaired,
+    /// Paired but no push token and no live session.
+    NoPush,
+}
+
+enum Command {
+    MintInvitation(std::sync::mpsc::SyncSender<Invitation>),
+    ForgetPhone(std::sync::mpsc::SyncSender<()>),
+    RequestTap(std::sync::mpsc::SyncSender<TapOutcome>),
+    Status(std::sync::mpsc::SyncSender<Status>),
+    EndpointAddr(std::sync::mpsc::SyncSender<iroh::EndpointAddr>),
+}
+
+/// The running service. Call [`shutdown`](Self::shutdown) to stop the
+/// workers cleanly; detach usbip after it returns.
+pub struct ServiceHandle {
+    commands: std::sync::Mutex<Option<mpsc::Sender<Command>>>,
+    events: std::sync::Arc<std::sync::Mutex<mpsc::Receiver<Event>>>,
+    shutdown: watch::Sender<bool>,
+    done: std::sync::Arc<std::sync::Mutex<mpsc::Receiver<io::Result<()>>>>,
+}
+
+impl ServiceHandle {
+    /// Draining queue of transitions; call [`drain_events`](Self::drain_events).
+    pub fn drain_events(&self) -> Vec<Event> {
+        let mut events = Vec::new();
+        if let Ok(receiver) = self.events.lock() {
+            while let Ok(event) = receiver.try_recv() {
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    pub fn status(&self) -> Status {
+        self.reply(Command::Status)
+    }
+
+    /// The host's own iroh address: the wake hint source and the dial target
+    /// for a pairing phone.
+    pub fn endpoint_addr(&self) -> Option<iroh::EndpointAddr> {
+        self.reply_option(Command::EndpointAddr)
+    }
+
+    /// Mints a fresh invitation; minting again revokes the previous one.
+    /// `None` when the service has already shut down.
+    pub fn mint_invitation(&self) -> Option<Invitation> {
+        self.reply_option(Command::MintInvitation)
+    }
+
+    /// Revokes the paired phone and drops a live session.
+    pub fn forget_phone(&self) {
+        self.ack(Command::ForgetPhone);
+    }
+
+    /// The wake trigger: `ReadCard` on a live session, otherwise the stored
+    /// push token plus the current hint for a relay POST.
+    pub fn request_tap(&self) -> TapOutcome {
+        self.reply(Command::RequestTap)
+    }
+
+    /// Requests graceful shutdown and waits for the workers to finish.
+    /// Detach usbip after this returns.
+    pub fn shutdown(&self) {
+        drop(self.commands.lock().unwrap().take());
+        let mut watch = self.shutdown.subscribe();
+        // Sync wait: the caller is a UI thread, not inside a runtime.
+        while *watch.borrow_and_update() {
+            thread::sleep(Duration::from_millis(50));
+        }
+        if let Ok(done) = self.done.lock() {
+            let _ = done.recv();
+        }
+    }
+
+    fn reply<T: Default>(&self, command: fn(std::sync::mpsc::SyncSender<T>) -> Command) -> T {
+        self.reply_option(command).unwrap_or_default()
+    }
+
+    fn reply_option<T>(&self, command: fn(std::sync::mpsc::SyncSender<T>) -> Command) -> Option<T> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        {
+            let commands = self.commands.lock().unwrap();
+            let sender = commands.as_ref()?;
+            sender.send(command(tx)).ok()?;
+        }
+        rx.recv().ok()
+    }
+
+    fn ack(&self, command: fn(std::sync::mpsc::SyncSender<()>) -> Command) {
+        let _ = self.reply_option(command);
+    }
+}
+
+/// Starts the host service: USB/IP reader plus phone session owner.
+///
+/// Locks `state_dir/host.lock`, binds `usbip_addr` (loopback only) and binds
+/// the iroh endpoint. The returned handle drives everything synchronously.
+pub async fn start(settings: Settings) -> io::Result<ServiceHandle> {
+    std::fs::create_dir_all(&settings.state_dir)?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(settings.state_dir.join("host.lock"))?;
+    lock.try_lock()
+        .map_err(|_| io::Error::other("another host owns this state directory; stop it first"))?;
+    let store = Store::open(&settings.state_dir)?;
+    let listener = tokio::net::TcpListener::bind(settings.usbip_addr).await?;
+    let endpoint = transport::production_builder(&store.key)
+        .bind()
+        .await
+        .map_err(io::Error::other)?;
+    let (commands_tx, commands_ui) = mpsc::channel::<Command>();
+    let (commands_tx_tokio, commands_rx) = tokio_mpsc::channel::<Command>(16);
+    let (events_tokio_tx, mut events_tokio_rx) = tokio_mpsc::unbounded_channel::<Event>();
+    let (events_tx, events_rx) = mpsc::channel::<Event>();
+    let (stop, shutdown) = watch::channel(false);
+    let (done_tx, done_rx) = mpsc::channel::<io::Result<()>>();
+    // Detached deliberately; completion is reported through `done_tx`.
+    let run_job = tokio::spawn(run(
+        store,
+        endpoint,
+        listener,
+        settings,
+        shutdown,
+        commands_rx,
+        events_tokio_tx,
+        done_tx,
+    ));
+    drop(run_job);
+    // Forward UI commands into the tokio loop on a plain OS thread.
+    let handle = tokio::runtime::Handle::current();
+    thread::spawn(move || {
+        for command in commands_ui {
+            if handle.block_on(commands_tx_tokio.send(command)).is_err() {
+                break;
+            }
+        }
+    });
+    // Forward service events out to the UI thread.
+    thread::spawn(move || {
+        while let Some(event) = events_tokio_rx.blocking_recv() {
+            if events_tx.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    Ok(ServiceHandle {
+        commands: std::sync::Mutex::new(Some(commands_tx)),
+        events: std::sync::Arc::new(std::sync::Mutex::new(events_rx)),
+        shutdown: stop,
+        done: std::sync::Arc::new(std::sync::Mutex::new(done_rx)),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run(
+    store: Store,
+    endpoint: Endpoint,
+    listener: tokio::net::TcpListener,
+    settings: Settings,
+    shutdown: watch::Receiver<bool>,
+    commands: tokio_mpsc::Receiver<Command>,
+    events: tokio_mpsc::UnboundedSender<Event>,
+    done: mpsc::Sender<io::Result<()>>,
+) {
+    let result = run_inner(
+        store, endpoint, listener, settings, shutdown, commands, events,
+    )
+    .await;
+    let _ = done.send(result);
+}
+
+async fn run_inner(
+    mut store: Store,
+    endpoint: Endpoint,
+    listener: tokio::net::TcpListener,
+    settings: Settings,
+    mut shutdown: watch::Receiver<bool>,
+    mut commands: tokio_mpsc::Receiver<Command>,
+    events: tokio_mpsc::UnboundedSender<Event>,
+) -> io::Result<()> {
+    let mut tracer = settings.trace.then(Tracer::default);
+    let mut gate = PairingGate::new();
+    let mut handshakes = tokio::task::JoinSet::new();
+    // reader -> service (frames the reader wants on the phone stream)
+    let (to_service, mut from_reader) = tokio_mpsc::channel::<Frame>(8);
+    // service -> reader (phone frames: Card/Response/Failed)
+    let (to_reader, from_phone) = tokio_mpsc::channel::<Frame>(8);
+    let reader_task = tokio::spawn(crate::serve(
+        listener,
+        from_phone,
+        to_service,
+        shutdown.clone(),
+    ));
+    // Frames received from the phone over iroh.
+    let (received_tx, mut received) = tokio_mpsc::channel::<io::Result<Frame>>(8);
+    let mut active: Option<(Connection, SendStream, tokio::task::JoinHandle<()>)> = None;
+    let mut card_present = false;
+    let result = async {
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                command = commands.recv() => {
+                    let Some(command) = command else { break };
+                    match command {
+                        Command::MintInvitation(reply) => {
+                            let _ = reply.send(gate.mint(endpoint.id()));
+                        },
+                        Command::ForgetPhone(reply) => {
+                            store.set_peer(None)?;
+                            if active.is_some() {
+                                disconnect(&mut active, &mut received, &to_reader, &events, &mut card_present).await?;
+                            }
+                            let _ = reply.send(());
+                        },
+                        Command::RequestTap(reply) => {
+                            let outcome = if active.is_some() {
+                                let sent = send_frame(
+                                    &mut active, &mut received, &to_reader, &events,
+                                    &mut card_present, Frame::ReadCard, tracer.as_mut(),
+                                ).await?;
+                                if sent { TapOutcome::ReadCardSent } else { session_outcome(&store, &endpoint) }
+                            } else {
+                                session_outcome(&store, &endpoint)
+                            };
+                            let _ = reply.send(outcome);
+                        },
+                        Command::EndpointAddr(reply) => {
+                            let _ = reply.send(endpoint.addr());
+                        },
+                        Command::Status(reply) => {
+                            let _ = reply.send(Status {
+                                paired: store.peer.is_some(),
+                                phone_connected: active.is_some(),
+                                phone_name: store.peer_name.clone(),
+                                card_present,
+                                push_stored: store.push_token.is_some(),
+                            });
+                        },
+                    }
+                },
+                // Reader asked to put a frame on the phone stream (Apdu, ReadCard).
+                frame = from_reader.recv() => {
+                    let Some(frame) = frame else { break };
+                    let _ = send_frame(
+                        &mut active, &mut received, &to_reader, &events,
+                        &mut card_present, frame, tracer.as_mut(),
+                    ).await?;
+                },
+                connection = endpoint.accept() => {
+                    let Some(connection) = connection else { break };
+                    if handshakes.len() >= 4 { connection.refuse(); continue; }
+                    handshakes.spawn(async move {
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            let conn = connection.await.map_err(io::Error::other)?;
+                            let (send, recv, hello) = transport::host_receive_hello(&conn).await?;
+                            Ok::<_, io::Error>((conn, send, recv, hello))
+                        }).await.map_err(io::Error::other)?
+                    });
+                },
+                completed = handshakes.join_next(), if !handshakes.is_empty() => {
+                    let Some(Ok(Ok((conn, mut send, recv, Frame::Hello { capability, name, push })))) = completed else { continue; };
+                    let peer = conn.remote_id();
+                    let (authorized, paired_now) = if active.is_some() { (false, false) }
+                    else if store.peer == Some(peer) { (true, false) }
+                    else if store.peer.is_some() { (false, false) }
+                    else {
+                        match gate.authorize(peer, capability.as_ref()) {
+                            Ok(pending) => {
+                                store.set_peer(Some(peer))?;
+                                store.set_phone_info(None, Some(&name), push.as_deref())?;
+                                gate.commit(pending).map_err(io::Error::other)?;
+                                (true, true)
+                            },
+                            Err(_) => (false, false),
+                        }
+                    };
+                    if !authorized {
+                        // Rejection is terminal; no arbitrary sleep before close.
+                        let _ = tokio::time::timeout(Duration::from_secs(1), transport::reply_rejected(&mut send)).await;
+                        let _ = send.finish();
+                        let _ = tokio::time::timeout(Duration::from_secs(1), send.stopped()).await;
+                        transport::close(&conn);
+                        continue;
+                    }
+                    if paired_now {
+                        let _ = events.send(Event::PairingCompleted);
+                    }
+                    if let Err(error) = store.set_phone_info(None, Some(&name), push.as_deref()) {
+                        transport::close(&conn);
+                        return Err(error);
+                    }
+                    if !matches!(tokio::time::timeout(Duration::from_secs(2), transport::reply_accepted(&mut send, settings.host_name.clone())).await, Ok(Ok(()))) {
+                        transport::close(&conn);
+                        continue;
+                    }
+                    let tx = received_tx.clone();
+                    let reader = tokio::spawn(async move {
+                        let mut recv = recv;
+                        loop {
+                            let frame = wire::read_frame(&mut recv).await;
+                            let failed = frame.is_err();
+                            if tx.send(frame).await.is_err() || failed { break; }
+                        }
+                    });
+                    active = Some((conn, send, reader));
+                    let _ = events.send(Event::PhoneConnected { name: name.clone() });
+                    let _ = events.send(Event::CardPresent { present: false });
+                },
+                event = received.recv(), if active.is_some() => {
+                    match event {
+                        Some(Ok(frame @ (Frame::Card { .. } | Frame::Response { .. } | Frame::Failed { .. }))) => {
+                            if let Some(line) = tracer.as_mut().and_then(|t| t.observe(&frame)) { let _ = events.send(Event::Trace(line)); }
+                            if let Frame::Card { atr, .. } = &frame {
+                                card_present = !atr.is_empty();
+                                let _ = events.send(Event::CardPresent { present: card_present });
+                            }
+                            tokio::select! {
+                                result = to_reader.send(frame) => result.map_err(|_| io::Error::other("reader stopped"))?,
+                                _ = shutdown.changed() => break,
+                            }
+                        },
+                        _ => disconnect(&mut active, &mut received, &to_reader, &events, &mut card_present).await?,
+                    }
+                },
+            }
+        }
+        Ok(())
+    }.await;
+    if let Some((conn, _, reader)) = active {
+        transport::close(&conn);
+        reader.abort();
+        let _ = reader.await;
+    }
+    reader_task.abort();
+    let _ = reader_task.await;
+    handshakes.abort_all();
+    while handshakes.join_next().await.is_some() {}
+    endpoint.close().await;
+    result
+}
+
+/// The tap outcome when no session is live.
+fn session_outcome(store: &Store, endpoint: &Endpoint) -> TapOutcome {
+    if store.peer.is_none() {
+        TapOutcome::NotPaired
+    } else if let Some(token) = store.push_token.clone() {
+        TapOutcome::Wake {
+            token,
+            hint: Hint::from_endpoint_addr(&endpoint.addr()),
+        }
+    } else {
+        TapOutcome::NoPush
+    }
+}
+
+async fn disconnect(
+    active: &mut Option<(Connection, SendStream, tokio::task::JoinHandle<()>)>,
+    received: &mut tokio_mpsc::Receiver<io::Result<Frame>>,
+    to_reader: &tokio_mpsc::Sender<Frame>,
+    events: &tokio_mpsc::UnboundedSender<Event>,
+    card_present: &mut bool,
+) -> io::Result<()> {
+    if let Some((conn, _, reader)) = active.take() {
+        transport::close(&conn);
+        reader.abort();
+        let _ = reader.await;
+    }
+    while received.try_recv().is_ok() {}
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        to_reader.send(Frame::Card {
+            generation: 0,
+            atr: vec![],
+            max_apdu: 0,
+        }),
+    )
+    .await
+    .map_err(|_| io::Error::other("reader stalled"))?
+    .map_err(|_| io::Error::other("reader stopped"))?;
+    *card_present = false;
+    let _ = events.send(Event::CardPresent { present: false });
+    let _ = events.send(Event::PhoneDisconnected);
+    Ok(())
+}
+
+/// Writes one frame to the live session, disconnecting on failure. Returns
+/// whether the frame reached the stream.
+async fn send_frame(
+    active: &mut Option<(Connection, SendStream, tokio::task::JoinHandle<()>)>,
+    received: &mut tokio_mpsc::Receiver<io::Result<Frame>>,
+    to_reader: &tokio_mpsc::Sender<Frame>,
+    events: &tokio_mpsc::UnboundedSender<Event>,
+    card_present: &mut bool,
+    frame: Frame,
+    tracer: Option<&mut Tracer>,
+) -> io::Result<bool> {
+    if let Some(line) = tracer.and_then(|t| t.observe(&frame)) {
+        let _ = events.send(Event::Trace(line));
+    }
+    if let Some((_, send, _)) = active.as_mut() {
+        let sent =
+            tokio::time::timeout(Duration::from_secs(5), wire::write_frame(send, &frame)).await;
+        if !matches!(sent, Ok(Ok(()))) {
+            disconnect(active, received, to_reader, events, card_present).await?;
+            return Ok(false);
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh::{EndpointId, SecretKey};
+    use tapbridge_core::{ALPN, transport::ClientHello};
+
+    fn settings(dir: &std::path::Path, trace: bool) -> Settings {
+        Settings {
+            state_dir: dir.to_path_buf(),
+            usbip_addr: "127.0.0.1:0".parse().unwrap(),
+            host_name: "Test PC".into(),
+            trace,
+        }
+    }
+
+    async fn phone_endpoint() -> (Endpoint, EndpointId) {
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(SecretKey::generate())
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let id = endpoint.id();
+        (endpoint, id)
+    }
+
+    /// Connects a phone with the given Hello and returns the reply plus the
+    /// connection streams.
+    async fn connect_phone(
+        host_addr: &iroh::EndpointAddr,
+        hello: ClientHello,
+    ) -> (
+        transport::HelloReply,
+        iroh::endpoint::SendStream,
+        iroh::endpoint::RecvStream,
+        Endpoint,
+        Connection,
+    ) {
+        let (endpoint, _) = phone_endpoint().await;
+        let conn = endpoint.connect(host_addr.clone(), ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let reply = transport::client_hello(&mut send, &mut recv, hello)
+            .await
+            .unwrap();
+        (reply, send, recv, endpoint, conn)
+    }
+
+    fn drain(handle: &ServiceHandle) -> Vec<Event> {
+        handle.drain_events()
+    }
+
+    /// Buffered event waiter: keeps non-matching events for later waits.
+    struct Collector {
+        handle: std::sync::Arc<ServiceHandle>,
+        seen: Vec<Event>,
+    }
+
+    impl Collector {
+        async fn wait(&mut self, pred: impl Fn(&Event) -> bool) -> Event {
+            for _ in 0..200 {
+                self.seen.extend(drain(&self.handle));
+                if let Some(index) = self.seen.iter().position(&pred) {
+                    return self.seen.remove(index);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("event never arrived; seen so far: {:?}", self.seen);
+        }
+    }
+
+    async fn paired_service(
+        dir: &std::path::Path,
+        name: &str,
+        push: Option<&str>,
+    ) -> (std::sync::Arc<ServiceHandle>, Collector, PhoneSide) {
+        let handle =
+            std::sync::Arc::new(crate::service::start(settings(dir, false)).await.unwrap());
+        let host_addr = handle.endpoint_addr().unwrap();
+        let invitation = handle.mint_invitation().unwrap();
+        let (reply, send, recv, endpoint, conn) = connect_phone(
+            &host_addr,
+            ClientHello {
+                capability: Some(invitation.capability()),
+                name: name.into(),
+                push: push.map(str::to_owned),
+            },
+        )
+        .await;
+        assert_eq!(
+            reply,
+            transport::HelloReply::Accepted {
+                host_name: "Test PC".into()
+            }
+        );
+        let mut collector = Collector {
+            handle: handle.clone(),
+            seen: Vec::new(),
+        };
+        collector
+            .wait(|event| matches!(event, Event::PairingCompleted))
+            .await;
+        // The session is registered as active only after the accept handshake
+        // completes; wait for PhoneConnected so tests that call request_tap
+        // see a live session.
+        let expected_name = name.to_owned();
+        collector
+            .wait(|event| matches!(event, Event::PhoneConnected { name } if *name == expected_name))
+            .await;
+        (
+            handle,
+            collector,
+            PhoneSide {
+                endpoint,
+                conn,
+                send,
+                recv,
+            },
+        )
+    }
+
+    /// The phone half of a paired session. Keep it alive for the whole test:
+    /// dropping the streams sends STOP_SENDING/RESET and kills the session.
+    struct PhoneSide {
+        endpoint: Endpoint,
+        conn: Connection,
+        #[allow(dead_code)]
+        send: iroh::endpoint::SendStream,
+        recv: iroh::endpoint::RecvStream,
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pairing_persists_name_and_token_and_accepted_carries_host_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, _collector, phone) =
+            paired_service(dir.path(), "Pixel 9", Some("fcm-token-1")).await;
+        assert!(handle.status().paired);
+        assert!(handle.status().phone_connected);
+        assert!(handle.status().push_stored);
+        handle.shutdown();
+        transport::close(&phone.conn);
+        drop(phone.endpoint);
+        let store = Store::open(dir.path()).unwrap();
+        assert!(store.peer.is_some());
+        assert_eq!(store.peer_name.as_deref(), Some("Pixel 9"));
+        assert_eq!(store.push_token.as_deref(), Some("fcm-token-1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn request_tap_on_fresh_service_reports_not_paired() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = crate::service::start(settings(dir.path(), false))
+            .await
+            .unwrap();
+        assert_eq!(handle.request_tap(), TapOutcome::NotPaired);
+        handle.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn request_tap_without_token_reports_no_push_once_paired() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, mut collector, phone) = paired_service(dir.path(), "Pixel", None).await;
+        transport::close(&phone.conn);
+        collector
+            .wait(|event| matches!(event, Event::PhoneDisconnected))
+            .await;
+        assert_eq!(handle.request_tap(), TapOutcome::NoPush);
+        handle.shutdown();
+        drop(phone.endpoint);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn request_tap_sends_read_card_on_live_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, _collector, phone) = paired_service(dir.path(), "Pixel", Some("tok")).await;
+        let mut phone = phone;
+        assert_eq!(handle.request_tap(), TapOutcome::ReadCardSent);
+        let frame = tokio::time::timeout(Duration::from_secs(5), wire::read_frame(&mut phone.recv))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame, Frame::ReadCard);
+        handle.shutdown();
+        transport::close(&phone.conn);
+        drop(phone.endpoint);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn request_tap_without_session_returns_stored_token_and_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, mut collector, phone) =
+            paired_service(dir.path(), "Pixel", Some("fcm-token-1")).await;
+        let expected_hint = Hint::from_endpoint_addr(&handle.endpoint_addr().unwrap());
+        transport::close(&phone.conn);
+        collector
+            .wait(|event| matches!(event, Event::PhoneDisconnected))
+            .await;
+        collector
+            .wait(|event| matches!(event, Event::CardPresent { present: false }))
+            .await;
+        assert_eq!(
+            handle.request_tap(),
+            TapOutcome::Wake {
+                token: "fcm-token-1".into(),
+                hint: expected_hint
+            }
+        );
+        handle.shutdown();
+        drop(phone.endpoint);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forget_phone_revokes_pairing_and_rejects_reconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, _collector, phone) = paired_service(dir.path(), "Pixel", None).await;
+        handle.forget_phone();
+        handle.shutdown();
+        transport::close(&phone.conn);
+        drop(phone.endpoint);
+        assert!(Store::open(dir.path()).unwrap().peer.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn second_connection_while_session_live_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, _collector, paired) = paired_service(dir.path(), "Pixel", None).await;
+        let host_addr = handle.endpoint_addr().unwrap();
+        // A second dial with the same pinned id has no capability and hits
+        // the "already active" branch: rejected.
+        let (phone, _) = phone_endpoint().await;
+        let second = phone.connect(host_addr, ALPN).await.unwrap();
+        let (mut send, mut recv) = second.open_bi().await.unwrap();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            transport::client_hello(
+                &mut send,
+                &mut recv,
+                ClientHello {
+                    capability: None,
+                    name: "Pixel".into(),
+                    push: None,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(reply, transport::HelloReply::Rejected);
+        handle.shutdown();
+        transport::close(&paired.conn);
+        drop(paired);
+        drop(phone);
+    }
+}
