@@ -67,7 +67,8 @@ object IdentityStore {
             .remove(K_HOST)
             .remove(K_HINT)
             .remove(K_HOST_NAME)
-            .remove(K_PUSH_TOKEN)
+            // The FCM token belongs to this install, not to the pairing: keep
+            // it, or the next PC could never wake this phone.
             .commit()) { "could not forget the paired PC" }
     }
 

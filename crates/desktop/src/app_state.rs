@@ -312,8 +312,12 @@ fn request_tap(cx: &mut App) {
                     Some("Relay not configured".to_owned())
                 }
             },
-            TapOutcome::NotPaired => Some("No phone paired".to_owned()),
+            TapOutcome::NotPaired => {
+                logging::log("wake: no phone paired");
+                Some("No phone paired".to_owned())
+            }
             TapOutcome::NoPush => {
+                logging::log("wake: the phone has not sent a push token");
                 Some("Open tapbridge on your phone once to enable wake".to_owned())
             }
         };

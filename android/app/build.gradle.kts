@@ -5,13 +5,11 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+    // Reads app/google-services.json (gitignored, the real Firebase project
+    // config) and fails the build with its own message when it is missing.
+    // Without this plugin FirebaseApp never initializes and FCM wake is dead.
+    id("com.google.gms.google-services")
 }
-
-// The google-services plugin applies only when the real Firebase config is
-// present (gitignored, user-provided). Without it debug builds work with push
-// disabled (Hello.push = null) and release/bundle tasks fail with a clear
-// message. Never ship a fake google-services.json.
-val hasFirebaseConfig = file("google-services.json").exists()
 
 // Single source of truth for versioning.
 val tapbridgeProps = Properties().apply {
@@ -149,23 +147,6 @@ tasks.register<Copy>("stageRustJniLib") {
 
 tasks.matching { it.name == "mergeDebugJniLibFolders" || it.name == "mergeReleaseJniLibFolders" }.configureEach {
     dependsOn("stageRustJniLib")
-}
-
-// Clear failure for release packaging without Firebase config.
-tasks.matching {
-    it.name == "assembleRelease" || it.name == "bundleRelease"
-        || it.name == "assembleReleaseAndroidTest"
-}.configureEach {
-    doFirst {
-        if (!file("google-services.json").exists()) {
-            throw GradleException(
-                "Release build requires android/app/google-services.json (the Firebase " +
-                    "project config for computer.ethernet.tapbridge). Debug builds work " +
-                    "without it with push disabled (Hello.push = null). Add the real " +
-                    "config, never a fake one."
-            )
-        }
-    }
 }
 
 dependencies {

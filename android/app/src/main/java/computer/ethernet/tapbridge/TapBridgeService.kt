@@ -178,7 +178,7 @@ class TapBridgeService : Service() {
                     NativeBridge.connect(
                         key, hint, invite,
                         IdentityStore.phoneName(this@TapBridgeService),
-                        IdentityStore.pushToken(this@TapBridgeService) ?: "",
+                        currentPushToken() ?: "",
                     )
                 } finally { key.fill(0) }
                 if (!wantsConnection || requested.get() != attempt) return@execute
@@ -211,13 +211,43 @@ class TapBridgeService : Service() {
         }
     }
 
+    /**
+     * The install's current FCM token, asked from Firebase on every connect
+     * (onNewToken only fires when the token changes, so a cached copy alone
+     * can be missing). Runs on the lifecycle worker, never the main thread.
+     * Falls back to the cached token; null when push is unavailable.
+     */
+    private fun currentPushToken(): String? {
+        val fresh = runCatching {
+            com.google.android.gms.tasks.Tasks.await(
+                com.google.firebase.messaging.FirebaseMessaging.getInstance().token,
+                5, TimeUnit.SECONDS,
+            )
+        }.onFailure {
+            // Never log the token; the failure type is enough to diagnose.
+            android.util.Log.w("tapbridge", "FCM token unavailable: ${it.javaClass.simpleName}: ${it.message}")
+        }.getOrNull()
+        if (!fresh.isNullOrBlank()) {
+            IdentityStore.savePushToken(this, fresh)
+            return fresh
+        }
+        return IdentityStore.pushToken(this)
+    }
+
     /** Visible retry backoff: 0.25/0.5/1/2/3s cap. Wake attempts retry once. */
     private fun scheduleRetry(attempt: Long) {
         if (!wantsConnection || destroyed) return
-        val delay = if (startedFromUi) {
-            RETRY_DELAYS_MS[retryAttempt.coerceAtMost(RETRY_DELAYS_MS.size - 1)].also { retryAttempt++ }
-        } else {
-            if (retryAttempt++ < 1) 1000L else return
+        val delay = when {
+            // Visible app: keep trying, fast.
+            visible -> RETRY_DELAYS_MS[retryAttempt.coerceAtMost(RETRY_DELAYS_MS.size - 1)].also { retryAttempt++ }
+            // FCM wake: one more try, then give up until the next wake.
+            !startedFromUi -> if (retryAttempt++ < 1) 1000L else return
+            // UI-started session whose app is no longer on screen: nothing
+            // may keep running at rest. The next app open or wake reconnects.
+            else -> {
+                main.post { stopSession(); stopSelf() }
+                return
+            }
         }
         main.postDelayed({
             if (wantsConnection && requested.get() == attempt && status != Status.CONNECTED) connectAsync()

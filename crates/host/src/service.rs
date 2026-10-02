@@ -336,6 +336,15 @@ async fn run_inner(
                 completed = handshakes.join_next(), if !handshakes.is_empty() => {
                     let Some(Ok(Ok((conn, mut send, recv, Frame::Hello { capability, name, push })))) = completed else { continue; };
                     let peer = conn.remote_id();
+                    // The paired phone runs one session at a time, so a new
+                    // authenticated connection from it means the old one is
+                    // dead (app restarted, network switched) even if QUIC has
+                    // not noticed yet. Replace it instead of making the phone
+                    // wait out the idle timeout. Any other peer is still
+                    // refused while a session is live.
+                    if active.is_some() && store.peer == Some(peer) {
+                        disconnect(&mut active, &mut received, &to_reader, &events, &mut card_present).await?;
+                    }
                     let (authorized, paired_now) = if active.is_some() { (false, false) }
                     else if store.peer == Some(peer) {
                         // The paired phone scanned a fresh code: consume it so
@@ -787,12 +796,57 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn paired_phone_redialing_replaces_its_stale_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, mut collector, phone) = paired_service(dir.path(), "Pixel", None).await;
+        let host_addr = handle.endpoint_addr().unwrap();
+        // The old session is still open on the host (the phone app was killed
+        // without closing it). The same identity dials again with a token.
+        let conn = phone.endpoint.connect(host_addr, ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            transport::client_hello(
+                &mut send,
+                &mut recv,
+                ClientHello {
+                    capability: None,
+                    name: "Pixel".into(),
+                    push: Some("fresh-token".into()),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(reply, transport::HelloReply::Accepted { .. }));
+        collector
+            .wait(|event| matches!(event, Event::PhoneDisconnected))
+            .await;
+        collector
+            .wait(|event| matches!(event, Event::PhoneConnected { .. }))
+            .await;
+        let status = handle.status();
+        assert!(status.phone_connected && status.push_stored);
+        // The new session is the live one: tap requests reach it.
+        assert_eq!(handle.request_tap(), TapOutcome::ReadCardSent);
+        let frame = tokio::time::timeout(Duration::from_secs(5), wire::read_frame(&mut recv))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame, Frame::ReadCard);
+        handle.shutdown();
+        transport::close(&conn);
+        drop(phone);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn second_connection_while_session_live_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let (handle, _collector, paired) = paired_service(dir.path(), "Pixel", None).await;
         let host_addr = handle.endpoint_addr().unwrap();
-        // A second dial with the same pinned id has no capability and hits
-        // the "already active" branch: rejected.
+        // A different identity while the paired phone's session is live:
+        // refused, and the live session is not replaced.
         let (phone, _) = phone_endpoint().await;
         let second = phone.connect(host_addr, ALPN).await.unwrap();
         let (mut send, mut recv) = second.open_bi().await.unwrap();

@@ -100,6 +100,9 @@ class MainActivity : ComponentActivity() {
             bound = true
             service?.listener = serviceListener
             if (resumed) service?.resumeTagDiscovery() else service?.pauseTagDiscovery()
+            // onResume ran before the bind finished on a cold start; tell the
+            // service now, or the idle timeout treats the open app as hidden.
+            service?.onAppVisibility(resumed)
             state?.status = service?.status ?: TapBridgeService.Status.IDLE
             state?.error = service?.lastError
             deliverForwardedTag()
@@ -179,10 +182,27 @@ class MainActivity : ComponentActivity() {
             checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
             PackageManager.PERMISSION_GRANTED
 
+    /** Set when Android refused the foreground start; retried on focus. */
+    private var startDeferred = false
+
     internal fun startTapService() {
         val i = Intent(this, TapBridgeService::class.java)
             .setAction(TapBridgeService.ACTION_START)
-        if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+        try {
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+            startDeferred = false
+        } catch (_: IllegalStateException) {
+            // ForegroundServiceStartNotAllowedException: resumed while the
+            // device is asleep or locked, so the app does not count as
+            // visible yet. The bound service keeps running meanwhile; start
+            // it in the foreground once the window really has focus.
+            startDeferred = true
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && startDeferred) startTapService()
     }
 
     internal fun stopTapService() {
