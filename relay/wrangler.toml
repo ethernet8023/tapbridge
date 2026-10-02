@@ -2,7 +2,12 @@ name = "tapbridge-relay"
 main = "src/worker.ts"
 compatibility_date = "2026-10-02"
 
+# Stable URL: it is built into tapbridge.exe (TAPBRIDGE_RELAY_URL).
+workers_dev = false
+routes = [{ pattern = "tapbridge-relay.ethernet.computer", custom_domain = true }]
+
 [[ratelimits]]
 name = "WAKE_LIMIT"
-namespace_id = "tapbridge_wake_v1"
+# Cloudflare requires a positive integer, unique per account.
+namespace_id = "1001"
 simple = { limit = 10, period = 60 }
