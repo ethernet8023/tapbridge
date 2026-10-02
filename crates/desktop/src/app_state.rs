@@ -46,6 +46,7 @@ struct Shell {
     /// Shown in the tray until the next state change (e.g. relay problems).
     notice: Option<String>,
     // Held for their Drop / process-lifetime handles.
+    _anchor: WindowHandle<ui::Anchor>,
     watcher: Option<prompt_watch::Watcher>,
     _instance: single::Instance,
 }
@@ -70,7 +71,9 @@ pub fn run(state_dir: PathBuf, trace_apdu: bool, instance: single::Instance) {
         let tray = Tray::new(crate::assets::Icons::load())
             .inspect_err(|error| logging::log(&format!("tray unavailable: {error}")))
             .ok();
+        let anchor = ui::open_anchor_window(cx);
         cx.set_global(Shell {
+            _anchor: anchor,
             events: events.clone(),
             state_dir: state_dir.clone(),
             trace_apdu,

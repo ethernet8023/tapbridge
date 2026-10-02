@@ -245,6 +245,40 @@ pub fn complete_pairing(handle: WindowHandle<PairingView>, cx: &mut App) {
     .detach();
 }
 
+/// Invisible window that keeps the app alive. gpui on Windows quits the
+/// process when its last window closes (`PostQuitMessage` in
+/// `close_one_window`), which would end the tray app whenever the user
+/// closed the pairing or status window, and after every successful pairing.
+pub struct Anchor;
+
+impl Render for Anchor {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+pub fn open_anchor_window(cx: &mut App) -> WindowHandle<Anchor> {
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.0), px(0.0)),
+                size(px(1.0), px(1.0)),
+            ))),
+            titlebar: None,
+            focus: false,
+            show: false,
+            // Tool window: no taskbar button even if something shows it.
+            kind: gpui::WindowKind::PopUp,
+            is_movable: false,
+            is_resizable: false,
+            is_minimizable: false,
+            ..Default::default()
+        },
+        |_, cx| cx.new(|_| Anchor),
+    )
+    .expect("anchor window")
+}
+
 pub struct StatusView {
     lines: Vec<String>,
 }

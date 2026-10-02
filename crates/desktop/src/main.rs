@@ -30,6 +30,13 @@ fn main() {
     let trace_apdu = std::env::args().any(|arg| arg == "--trace-apdu");
     let dir = state_dir();
     logging::init(&logging::log_dir(&dir));
+    // A GUI app has no console: panics must land in the log file.
+    std::panic::set_hook(Box::new(|info| {
+        logging::log(&format!(
+            "panic: {info}\n{}",
+            std::backtrace::Backtrace::force_capture()
+        ));
+    }));
     logging::log("tapbridge starting");
     let instance = single::acquire();
     app_state::run(dir, trace_apdu, instance);
