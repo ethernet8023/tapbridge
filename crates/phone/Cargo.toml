@@ -1,0 +1,24 @@
+[package]
+name = "tapbridge-phone"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "tapbridge_phone"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+tapbridge-core = { path = "../core" }
+iroh.workspace = true
+tokio.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
+android_logger = "0.15"
+log = "0.4"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

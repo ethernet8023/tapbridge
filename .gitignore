@@ -1,0 +1,14 @@
+/target/
+/android/.gradle/
+/android/local.properties
+/android/**/build/
+/.hermes/
+*.log
+*.err
+.env
+*.key
+*.p12
+*.jks
+*.keystore
+/dist/
+/android/app/google-services.json

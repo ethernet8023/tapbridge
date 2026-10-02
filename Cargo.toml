@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT"
+
+[workspace.dependencies]
+iroh = { version = "=1.2.0", default-features = false, features = ["tls-ring"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time", "signal"] }
+
+[profile.release]
+strip = "debuginfo"
+lto = "thin"
