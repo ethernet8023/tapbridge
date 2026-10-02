@@ -156,10 +156,10 @@ fn tick(inbox: &mpsc::Receiver<UiEvent>, cx: &mut App) {
             continue;
         }
         logging::log(&format!("service: {event:?}"));
-        if matches!(event, service::Event::PairingCompleted)
+        if let service::Event::PairingCompleted { name } = &event
             && let Some(window) = cx.global::<Shell>().pairing
         {
-            ui::complete_pairing(window, cx);
+            ui::complete_pairing(window, name.clone(), cx);
         }
         cx.update_global::<Shell, _>(|shell, _| {
             shell.notice = None;

@@ -41,8 +41,11 @@ pub enum Event {
     CardPresent {
         present: bool,
     },
-    /// A previously unknown phone completed pairing.
-    PairingCompleted,
+    /// A phone completed pairing with the outstanding invitation: a new phone,
+    /// or the already paired phone scanning a fresh code.
+    PairingCompleted {
+        name: String,
+    },
     /// One payload-free APDU trace line (`Settings::trace` only): command
     /// name and status, never payload bytes.
     Trace(String),
@@ -334,7 +337,18 @@ async fn run_inner(
                     let Some(Ok(Ok((conn, mut send, recv, Frame::Hello { capability, name, push })))) = completed else { continue; };
                     let peer = conn.remote_id();
                     let (authorized, paired_now) = if active.is_some() { (false, false) }
-                    else if store.peer == Some(peer) { (true, false) }
+                    else if store.peer == Some(peer) {
+                        // The paired phone scanned a fresh code: consume it so
+                        // the pairing window completes. A stale or missing
+                        // capability is still a normal pinned reconnect.
+                        match capability.as_ref().map(|capability| gate.authorize(peer, Some(capability))) {
+                            Some(Ok(pending)) => {
+                                gate.commit(pending).map_err(io::Error::other)?;
+                                (true, true)
+                            }
+                            _ => (true, false),
+                        }
+                    }
                     else if store.peer.is_some() { (false, false) }
                     else {
                         match gate.authorize(peer, capability.as_ref()) {
@@ -356,7 +370,7 @@ async fn run_inner(
                         continue;
                     }
                     if paired_now {
-                        let _ = events.send(Event::PairingCompleted);
+                        let _ = events.send(Event::PairingCompleted { name: name.clone() });
                     }
                     if let Err(error) = store.set_phone_info(None, Some(&name), push.as_deref()) {
                         transport::close(&conn);
@@ -581,7 +595,7 @@ mod tests {
             seen: Vec::new(),
         };
         collector
-            .wait(|event| matches!(event, Event::PairingCompleted))
+            .wait(|event| matches!(event, Event::PairingCompleted { .. }))
             .await;
         // The session is registered as active only after the accept handshake
         // completes; wait for PhoneConnected so tests that call request_tap
@@ -690,6 +704,75 @@ mod tests {
         );
         handle.shutdown();
         drop(phone.endpoint);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paired_phone_scanning_a_fresh_code_completes_pairing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, mut collector, phone) = paired_service(dir.path(), "Pixel", None).await;
+        let host_addr = handle.endpoint_addr().unwrap();
+        transport::close(&phone.conn);
+        collector
+            .wait(|event| matches!(event, Event::PhoneDisconnected))
+            .await;
+        // Same phone identity, fresh invitation: PairingCompleted again.
+        let invitation = handle.mint_invitation().unwrap();
+        let conn = phone
+            .endpoint
+            .connect(host_addr.clone(), ALPN)
+            .await
+            .unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            transport::client_hello(
+                &mut send,
+                &mut recv,
+                ClientHello {
+                    capability: Some(invitation.capability()),
+                    name: "Pixel".into(),
+                    push: None,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(reply, transport::HelloReply::Accepted { .. }));
+        collector
+            .wait(|event| matches!(event, Event::PairingCompleted { name } if name == "Pixel"))
+            .await;
+        // The code was consumed: a replay is a plain reconnect, no new pairing.
+        transport::close(&conn);
+        collector
+            .wait(|event| matches!(event, Event::PhoneDisconnected))
+            .await;
+        let conn = phone.endpoint.connect(host_addr, ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let reply = transport::client_hello(
+            &mut send,
+            &mut recv,
+            ClientHello {
+                capability: Some(invitation.capability()),
+                name: "Pixel".into(),
+                push: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(reply, transport::HelloReply::Accepted { .. }));
+        collector
+            .wait(|event| matches!(event, Event::PhoneConnected { .. }))
+            .await;
+        collector.seen.extend(handle.drain_events());
+        assert!(
+            !collector
+                .seen
+                .iter()
+                .any(|event| matches!(event, Event::PairingCompleted { .. }))
+        );
+        handle.shutdown();
+        transport::close(&conn);
     }
 
     #[tokio::test(flavor = "multi_thread")]

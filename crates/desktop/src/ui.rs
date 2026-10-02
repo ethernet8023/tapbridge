@@ -18,7 +18,7 @@ const QR_TARGET: f32 = 340.0;
 /// QR quiet zone in modules (ISO/IEC 18004 asks for 4).
 const QUIET_ZONE: u16 = 4;
 /// How long the "Phone paired" confirmation stays up before the window closes.
-const PAIRED_CLOSE_DELAY: Duration = Duration::from_millis(1600);
+const PAIRED_CLOSE_DELAY: Duration = Duration::from_millis(2800);
 
 const PANEL: u32 = 0x17121F;
 const PANEL_2: u32 = 0x221A30;
@@ -36,7 +36,8 @@ pub struct PairingView {
     /// invitation could not be encoded.
     dark: Rc<[bool]>,
     dimension: u16,
-    paired: bool,
+    /// Set when pairing completes: the phone's display name.
+    paired: Option<String>,
     /// When the invitation stops working (the host gate uses the same TTL).
     expires: Instant,
     /// Re-renders once a second for the countdown; dropped with the view.
@@ -57,7 +58,7 @@ impl PairingView {
         Self {
             dark: dark.into(),
             dimension,
-            paired: false,
+            paired: None,
             expires: Instant::now() + INVITATION_TTL,
             _ticker: ticker,
         }
@@ -65,7 +66,7 @@ impl PairingView {
 
     /// The invitation ran out and nobody paired: time for a fresh one.
     pub fn expired(&self) -> bool {
-        !self.paired && Instant::now() >= self.expires
+        self.paired.is_none() && Instant::now() >= self.expires
     }
 }
 
@@ -82,8 +83,51 @@ impl Render for PairingView {
         let cells = (dimension + 2 * QUIET_ZONE) as f32;
         let module = px((QR_TARGET * scale / cells).floor().max(1.0) / scale);
         let side = module * cells;
+        let stage = side + px(20.0);
+
+        let root = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .size_full()
+            .gap(px(18.0))
+            .bg(rgb(PANEL))
+            .text_color(rgb(TEXT));
+
+        if let Some(phone) = &self.paired {
+            return root
+                .child(
+                    div()
+                        .text_size(px(18.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(GOOD))
+                        .child("Pairing successful"),
+                )
+                .child(
+                    div()
+                        .size(stage)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(success_badge()),
+                )
+                .child(
+                    div()
+                        .text_size(px(22.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child(format!("{phone} is ready")),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(rgb(ACCENT_SOFT))
+                        .child("You can sign in with your key from this PC now."),
+                );
+        }
+
         // One canvas paints every dark module: the QR costs one element per
-        // frame while the scan line animates, not one div per module.
+        // frame while the ring animates, not one div per module.
         let dark = self.dark.clone();
         let grid = canvas(
             |_, _, _| {},
@@ -99,29 +143,23 @@ impl Render for PairingView {
         .size(side);
         // A soft accent ring breathes around the card. Motion stays outside
         // the code: a coloured line over the modules can read as dark.
-        let ring_color = if self.paired { GOOD } else { ACCENT };
         let ring = div()
             .absolute()
             .inset_0()
             .rounded(px(20.0))
             .border_2()
-            .border_color(rgb(ring_color));
-        let ring = if self.paired {
-            ring.into_any_element()
-        } else {
-            ring.with_animation(
+            .border_color(rgb(ACCENT))
+            .with_animation(
                 "pairing-ring",
                 Animation::new(Duration::from_millis(2200)).repeat(),
                 |ring, delta| {
                     let wave = 0.5 - 0.5 * (std::f32::consts::TAU * delta).cos();
                     ring.opacity(0.25 + 0.75 * wave)
                 },
-            )
-            .into_any_element()
-        };
+            );
         let card = div()
             .relative()
-            .size(side + px(20.0))
+            .size(stage)
             .flex()
             .items_center()
             .justify_center()
@@ -137,54 +175,62 @@ impl Render for PairingView {
                     })
                     .child(grid),
             );
-
-        let (heading, heading_color, glyph) = if self.paired {
-            ("Phone paired", GOOD, "✓")
-        } else {
-            ("Pair your phone", TEXT, "")
-        };
-        div()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .size_full()
-            .gap(px(18.0))
-            .bg(rgb(PANEL))
-            .text_color(rgb(TEXT))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(10.0))
-                    .text_size(px(18.0))
-                    .text_color(rgb(heading_color))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .child(glyph)
-                    .child(heading),
-            )
-            .child(card)
-            .child({
-                let remaining = self.expires.saturating_duration_since(Instant::now());
-                let color = if self.paired {
-                    GOOD
-                } else if remaining < EXPIRY_WARNING {
+        let remaining = self.expires.saturating_duration_since(Instant::now());
+        root.child(
+            div()
+                .text_size(px(18.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .child("Pair your phone"),
+        )
+        .child(card)
+        .child(
+            div()
+                .text_size(px(26.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(rgb(if remaining < EXPIRY_WARNING {
                     WARN
                 } else {
                     ACCENT_SOFT
-                };
-                div()
-                    .text_size(px(26.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(rgb(color))
-                    .child(if self.paired {
-                        "Closing...".to_owned()
-                    } else {
-                        countdown(remaining)
-                    })
-            })
+                }))
+                .child(countdown(remaining)),
+        )
     }
+}
+
+/// Green disc that springs in with a white check mark drawn as a vector path.
+fn success_badge() -> impl IntoElement {
+    let diameter = 150.0;
+    div()
+        .size(px(diameter))
+        .rounded_full()
+        .bg(rgb(GOOD))
+        .child(
+            canvas(
+                |_, _, _| {},
+                |bounds, (), window, _| {
+                    let d = bounds.size.width.min(bounds.size.height);
+                    let at = |x: f32, y: f32| bounds.origin + point(d * x, d * y);
+                    let mut check = gpui::PathBuilder::stroke(d * 0.085);
+                    check.move_to(at(0.29, 0.52));
+                    check.line_to(at(0.44, 0.67));
+                    check.line_to(at(0.72, 0.37));
+                    if let Ok(path) = check.build() {
+                        window.paint_path(path, rgb(0xFFFFFF));
+                    }
+                },
+            )
+            .size_full(),
+        )
+        .with_animation(
+            "paired-badge",
+            Animation::new(Duration::from_millis(650))
+                .with_easing(gpui::bounce(gpui::ease_out_quint())),
+            move |badge, delta| {
+                badge
+                    .size(px(diameter * (0.4 + 0.6 * delta)))
+                    .opacity(delta.min(1.0))
+            },
+        )
 }
 
 /// Opens the pairing window, or refreshes it in place while it is still open.
@@ -229,10 +275,10 @@ pub fn pairing_expired(handle: WindowHandle<PairingView>, cx: &mut App) -> Optio
     handle.update(cx, |view, _, _| view.expired()).ok()
 }
 
-/// Shows the paired confirmation, then closes the window.
-pub fn complete_pairing(handle: WindowHandle<PairingView>, cx: &mut App) {
+/// Shows the pairing-successful screen, then closes the window.
+pub fn complete_pairing(handle: WindowHandle<PairingView>, phone: String, cx: &mut App) {
     let shown = handle.update(cx, |view, _window, cx| {
-        view.paired = true;
+        view.paired = Some(phone);
         cx.notify();
     });
     if shown.is_err() {
