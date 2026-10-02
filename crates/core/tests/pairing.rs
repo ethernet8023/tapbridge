@@ -248,12 +248,13 @@ async fn host_pairing_session(ep: &Endpoint, gate: &mut pairing::PairingGate) ->
     let result = transport::host_handle_hello(&conn, |hello| match &hello {
         Frame::Hello {
             capability: Some(cap),
+            ..
         } => match gate.authorize(conn.remote_id(), Some(cap)) {
             Ok(pending) => {
                 // Host caller persists BEFORE Accepted. Here persistence is
                 // simulated by committing the gate entry.
                 match gate.commit(pending) {
-                    Ok(_) => transport::HostDecision::Accept,
+                    Ok(_) => transport::HostDecision::Accept("host".into()),
                     Err(_) => transport::HostDecision::Reject,
                 }
             }
@@ -300,10 +301,10 @@ async fn full_pairing_over_real_endpoints_and_replay_rejected() {
             .expect("timed out connecting")
             .expect("connect failed");
         let (mut send, mut recv) = conn.open_bi().await.expect("open_bi failed");
-        let reply = transport::client_hello(&mut send, &mut recv, Some(capability))
+        let reply = transport::client_hello(&mut send, &mut recv, hello(Some(capability)))
             .await
             .expect("hello failed");
-        assert!(matches!(reply, transport::HelloReply::Accepted));
+        assert!(matches!(reply, transport::HelloReply::Accepted { .. }));
     }
 
     // Replay: the phone redials with the same (already consumed) capability.
@@ -313,7 +314,7 @@ async fn full_pairing_over_real_endpoints_and_replay_rejected() {
             .expect("timed out connecting")
             .expect("connect failed");
         let (mut send, mut recv) = conn.open_bi().await.expect("open_bi failed");
-        let reply = transport::client_hello(&mut send, &mut recv, Some(capability))
+        let reply = transport::client_hello(&mut send, &mut recv, hello(Some(capability)))
             .await
             .expect("hello failed");
         assert!(matches!(reply, transport::HelloReply::Rejected));
@@ -326,4 +327,12 @@ async fn full_pairing_over_real_endpoints_and_replay_rejected() {
         assert!(eof.is_ok(), "reply stream should end after replay reject");
     }
     host_task.await.unwrap();
+}
+
+fn hello(capability: Option<[u8; 32]>) -> transport::ClientHello {
+    transport::ClientHello {
+        capability,
+        name: "phone".into(),
+        push: None,
+    }
 }

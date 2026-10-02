@@ -33,10 +33,10 @@ pub async fn accept(ep: &Endpoint) -> io::Result<Connection> {
 }
 
 /// Host decision after inspecting the phone's Hello.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostDecision {
-    /// Reply `Accepted`; the session continues.
-    Accept,
+    /// Reply `Accepted` with the host display name; the session continues.
+    Accept(String),
     /// Reply `Rejected` and close the connection.
     Reject,
 }
@@ -80,8 +80,8 @@ where
 {
     let (mut send, recv, hello) = host_receive_hello(conn).await?;
     match decide(hello) {
-        HostDecision::Accept => {
-            reply_accepted(&mut send).await?;
+        HostDecision::Accept(name) => {
+            reply_accepted(&mut send, name).await?;
             Ok(HostHelloOutcome::Accepted { send, recv })
         }
         HostDecision::Reject => {
@@ -98,16 +98,25 @@ where
 }
 
 /// Phone side of the Hello handshake: send Hello (optionally carrying the
-/// pairing capability) and await the host verdict.
+/// pairing capability, always the phone display name and current push token)
+/// and await the host verdict.
 pub async fn client_hello(
     send: &mut SendStream,
     recv: &mut RecvStream,
-    capability: Option<[u8; 32]>,
+    hello: ClientHello,
 ) -> io::Result<HelloReply> {
-    write_frame(send, &Frame::Hello { capability }).await?;
+    write_frame(
+        send,
+        &Frame::Hello {
+            capability: hello.capability,
+            name: hello.name,
+            push: hello.push,
+        },
+    )
+    .await?;
     let reply = read_frame(recv).await?;
     match reply {
-        Frame::Accepted => Ok(HelloReply::Accepted),
+        Frame::Accepted { name } => Ok(HelloReply::Accepted { host_name: name }),
         Frame::Rejected => Ok(HelloReply::Rejected),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -116,18 +125,35 @@ pub async fn client_hello(
     }
 }
 
+/// What the phone announces in its Hello.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClientHello {
+    /// Pairing capability from the invitation; `None` for a pinned reconnect.
+    pub capability: Option<[u8; 32]>,
+    /// Phone display name, 1..=64 UTF-8 bytes.
+    pub name: String,
+    /// Current FCM token, when push is available.
+    pub push: Option<String>,
+}
+
+impl std::fmt::Debug for ClientHello {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClientHello(REDACTED)")
+    }
+}
+
 /// The host's verdict on a Hello.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HelloReply {
-    /// Host accepted the session.
-    Accepted,
+    /// Host accepted the session and told us its display name.
+    Accepted { host_name: String },
     /// Host rejected; treat the session as dead.
     Rejected,
 }
 
 /// Host reply helpers used by [`host_handle_hello`] or custom host loops.
-pub async fn reply_accepted(send: &mut SendStream) -> io::Result<()> {
-    write_frame(send, &Frame::Accepted).await
+pub async fn reply_accepted(send: &mut SendStream, name: String) -> io::Result<()> {
+    write_frame(send, &Frame::Accepted { name }).await
 }
 
 /// See [`reply_accepted`].

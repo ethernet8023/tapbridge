@@ -27,7 +27,13 @@ pub struct Session {
 
 impl Session {
     /// Called on a worker thread. Keys are loaded and protected by Android.
-    pub fn connect(key: [u8; 32], host: &str, invitation: &str) -> io::Result<Self> {
+    pub fn connect(
+        key: [u8; 32],
+        host: &str,
+        invitation: &str,
+        name: &str,
+        push: Option<String>,
+    ) -> io::Result<Self> {
         let host: EndpointId = host
             .parse()
             .map_err(|_| io::Error::other("invalid host identity"))?;
@@ -43,14 +49,18 @@ impl Session {
         Self::connect_to(
             transport::production_builder(&SecretKey::from_bytes(&key)),
             host.into(),
-            capability,
+            transport::ClientHello {
+                capability,
+                name: name.into(),
+                push,
+            },
         )
     }
 
     fn connect_to(
         builder: iroh::endpoint::Builder,
         host: iroh::EndpointAddr,
-        capability: Option<[u8; 32]>,
+        hello: transport::ClientHello,
     ) -> io::Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -65,9 +75,10 @@ impl Session {
                     .map_err(io::Error::other)?;
                 let (mut writer, mut reader) =
                     connection.open_bi().await.map_err(io::Error::other)?;
-                if transport::client_hello(&mut writer, &mut reader, capability).await?
-                    != transport::HelloReply::Accepted
-                {
+                if !matches!(
+                    transport::client_hello(&mut writer, &mut reader, hello).await?,
+                    transport::HelloReply::Accepted { .. }
+                ) {
                     transport::close(&connection);
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,

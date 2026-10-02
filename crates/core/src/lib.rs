@@ -2,6 +2,7 @@
 
 pub mod pairing;
 pub mod transport;
+pub mod wake;
 pub mod wire;
 
-pub const ALPN: &[u8] = b"tapbridge/1";
+pub const ALPN: &[u8] = b"tapbridge/2";

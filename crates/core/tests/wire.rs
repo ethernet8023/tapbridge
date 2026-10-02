@@ -1,13 +1,25 @@
-use tapbridge_core::wire::{Frame, read_frame, write_frame};
+use tapbridge_core::wire::{Frame, MAX_NAME, MAX_PUSH, read_frame, write_frame};
+
+fn hello(name: &str, push: Option<&str>) -> Frame {
+    Frame::Hello {
+        capability: None,
+        name: name.into(),
+        push: push.map(Into::into),
+    }
+}
 
 #[tokio::test]
 async fn carries_pairing_presence_and_cancellation_in_order() {
     let frames = [
         Frame::Hello {
             capability: Some([17; 32]),
+            name: "Pixel 9".into(),
+            push: Some("fcm-token".into()),
         },
-        Frame::Hello { capability: None },
-        Frame::Accepted,
+        hello("p", None),
+        Frame::Accepted {
+            name: "Desk PC \u{1f5a5}".into(),
+        },
         Frame::Rejected,
         Frame::Card {
             generation: 4,
@@ -70,6 +82,16 @@ async fn rejects_oversized_card_and_apdu_before_writing() {
             generation: 1,
             data: vec![0x90],
         },
+        hello("", None),
+        hello(&"n".repeat(MAX_NAME + 1), None),
+        hello("p", Some("")),
+        hello("p", Some(&"t".repeat(MAX_PUSH + 1))),
+        Frame::Accepted {
+            name: String::new(),
+        },
+        Frame::Accepted {
+            name: "n".repeat(MAX_NAME + 1),
+        },
     ];
     for frame in invalid {
         let mut out = Vec::new();
@@ -83,7 +105,7 @@ async fn rejects_oversized_card_and_apdu_before_writing() {
 
 #[tokio::test]
 async fn rejects_oversized_incoming_apdu() {
-    let mut body = vec![1, 4];
+    let mut body = vec![2, 4];
     body.extend_from_slice(&[0; 16]);
     body.extend_from_slice(&vec![0; 65537]);
     let mut wire = (body.len() as u32).to_be_bytes().to_vec();
@@ -94,12 +116,26 @@ async fn rejects_oversized_incoming_apdu() {
 #[tokio::test]
 async fn rejects_malformed_headers_and_trailing_control_bytes() {
     for body in [
-        vec![1],
+        // v1 frames are refused outright.
+        vec![1, 2],
+        vec![1, 0, 0],
+        vec![2],
+        vec![3, 2],
+        vec![2, 255],
+        vec![2, 2, 0],
+        vec![2, 0, 2],
+        vec![2, 7, 0],
+        // Accepted without a name, with a truncated name, with trailing bytes.
         vec![2, 1],
-        vec![1, 255],
-        vec![1, 1, 0],
-        vec![1, 0, 2],
-        vec![1, 7, 0],
+        vec![2, 1, 0, 3, b'a'],
+        vec![2, 1, 0, 1, b'a', 0],
+        // Hello: invalid UTF-8 name, empty name, bad push flag, trailing byte.
+        vec![2, 0, 0, 0, 1, 0xff, 0],
+        vec![2, 0, 0, 0, 0, 0],
+        vec![2, 0, 0, 0, 1, b'p', 2],
+        vec![2, 0, 0, 0, 1, b'p', 0, 0],
+        // Hello with a truncated capability.
+        vec![2, 0, 1, 0, 0],
     ] {
         let mut bytes = (body.len() as u32).to_be_bytes().to_vec();
         bytes.extend(body);
@@ -142,15 +178,25 @@ async fn reads_fragmented_frames_and_accepts_exact_apdu_limit() {
 #[tokio::test]
 async fn frame_layout_is_fixed_and_secrets_are_redacted() {
     let mut bytes = Vec::new();
-    write_frame(&mut bytes, &Frame::Hello { capability: None })
+    write_frame(&mut bytes, &hello("p", Some("tk")))
         .await
         .unwrap();
-    assert_eq!(bytes, [0, 0, 0, 3, 1, 0, 0]);
+    assert_eq!(
+        bytes,
+        [0, 0, 0, 11, 2, 0, 0, 0, 1, b'p', 1, 0, 2, b't', b'k']
+    );
+    let mut bytes = Vec::new();
+    write_frame(&mut bytes, &Frame::Accepted { name: "PC".into() })
+        .await
+        .unwrap();
+    assert_eq!(bytes, [0, 0, 0, 6, 2, 1, 0, 2, b'P', b'C']);
     assert_eq!(
         format!(
             "{:?}",
             Frame::Hello {
-                capability: Some([88; 32])
+                capability: Some([88; 32]),
+                name: "secret-name".into(),
+                push: Some("secret-token".into()),
             }
         ),
         "Hello(REDACTED)"

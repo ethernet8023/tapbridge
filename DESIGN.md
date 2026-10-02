@@ -1,47 +1,68 @@
 # tapbridge
 
-A remote Android NFC reader, exposed to Windows as a USB/IP CCID reader. Physical card performs all authentication. APDUs and response status words are preserved byte-for-byte. No CTAP interpretation or software credentials.
+An Android phone is a remote NFC reader for a Windows PC. Windows sees a USB/IP CCID smart-card reader. The physical FIDO card performs all authentication. APDUs and status words cross an authenticated, encrypted iroh connection byte-for-byte. No CTAP interpretation on the bridge path; no software credentials.
 
-## Non-destructive construction
+Earlier sources stay at `../2fa-sync-before-rebuild` (historical evidence, not protocol authority). Local git baseline: `d51d13f`.
 
-The replacement occupies `2fa-sync`. The complete original sources, artifacts and settings are preserved at `../2fa-sync-before-rebuild`. Recovered source/session notes remain in that archive under `.hermes/plans/`; they are historical evidence, not protocol authority. No commits or pushes have been made.
+## Product shape
 
-## Modules
+- **Windows desktop app** (`crates/desktop`, binary `tapbridge.exe`): tray icon (`tray-icon`), gpui windows only where UI is needed (pairing QR, status). Runs the host service, attaches the bundled usbip-win2 client to `127.0.0.1:3240` busid `1-1`, detaches on quit. Starts at login. Single instance. Supersedes the old `tapbridge-host` CLI.
+- **Host library** (`crates/host`): USB/IP/CCID reader, phone session service, DPAPI-protected state. No CLI.
+- **Android app** (`android/`, `dev.tapbridge.app`, Play Store): Jetpack Compose + Material 3, motion graphics, CameraX + ML Kit QR pairing, FCM wake, registered keys.
+- **Phone native** (`crates/phone`): Rust JNI endpoint/session runtime. Kotlin owns NFC, lifecycle and notifications. One native library, no C++ wrapper.
+- **Relay** (`relay/`): Cloudflare Worker that turns a desktop wake request into an FCM high-priority data message. It holds the FCM service account; the desktop never does.
+- **Installer** (`installer/`): Inno Setup, x64 + arm64, bundles the pinned, hash-checked official usbip-win2 installer (BSD-2, WHLK-signed drivers) and runs it silently when the driver is missing.
 
-- `tapbridge-core`: bounded versioned wire frames, pairing authorization, encrypted iroh endpoints, identity/invitation encoding. No platform UI, USB or global state.
-- `tapbridge-host`: USB/IP/CCID reader, host identity/pairing persistence and CLI. USB/IP loopback only. Connect peer state and APDU operations to the reader via bounded channels. No raw TCP phone listener.
-- `tapbridge-phone`: Rust JNI endpoint/session runtime. Kotlin Activity/foreground service owns NFC and notifications. Single native library; no C++ wrapper. Kotlin keeps a session handle; all callbacks carry session/card generation.
+## Nothing runs at rest
 
-## Shared wire contract (frozen for parallel implementation)
+No always-on phone connection: iroh heartbeats every 5 s (`iroh/src/socket.rs` `HEARTBEAT_INTERVAL`) would keep the cellular radio awake. The phone connects on demand:
 
-Rust `tapbridge_core::wire::Frame` variants:
-- `Hello { capability: Option<[u8; 32]> }` (phone first; authenticated iroh peer supplies its identity).
-- `Accepted` and `Rejected` (host; no error details or capability echoes).
-- `Card { generation: u64, atr: Vec<u8>, max_apdu: u32 }` (phone; empty ATR = absent, max_apdu=0 then; each tag replacement/removal changes generation).
-- `Apdu { id: u64, generation: u64, data: Vec<u8> }` (host).
-- `Response { id: u64, generation: u64, data: Vec<u8> }` (phone; includes SW1/SW2).
-- `Failed { id: u64, generation: u64 }` (phone, transport/card failure, not an APDU status).
-- `Cancel { id: u64 }` (host; cancel pending operation).
-- `ReadCard` (host user-requested reminder; not a fabricated card-presence event).
+1. Trigger on the PC: the Windows Security security-key dialog appears (WinEvent hook), or the user picks "Request tap" in the tray. Generic CCID polling does not identify a WebAuthn ceremony, so the trigger is UI-level.
+2. If a phone session is already live, the host sends `ReadCard` (phone shows "tap now"). Otherwise, if a push token is stored, the desktop POSTs `{token, host, hint}` to the relay.
+3. Relay sends an FCM data message (`priority: high`, `ttl: 60s`): `{"t":"wake","host":ID,"hint":HINT}`.
+4. Phone checks `host` == paired host (anything else is dropped), starts a `connectedDevice` foreground service, connects using the hint, posts a heads-up "Tap your key for <PC>" notification, and enables the NFC tap gate for 120 s.
+5. Session idles out 60 s after the last card/APDU activity; the service stops and the gate is disabled.
 
-`wire::read_frame<R: tokio::io::AsyncRead + Unpin>(&mut R) -> std::io::Result<Frame>` and corresponding `write_frame<W: AsyncWrite + Unpin>(&mut W, &Frame)`. Maximum APDU 65536 bytes, ATR <=33 bytes, total frame <=65600 bytes. Reject wrong direction at session owner. Strict reject unknown version/kind, trailing fixed-frame bytes and overlength before allocation. No Debug/Display leaking Hello capability or APDU bytes. Dedicated reader owns read_frame across select events; cancellation abandons the whole stream.
+The wake message is an unauthenticated hint. Authority is always the iroh-authenticated pinned identity. A forged wake can at most make the phone dial its own paired PC.
 
-ALPN constant `tapbridge_core::ALPN = b"tapbridge/1"`. One long-lived bidirectional QUIC stream per authenticated session, opened by phone sending Hello first. One paired phone, one active session, one physical tag and one in-flight APDU. Concurrent unrelated dialers must not block USB enumeration.
+Opening the app while paired connects immediately (cached hint) and, while the UI is visible, retries on drop: 0.25, 0.5, 1, 2, 3 s cap, plus immediate retry on network change.
+
+## Registered keys and the tap gate
+
+Android NFC dispatch filters by technology only. So: activity-alias `TapGate` (translucent, no UI) has a `TECH_DISCOVERED` IsoDep filter and is **disabled by default**. It is enabled only during a wake window. On dispatch it compares the card with registered keys, then forwards the `Tag` to `MainActivity` on match or `finish()`es silently otherwise.
+
+A registered key stores: label, NFC UID if stable (a 4-byte UID starting `0x08` is random and is not stored), and the CTAP2 `authenticatorGetInfo` AAGUID (SELECT `A0000006472F0001`, then `80 10 00 00 01 04 00`). Match = stable UID equal, otherwise AAGUID equal. This identification exchange is local to the phone and is not part of the bridge path. Inside the open app, reader mode accepts any ISO-DEP card.
+
+## Wire contract v2 (ALPN `tapbridge/2`, frame version byte 2)
+
+`tapbridge_core::wire::Frame`:
+- `Hello { capability: Option<[u8;32]>, name: String, push: Option<String> }` — phone first, on every connect. `name`: display name, 1..=64 UTF-8 bytes. `push`: current FCM token, 1..=4096 bytes, absent when FCM is unavailable. Host stores the newest name/token for the pinned phone. Authenticated iroh peer supplies identity.
+- `Accepted { name: String }` — host display name, 1..=64 bytes. `Rejected` — no details.
+- `Card { generation: u64, atr: Vec<u8>, max_apdu: u32 }` — phone; empty ATR = absent, max_apdu=0 then; each tag replacement/removal changes generation.
+- `Apdu { id, generation, data }` (host), `Response { id, generation, data }` (phone; includes SW1/SW2), `Failed { id, generation }` (phone; transport/card failure, not an APDU status), `Cancel { id }` (host), `ReadCard` (host; user-visible reminder, not a fabricated presence event).
+
+Max APDU 65536 bytes, ATR <=33, total frame <=65600. Strict decode: unknown version/kind, trailing bytes, overlength and invalid UTF-8 rejected before use. Debug redacts Hello/Apdu/Response. Wrong direction rejected at session owner. A dedicated reader owns `read_frame`; cancellation abandons the stream. One long-lived bidirectional QUIC stream per session, opened by the phone. One paired phone, one active session, one tag, one in-flight APDU. Concurrent dialers never block USB enumeration.
+
+`tapbridge_core::wake::Hint { host: EndpointId, relay: Option<RelayUrl>, direct: Vec<SocketAddr> }`. Text form `HOSTID[;r=RELAYURL][;d=IP:PORT]*`, at most 8 direct addresses, at most 1024 bytes. `Hint::endpoint_addr()` builds the iroh `EndpointAddr`. The phone caches the last hint.
 
 ## Pairing and persistence
 
-Host identity in private application state, DPAPI wrapped on Windows; Android Keystore-wrapped in app-private storage, backups disabled. A missing identity generates one; corrupt existing state fails loudly, never silently changes identity. Pairing only on explicit host request, using host endpoint ID and a 32-byte CSPRNG capability in a QR invitation. Invitation lives in host memory for 5 minutes, single-use; minting another revokes previous. Re-pair is explicit. No custom token signatures or custom encryption. Iroh authenticates endpoint identity; public relays see traffic metadata, not plaintext APDUs.
+Invitation (QR) `tapbridge:1:HOSTID:CAPHEX`: 32-byte CSPRNG capability, 5 min, single use, minting another revokes the previous one, only on explicit user request. The core pairing gate is pure in-memory state; the caller persists the authenticated phone id BEFORE `Accepted`. Persist failure rejects. A lost acknowledgement is recoverable by pinned identity. Reject unknown peers, wrong/expired/replayed capability, and a second active session without replacing the first.
 
-Core pairing gate is pure in-memory state; caller persists the authenticated phone ID BEFORE sending Accepted. Persist failure rejects and cannot claim pairing success. A lost acknowledgement is recoverable by pinned identity. No tokens/PINs/APDUs/credential material in logs. Reject unknown peers, wrong/expired/replayed capability; reject second active session without replacing first.
+Host state is DPAPI-protected (`%LOCALAPPDATA%\tapbridge`): host key, paired phone id, phone name, push token. Phone identity is Android Keystore-wrapped, backups disabled. Missing identity generates one; corrupt state fails loudly and never silently re-keys. No keys, capabilities, push tokens, PINs or APDU bytes in logs.
+
+## Relay API
+
+`POST /v1/wake`, JSON `{"token": str<=4096, "host": str<=128, "hint": str<=1024}`. Responses: `202` FCM accepted, `400` malformed, `429` rate limited (10/min per token), `502` FCM failure. Tokens are never logged. Secret: `FCM_SERVICE_ACCOUNT` (JSON); project id comes from it.
 
 ## Reader invariants
 
-CCID bit 0 present, bit 1 changed. Event-driven interrupt IN with notification before/after pending read handled. One bounded pending request, cancel-safe complete USB/IP packet readers, UNLINK, valid ATR, strict descriptors matching capabilities. Phone connection is not card insertion. On disconnect, deactivation or tag loss: absent, retire generation, fail pending operation. Never carry response to next tag/session. CCID errors are failures, not invented 9000. USB/IP loop never waits synchronously for NFC.
+CCID bit 0 present, bit 1 changed. Event-driven interrupt IN with notification before/after pending read handled. One bounded pending request, cancel-safe complete USB/IP packet readers, UNLINK, valid ATR, strict descriptors. Phone connection is not card insertion. On disconnect, deactivation or tag loss: absent, retire generation, fail pending operation. Never carry a response to the next tag/session. CCID errors are failures, not invented 9000. The USB/IP loop never waits synchronously for NFC. See `crates/host/IMPLEMENTATION-NOTES.md`.
 
 ## Android lifecycle
 
-NFC reader mode requires a resumed Activity. Background foreground-service connection can notify the user to open the app, not silently bypass lockscreen/background restrictions. User starts/stops the connection explicitly; on notification tap the reader opens. Do not claim generic CCID polling identifies a WebAuthn ceremony. Rust iroh JNI DNS context must initialize with application context before endpoint creation. Worker threads run IsoDep, UI does not block. Close IsoDep to cancel, ignore late generation responses. Native runtime shutdown waits off the UI thread and frees JNI references.
+Reader mode requires a resumed Activity. Background work can notify, never silently bypass the lockscreen; most devices disable NFC while locked, so the flow is wake → unlock → tap. Rust iroh JNI DNS context initializes with the application context before endpoint creation. IsoDep runs on a worker; the UI never blocks. Close IsoDep to cancel; ignore late-generation responses. Native shutdown runs off the UI thread and frees JNI references.
 
-## Verification
+## Verification gates (reported separately)
 
-Build and test real Rust encrypted endpoints with temporary identities and loopback port 0; exact byte protocol and malformed cases; reader black-box USB/IP tests, timeouts/cancel/disconnect. Run fmt/clippy. Build real Windows ARM64 executable and Android APK, Gradle tests/lint, JNI load/ELF 16KB alignment. Real wireless phone and NFC card must separately prove PC/SC detection and WebAuthn success; currently no phone attached to ADB. Linux source portability is not a verified Linux installation.
+Rust tests/clippy/fmt; desktop release build x64 + arm64; installer build; real usbip-win2 attach; APK/AAB build, Gradle tests, lint, 16 KB ELF alignment; relay deployed + real FCM delivery; on-device wake → tap → WebAuthn success. Gates not yet run are reported as not run.

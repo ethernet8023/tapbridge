@@ -20,8 +20,17 @@ fn actual_phone_session_relays_frames_and_close_unblocks_reader() {
             address_tx.send(endpoint.addr()).unwrap();
             let conn = transport::accept(&endpoint).await.unwrap();
             let (mut send, mut recv, hello) = transport::host_receive_hello(&conn).await.unwrap();
-            assert_eq!(hello, Frame::Hello { capability: None });
-            transport::reply_accepted(&mut send).await.unwrap();
+            assert_eq!(
+                hello,
+                Frame::Hello {
+                    capability: None,
+                    name: "phone".into(),
+                    push: None,
+                }
+            );
+            transport::reply_accepted(&mut send, "PC".into())
+                .await
+                .unwrap();
             assert!(matches!(
                 wire::read_frame(&mut recv).await.unwrap(),
                 Frame::Card { generation: 1, .. }
@@ -50,7 +59,11 @@ fn actual_phone_session_relays_frames_and_close_unblocks_reader() {
         Session::connect_to(
             builder(),
             address_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
-            None,
+            transport::ClientHello {
+                capability: None,
+                name: "phone".into(),
+                push: None,
+            },
         )
         .unwrap(),
     );
@@ -90,8 +103,17 @@ fn actual_phone_session_relays_frames_and_close_unblocks_reader() {
 
 #[test]
 fn rejects_invalid_or_mismatched_invitation_without_network() {
-    assert!(Session::connect([1; 32], "bad", "").is_err());
+    assert!(Session::connect([1; 32], "bad", "", "phone", None).is_err());
     let host = SecretKey::generate().public();
     let invitation = Invitation::new(SecretKey::generate().public());
-    assert!(Session::connect([1; 32], &host.to_string(), &invitation.to_string()).is_err());
+    assert!(
+        Session::connect(
+            [1; 32],
+            &host.to_string(),
+            &invitation.to_string(),
+            "phone",
+            None
+        )
+        .is_err()
+    );
 }

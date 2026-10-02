@@ -56,10 +56,10 @@ async fn run_host(
     let conn = accept_conn(&ep).await;
     let peer = conn.remote_id();
     let outcome = transport::host_handle_hello(&conn, |hello| match &hello {
-        Frame::Hello { capability: _ } => {
+        Frame::Hello { .. } => {
             let known = pinned.is_none_or(|p| p == peer);
             if known {
-                transport::HostDecision::Accept
+                transport::HostDecision::Accept("Desk".into())
             } else {
                 transport::HostDecision::Reject
             }
@@ -92,10 +92,10 @@ async fn hello_accepted_roundtrip_over_real_endpoint() {
     assert_eq!(conn.remote_id(), host_key.public());
 
     let (mut send, mut recv) = open_bi(&conn).await;
-    let reply = transport::client_hello(&mut send, &mut recv, None)
+    let reply = transport::client_hello(&mut send, &mut recv, hello())
         .await
         .expect("client hello failed");
-    assert!(matches!(reply, transport::HelloReply::Accepted));
+    assert!(matches!(reply, transport::HelloReply::Accepted { .. }));
 
     let (_, outcome) = host_task.await.unwrap();
     match outcome {
@@ -125,7 +125,7 @@ async fn unauthorized_peer_is_rejected_and_disconnected() {
         .expect("connect failed");
     assert_eq!(conn.remote_id(), host_key.public());
     let (mut send, mut recv) = open_bi(&conn).await;
-    let reply = transport::client_hello(&mut send, &mut recv, None)
+    let reply = transport::client_hello(&mut send, &mut recv, hello())
         .await
         .expect("client hello failed");
     assert!(matches!(reply, transport::HelloReply::Rejected));
@@ -165,10 +165,14 @@ async fn capability_hello_roundtrip_and_debug_redaction() {
         assert_eq!(
             hello,
             Frame::Hello {
-                capability: Some(capability)
+                capability: Some(capability),
+                name: "phone".into(),
+                push: Some("push-token".into()),
             }
         );
-        transport::reply_accepted(&mut send).await.unwrap();
+        transport::reply_accepted(&mut send, "Desk".into())
+            .await
+            .unwrap();
         send.finish().map_err(std::io::Error::other).unwrap();
         // Keep the connection alive until the phone has read the reply.
         let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
@@ -180,18 +184,34 @@ async fn capability_hello_roundtrip_and_debug_redaction() {
         .expect("timed out connecting")
         .expect("connect failed");
     let (mut send, mut recv) = open_bi(&conn).await;
-    let reply = transport::client_hello(&mut send, &mut recv, Some(capability))
-        .await
-        .expect("client hello failed");
-    assert!(matches!(reply, transport::HelloReply::Accepted));
+    let reply = transport::client_hello(
+        &mut send,
+        &mut recv,
+        transport::ClientHello {
+            capability: Some(capability),
+            name: "phone".into(),
+            push: Some("push-token".into()),
+        },
+    )
+    .await
+    .expect("client hello failed");
+    assert_eq!(
+        reply,
+        transport::HelloReply::Accepted {
+            host_name: "Desk".into()
+        }
+    );
     let _conn = host_task.await.unwrap();
 
     // Hello frames must never leak the capability through Debug.
     let frame = Frame::Hello {
         capability: Some(capability),
+        name: "phone".into(),
+        push: Some("push-token".into()),
     };
     let debug = format!("{frame:?}");
     assert!(!debug.contains(&hex_debug(&capability)));
+    assert!(!debug.contains("push-token"));
 }
 
 fn hex_debug(bytes: &[u8]) -> String {
@@ -231,9 +251,10 @@ async fn accepted_handshake_keeps_both_stream_directions_open() {
     let address = host.addr();
     let host_task = tokio::spawn(async move {
         let conn = accept_conn(&host).await;
-        let outcome = transport::host_handle_hello(&conn, |_| transport::HostDecision::Accept)
-            .await
-            .unwrap();
+        let outcome =
+            transport::host_handle_hello(&conn, |_| transport::HostDecision::Accept("Desk".into()))
+                .await
+                .unwrap();
         let _keep_outcome_alive = outcome;
         tokio::time::timeout(TIMEOUT, conn.closed()).await.unwrap();
         host.close().await;
@@ -241,10 +262,12 @@ async fn accepted_handshake_keeps_both_stream_directions_open() {
     let conn = phone.connect(address, ALPN).await.unwrap();
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
     assert_eq!(
-        transport::client_hello(&mut send, &mut recv, None)
+        transport::client_hello(&mut send, &mut recv, hello())
             .await
             .unwrap(),
-        transport::HelloReply::Accepted
+        transport::HelloReply::Accepted {
+            host_name: "Desk".into()
+        }
     );
     // Neither EOF nor STOP_SENDING is allowed after Accepted.
     assert!(
@@ -285,4 +308,12 @@ async fn non_hello_frame_rejected_at_host() {
         .unwrap();
     host_task.await.unwrap();
     transport::close(&conn);
+}
+
+fn hello() -> transport::ClientHello {
+    transport::ClientHello {
+        capability: None,
+        name: "phone".into(),
+        push: None,
+    }
 }

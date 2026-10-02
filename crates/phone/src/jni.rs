@@ -82,7 +82,13 @@ pub extern "system" fn Java_dev_tapbridge_app_NativeBridge_connect(
             .map_err(|_| "identity must contain 32 bytes")?;
         let host: String = env.get_string(&host)?.into();
         let invitation: String = env.get_string(&invitation)?.into();
-        Ok(Session::connect(key, &host, &invitation)?)
+        Ok(Session::connect(
+            key,
+            &host,
+            &invitation,
+            "Android phone",
+            None,
+        )?)
     })();
     match result {
         Ok(session) => Box::into_raw(Box::new(session)) as jlong,

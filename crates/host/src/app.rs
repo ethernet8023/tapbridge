@@ -41,7 +41,7 @@ pub async fn serve_phone(
                     });
                 },
                 completed = handshakes.join_next(), if !handshakes.is_empty() => {
-                    let Some(Ok(Ok((conn, mut send, recv, Frame::Hello { capability })))) = completed else { continue; };
+                    let Some(Ok(Ok((conn, mut send, recv, Frame::Hello { capability, .. })))) = completed else { continue; };
                     let peer = conn.remote_id();
                     let authorized = if active.is_some() { false }
                     else if store.peer == Some(peer) { true }
@@ -65,7 +65,7 @@ pub async fn serve_phone(
                         continue;
                     }
                     while outgoing.try_recv().is_ok() {}
-                    if !matches!(tokio::time::timeout(Duration::from_secs(2), transport::reply_accepted(&mut send)).await, Ok(Ok(()))) {
+                    if !matches!(tokio::time::timeout(Duration::from_secs(2), transport::reply_accepted(&mut send, "PC".into())).await, Ok(Ok(()))) {
                         transport::close(&conn);
                         continue;
                     }
@@ -180,12 +180,22 @@ mod tests {
         assert_eq!(
             tokio::time::timeout(
                 Duration::from_secs(5),
-                transport::client_hello(&mut send, &mut recv, Some(invitation.capability()))
+                transport::client_hello(
+                    &mut send,
+                    &mut recv,
+                    transport::ClientHello {
+                        capability: Some(invitation.capability()),
+                        name: "phone".into(),
+                        push: None,
+                    }
+                )
             )
             .await
             .unwrap()
             .unwrap(),
-            transport::HelloReply::Accepted
+            transport::HelloReply::Accepted {
+                host_name: "PC".into()
+            }
         );
         assert_eq!(Store::open(dir.path()).unwrap().peer, Some(phone_id));
         let card = Frame::Card {
