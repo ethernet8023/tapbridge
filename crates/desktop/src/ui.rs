@@ -1,10 +1,19 @@
 //! gpui windows: the pairing QR window and the status window. Only these two
 //! surfaces use gpui; the tray and all orchestration live beside them.
 use gpui::{
-    Animation, AnimationExt, App, Bounds, Context, Window, WindowBounds, WindowHandle,
+    Animation, AnimationExt, App, Bounds, Context, Task, Window, WindowBounds, WindowHandle,
     WindowOptions, canvas, div, fill, point, prelude::*, px, rgb, size,
 };
-use std::{rc::Rc, time::Duration};
+use std::{
+    rc::Rc,
+    time::{Duration, Instant},
+};
+use tapbridge_core::pairing::INVITATION_TTL;
+
+/// The pairing window is square; the QR is sized to fit it, not the reverse.
+const PAIRING_WINDOW: f32 = 480.0;
+/// Target QR side including its quiet zone, in logical pixels.
+const QR_TARGET: f32 = 340.0;
 
 /// QR quiet zone in modules (ISO/IEC 18004 asks for 4).
 const QUIET_ZONE: u16 = 4;
@@ -14,9 +23,13 @@ const PAIRED_CLOSE_DELAY: Duration = Duration::from_millis(1600);
 const PANEL: u32 = 0x17121F;
 const PANEL_2: u32 = 0x221A30;
 const TEXT: u32 = 0xF2EFFA;
-const MUTED: u32 = 0x9D93B5;
 const ACCENT: u32 = 0x7C5CFF;
 const GOOD: u32 = 0x3DDC97;
+/// Light brand lavender: readable on PANEL, still clearly "tapbridge".
+const ACCENT_SOFT: u32 = 0xC4B5FF;
+const WARN: u32 = 0xFFB454;
+/// The countdown turns WARN for the last stretch before the code refreshes.
+const EXPIRY_WARNING: Duration = Duration::from_secs(30);
 
 pub struct PairingView {
     /// Row-major dark modules, `dimension * dimension` long; empty when the
@@ -24,24 +37,51 @@ pub struct PairingView {
     dark: Rc<[bool]>,
     dimension: u16,
     paired: bool,
+    /// When the invitation stops working (the host gate uses the same TTL).
+    expires: Instant,
+    /// Re-renders once a second for the countdown; dropped with the view.
+    _ticker: Task<()>,
 }
 
 impl PairingView {
-    pub fn new(invitation: &str) -> Self {
+    pub fn new(invitation: &str, cx: &mut Context<Self>) -> Self {
         let (dark, dimension) = build_qr(invitation).unwrap_or((Vec::new(), 0));
+        let ticker = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        });
         Self {
             dark: dark.into(),
             dimension,
             paired: false,
+            expires: Instant::now() + INVITATION_TTL,
+            _ticker: ticker,
         }
+    }
+
+    /// The invitation ran out and nobody paired: time for a fresh one.
+    pub fn expired(&self) -> bool {
+        !self.paired && Instant::now() >= self.expires
     }
 }
 
+fn countdown(remaining: Duration) -> String {
+    let seconds = remaining.as_secs();
+    format!("Expires in {}:{:02}", seconds / 60, seconds % 60)
+}
+
 impl Render for PairingView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let module = px(7.0);
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let dimension = self.dimension;
-        let side = module * (dimension + 2 * QUIET_ZONE) as f32;
+        // Whole device pixels per module: fractional modules leave seams.
+        let scale = window.scale_factor();
+        let cells = (dimension + 2 * QUIET_ZONE) as f32;
+        let module = px((QR_TARGET * scale / cells).floor().max(1.0) / scale);
+        let side = module * cells;
         // One canvas paints every dark module: the QR costs one element per
         // frame while the scan line animates, not one div per module.
         let dark = self.dark.clone();
@@ -125,16 +165,25 @@ impl Render for PairingView {
                     .child(heading),
             )
             .child(card)
-            .child(
+            .child({
+                let remaining = self.expires.saturating_duration_since(Instant::now());
+                let color = if self.paired {
+                    GOOD
+                } else if remaining < EXPIRY_WARNING {
+                    WARN
+                } else {
+                    ACCENT_SOFT
+                };
                 div()
-                    .text_size(px(13.0))
-                    .text_color(rgb(if self.paired { GOOD } else { MUTED }))
+                    .text_size(px(26.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(color))
                     .child(if self.paired {
-                        "Closing..."
+                        "Closing...".to_owned()
                     } else {
-                        "Scan with the tapbridge app (valid 5 minutes)"
-                    }),
-            )
+                        countdown(remaining)
+                    })
+            })
     }
 }
 
@@ -149,7 +198,7 @@ pub fn open_pairing_window(
     if let Some(handle) = existing {
         let text = invitation.to_owned();
         let refreshed = handle.update(cx, |view, window, cx| {
-            *view = PairingView::new(&text);
+            *view = PairingView::new(&text, cx);
             window.activate_window();
             cx.notify();
         });
@@ -158,7 +207,7 @@ pub fn open_pairing_window(
         }
     }
     let invitation = invitation.to_owned();
-    let bounds = Bounds::centered(None, size(px(360.0), px(520.0)), cx);
+    let bounds = Bounds::centered(None, size(px(PAIRING_WINDOW), px(PAIRING_WINDOW)), cx);
     cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -166,11 +215,18 @@ pub fn open_pairing_window(
                 title: Some("Pair phone".into()),
                 ..Default::default()
             }),
+            is_resizable: false,
             ..Default::default()
         },
-        move |_window, cx| cx.new(|_| PairingView::new(&invitation)),
+        move |_window, cx| cx.new(|cx| PairingView::new(&invitation, cx)),
     )
     .expect("pairing window")
+}
+
+/// `Some(true)` when the open pairing window's invitation ran out; `None`
+/// when the window is closed.
+pub fn pairing_expired(handle: WindowHandle<PairingView>, cx: &mut App) -> Option<bool> {
+    handle.update(cx, |view, _, _| view.expired()).ok()
 }
 
 /// Shows the paired confirmation, then closes the window.
@@ -264,6 +320,13 @@ fn build_qr(text: &str) -> Option<(Vec<bool>, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn countdown_shows_minutes_and_padded_seconds() {
+        assert_eq!(countdown(Duration::from_secs(300)), "Expires in 5:00");
+        assert_eq!(countdown(Duration::from_millis(64_900)), "Expires in 1:04");
+        assert_eq!(countdown(Duration::ZERO), "Expires in 0:00");
+    }
 
     #[test]
     fn qr_grid_is_square_and_dense() {

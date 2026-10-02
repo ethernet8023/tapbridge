@@ -21,8 +21,12 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.togetherWith
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.OutlinedTextField
@@ -41,10 +45,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.core.view.WindowCompat
 import computer.ethernet.tapbridge.ui.HomeScreen
 import computer.ethernet.tapbridge.ui.KeysScreen
-import computer.ethernet.tapbridge.ui.KeyReaderOverlay
+import computer.ethernet.tapbridge.ui.AddKeyDialogs
 import computer.ethernet.tapbridge.ui.PairScreen
 import computer.ethernet.tapbridge.ui.SettingsScreen
-import computer.ethernet.tapbridge.ui.TapPhase
 import computer.ethernet.tapbridge.ui.theme.LocalReducedMotion
 import computer.ethernet.tapbridge.ui.theme.TapBridgeTheme
 import java.util.UUID
@@ -176,7 +179,7 @@ class MainActivity : ComponentActivity() {
             checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
             PackageManager.PERMISSION_GRANTED
 
-    private fun startTapService() {
+    internal fun startTapService() {
         val i = Intent(this, TapBridgeService::class.java)
             .setAction(TapBridgeService.ACTION_START)
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
@@ -276,7 +279,9 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
     val context = LocalContext.current
     var screen by rememberSaveable { mutableStateOf("home") }
     var keys by remember { mutableStateOf(RegisteredKeys.list(context)) }
-    var readerMode by remember { mutableStateOf(false) }
+
+    // System back (and predictive back) returns to home from any sub-screen.
+    BackHandler(enabled = screen != "home") { screen = "home" }
 
     AnimatedContent(
         targetState = screen,
@@ -286,15 +291,21 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
         },
         label = "screens",
     ) { route ->
-        Box(Modifier.fillMaxSize()) {
+        // Edge-to-edge: backgrounds draw behind the system bars, content
+        // stays inside them.
+        Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
             when (route) {
                 "pair" -> PairScreen(
                     onPaired = {
                         PairingState.setPendingInvitation(it)
-                        activity.startActivity(
-                            Intent(context, TapBridgeService::class.java)
-                                .setAction(TapBridgeService.ACTION_START)
-                        )
+                        activity.startTapService()
+                        // Wake alerts need notifications; ask while the user
+                        // is setting the app up.
+                        if (!ui.notificationsGranted && Build.VERSION.SDK_INT >= 33) {
+                            activity.requestPermissionLauncher?.launch(
+                                android.Manifest.permission.POST_NOTIFICATIONS,
+                            )
+                        }
                         screen = "home"
                     },
                     onBack = { screen = "home" },
@@ -302,7 +313,7 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
                 )
                 "keys" -> KeysScreen(
                     keys = keys,
-                    onAddKey = { ui.addKeyMode = true; readerMode = true },
+                    onAddKey = { ui.addKeyError = null; ui.addKeyMode = true },
                     onRename = { record, label ->
                         RegisteredKeys.upsert(context, record.copy(label = label))
                         keys = RegisteredKeys.list(context)
@@ -317,6 +328,7 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
                 "settings" -> SettingsScreen(
                     phoneName = IdentityStore.phoneName(context),
                     pushEnabled = ui.notificationsGranted,
+                    paired = IdentityStore.pairedHost(context) != null,
                     onPhoneName = { name ->
                         runCatching { IdentityStore.setPhoneName(context, name) }
                     },
@@ -338,11 +350,24 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
                     onStartPair = { screen = "pair" },
                     onKeys = { keys = RegisteredKeys.list(context); screen = "keys" },
                     onSettings = { screen = "settings" },
-                    readerMode = readerMode,
-                    onReaderModeDismiss = { readerMode = false },
                     Modifier.fillMaxSize(),
                 )
             }
         }
     }
+    // Dialogs live above the navigation, so they open over whichever screen
+    // started them (they used to belong to home and opened behind Keys).
+    AddKeyDialogs(
+        reading = ui.addKeyMode,
+        readError = ui.addKeyError,
+        pending = ui.pendingRecord,
+        onCancelRead = { ui.addKeyMode = false; ui.addKeyError = null },
+        onSave = { record ->
+            RegisteredKeys.upsert(context, record)
+            ui.pendingRecord = null
+            ui.addKeyMode = false
+            keys = RegisteredKeys.list(context)
+        },
+        onDiscard = { ui.pendingRecord = null; ui.addKeyMode = false },
+    )
 }

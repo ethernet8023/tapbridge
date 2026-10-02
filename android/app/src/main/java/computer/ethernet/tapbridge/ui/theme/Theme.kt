@@ -44,6 +44,13 @@ private val LightColors: ColorScheme = lightColorScheme(
     error = Color(0xFFBA1A1A),
     errorContainer = Color(0xFFFFDAD6),
     onErrorContainer = Color(0xFF410002),
+    outline = Color(0xFF7A7396),
+    outlineVariant = Color(0xFFCBC3E6),
+    surfaceContainerLowest = Color(0xFFFFFFFF),
+    surfaceContainerLow = Color(0xFFF7F4FF),
+    surfaceContainer = Color(0xFFF1ECFF),
+    surfaceContainerHigh = Color(0xFFEBE5FF),
+    surfaceContainerHighest = Color(0xFFE4DDFB),
 )
 
 private val DarkColors: ColorScheme = darkColorScheme(
@@ -66,14 +73,21 @@ private val DarkColors: ColorScheme = darkColorScheme(
     error = Color(0xFFFFB4AB),
     errorContainer = Color(0xFF93000A),
     onErrorContainer = Color(0xFFFFDAD6),
+    outline = Color(0xFF8F86B0),
+    outlineVariant = Color(0xFF4A4166),
+    surfaceContainerLowest = Color(0xFF0E0A1C),
+    surfaceContainerLow = Color(0xFF17122A),
+    surfaceContainer = Color(0xFF1C1631),
+    surfaceContainerHigh = Color(0xFF261F40),
+    surfaceContainerHighest = Color(0xFF312950),
 )
 
 @Composable
 fun TapBridgeTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
-    // Dynamic color on Android 12+ keeps the system palette but the brand
-    // fallback scheme carries the icon gradient when unavailable.
-    dynamicColor: Boolean = true,
+    // Brand colors by default: wallpaper-derived dynamic schemes clash with
+    // the purple hero art and the app icon.
+    dynamicColor: Boolean = false,
     content: @Composable () -> Unit,
 ) {
     val context = LocalContext.current

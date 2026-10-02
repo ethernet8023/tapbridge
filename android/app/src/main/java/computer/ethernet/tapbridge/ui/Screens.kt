@@ -1,12 +1,6 @@
 package computer.ethernet.tapbridge.ui
 
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.animateContentSize
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -20,8 +14,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import computer.ethernet.tapbridge.Invitation
@@ -51,7 +43,7 @@ fun PairScreen(
         }
         Spacer(Modifier.height(16.dp))
         Text(
-            "On the PC, choose “Pair a phone” and hold the QR in the frame.",
+            "On your PC, choose Pair phone… in the tapbridge tray menu, then point this camera at the code.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -211,19 +203,23 @@ fun KeysScreen(
     }
 }
 
-/** Settings screen: phone name, notifications, forget PC. */
+/** Settings: device name, unpair, and permissions at the bottom. */
 @Composable
 fun SettingsScreen(
     phoneName: String,
     pushEnabled: Boolean,
+    paired: Boolean,
     onPhoneName: (String) -> Unit,
     onRequestNotifications: () -> Unit,
     onForgetPc: () -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    var nameDraft by remember(phoneName) { mutableStateOf(phoneName) }
+    // The saved name is tracked here: the caller's value is not observable.
+    var savedName by remember { mutableStateOf(phoneName) }
+    var nameDraft by remember { mutableStateOf(phoneName) }
     var confirmForget by remember { mutableStateOf(false) }
+    val edited = nameDraft.isNotBlank() && nameDraft.trim() != savedName
     Column(
         modifier
             .fillMaxSize()
@@ -239,20 +235,40 @@ fun SettingsScreen(
         Spacer(Modifier.height(16.dp))
         OutlinedTextField(
             value = nameDraft,
-            onValueChange = { nameDraft = it },
-            label = { Text("Phone name shown on your PC") },
+            onValueChange = { nameDraft = it.take(64) },
+            label = { Text("Name this device") },
             singleLine = true,
-            supportingText = { Text("1–64 characters") },
             modifier = Modifier.fillMaxWidth(),
         )
-        TextButton(
-            onClick = { onPhoneName(nameDraft.trim()) },
-            enabled = nameDraft.isNotBlank() && nameDraft.trim() != phoneName,
-        ) { Text("Save name") }
-        HorizontalDivider(Modifier.padding(vertical = 12.dp))
+        AnimatedVisibility(visible = edited) {
+            Button(
+                onClick = {
+                    val name = nameDraft.trim()
+                    onPhoneName(name)
+                    savedName = name
+                    nameDraft = name
+                },
+                modifier = Modifier.padding(top = 8.dp),
+            ) { Text("Save name") }
+        }
+        if (paired) {
+            HorizontalDivider(Modifier.padding(vertical = 16.dp))
+            OutlinedButton(
+                onClick = { confirmForget = true },
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Unpair your connected PC") }
+        }
+        HorizontalDivider(Modifier.padding(vertical = 16.dp))
+        Text(
+            "Permissions",
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.padding(bottom = 4.dp),
+        )
         ListItem(
             headlineContent = { Text("Notifications") },
-            supportingContent = { Text("Needed for tap-request wake-ups") },
+            supportingContent = { Text("Lets your PC wake this phone when it needs your key") },
             trailingContent = {
                 if (!pushEnabled) {
                     TextButton(onClick = onRequestNotifications) { Text("Allow") }
@@ -261,26 +277,17 @@ fun SettingsScreen(
                 }
             },
         )
-        HorizontalDivider(Modifier.padding(vertical = 12.dp))
-        Button(
-            onClick = { confirmForget = true },
-            colors = ButtonDefaults.buttonColors(
-                containerColor = MaterialTheme.colorScheme.errorContainer,
-                contentColor = MaterialTheme.colorScheme.onErrorContainer,
-            ),
-            modifier = Modifier.fillMaxWidth(),
-        ) { Text("Forget this PC") }
     }
     if (confirmForget) {
         AlertDialog(
             onDismissRequest = { confirmForget = false },
-            title = { Text("Forget this PC?") },
-            text = { Text("You'll need to scan the pairing QR again to reconnect.") },
+            title = { Text("Unpair this PC?") },
+            text = { Text("You'll need to scan the PC's pairing code again to reconnect.") },
             confirmButton = {
                 TextButton(onClick = {
                     confirmForget = false
                     onForgetPc()
-                }) { Text("Forget") }
+                }) { Text("Unpair") }
             },
             dismissButton = {
                 TextButton(onClick = { confirmForget = false }) { Text("Cancel") }
@@ -289,39 +296,75 @@ fun SettingsScreen(
     }
 }
 
-/** Reader-mode hint shown while registering a key. */
+/** Add-key flow, shown above whatever screen is open: tap prompt, then name. */
+@Composable
+fun AddKeyDialogs(
+    reading: Boolean,
+    readError: String?,
+    pending: RegisteredKeys.KeyRecord?,
+    onCancelRead: () -> Unit,
+    onSave: (RegisteredKeys.KeyRecord) -> Unit,
+    onDiscard: () -> Unit,
+) {
+    if (reading && pending == null) {
+        AlertDialog(
+            onDismissRequest = onCancelRead,
+            title = { Text("Add a key") },
+            text = {
+                Column {
+                    KeyReaderOverlay(null)
+                    if (readError != null) {
+                        Text(
+                            readError,
+                            color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.padding(top = 12.dp),
+                        )
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = onCancelRead) { Text("Cancel") } },
+        )
+    }
+    pending?.let { record ->
+        var name by remember(record) { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = onDiscard,
+            title = { Text("Name this key") },
+            text = {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it.take(40) },
+                    placeholder = { Text("e.g. Blue key") },
+                    singleLine = true,
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = name.isNotBlank(),
+                    onClick = { onSave(record.copy(label = name.trim())) },
+                ) { Text("Save") }
+            },
+            dismissButton = { TextButton(onClick = onDiscard) { Text("Cancel") } },
+        )
+    }
+}
+
+/** Tap prompt while registering a key: the home hero's motion, smaller. */
 @Composable
 fun KeyReaderOverlay(keyName: String?, modifier: Modifier = Modifier) {
-    val context = LocalContext.current
-    val pulse = rememberInfiniteTransition(label = "reader").animateFloat(
-        initialValue = 0.85f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            tween(700),
-            RepeatMode.Reverse,
-        ),
-        label = "reader-pulse",
-    ).value
-    AnimatedVisibility(true, modifier = modifier) {
-        Surface(
-            shape = RoundedCornerShape(24.dp),
-            color = MaterialTheme.colorScheme.primaryContainer,
-            modifier = Modifier
-                .animateContentSize()
-                .graphicsLayer { alpha = pulse },
-        ) {
-            Column(Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(
-                    if (keyName == null) "Hold your key against the phone's back"
-                    else "Hold again to confirm \u201C$keyName\u201D",
-                    style = MaterialTheme.typography.titleMedium,
-                )
-                Text(
-                    "Keep the key still until it vibrates.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onPrimaryContainer,
-                )
-            }
-        }
+    Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
+        TapHero(TapPhase.WAITING, Modifier.widthIn(max = 220.dp))
+        Text(
+            if (keyName == null) "Hold your key against the back of this phone"
+            else "Hold again to confirm \u201C$keyName\u201D",
+            style = MaterialTheme.typography.titleMedium,
+            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+        )
+        Text(
+            "Keep it still until the phone vibrates.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 4.dp),
+        )
     }
 }

@@ -163,6 +163,14 @@ fn tick(inbox: &mpsc::Receiver<UiEvent>, cx: &mut App) {
             shell.refresh_tray();
         });
     }
+    // An unused invitation expired while its window is open: show a fresh one.
+    if let Some(window) = cx.global::<Shell>().pairing {
+        match ui::pairing_expired(window, cx) {
+            Some(true) => open_pairing(cx),
+            Some(false) => {}
+            None => cx.update_global::<Shell, _>(|shell, _| shell.pairing = None),
+        }
+    }
     let actions = cx
         .global::<Shell>()
         .tray

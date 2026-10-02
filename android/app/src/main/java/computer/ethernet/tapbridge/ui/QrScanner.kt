@@ -15,12 +15,16 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -62,10 +66,47 @@ fun QrScanner(onCode: (String) -> Unit, modifier: Modifier = Modifier) {
     }
 
     if (!hasPermission) {
-        Text(
-            "Camera permission is needed to scan the pairing QR",
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        Column(
+            modifier,
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(
+                12.dp,
+                Alignment.CenterVertically,
+            ),
+        ) {
+            Text(
+                "tapbridge needs the camera to scan the pairing code on your PC.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Button(
+                onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) },
+            ) { Text("Allow camera") }
+            // After "Don't allow" twice Android stops showing the dialog; the
+            // app's system settings page is the only way back.
+            TextButton(
+                onClick = {
+                    context.startActivity(
+                        android.content.Intent(
+                            android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            android.net.Uri.fromParts("package", context.packageName, null),
+                        ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                    )
+                },
+            ) { Text("Open settings") }
+        }
+        // Coming back from system settings: pick up a grant made there.
+        val lifecycle = LocalLifecycleOwner.current.lifecycle
+        androidx.compose.runtime.DisposableEffect(lifecycle) {
+            val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+                if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                    hasPermission = ContextCompat.checkSelfPermission(
+                        context, Manifest.permission.CAMERA,
+                    ) == PackageManager.PERMISSION_GRANTED
+                }
+            }
+            lifecycle.addObserver(observer)
+            onDispose { lifecycle.removeObserver(observer) }
+        }
         return
     }
 
