@@ -208,6 +208,8 @@ fun KeysScreen(
 fun SettingsScreen(
     phoneName: String,
     pushEnabled: Boolean,
+    dndGranted: Boolean,
+    onRequestDnd: () -> Unit,
     paired: Boolean,
     onPhoneName: (String) -> Unit,
     onRequestNotifications: () -> Unit,
@@ -272,6 +274,17 @@ fun SettingsScreen(
             trailingContent = {
                 if (!pushEnabled) {
                     TextButton(onClick = onRequestNotifications) { Text("Allow") }
+                } else {
+                    Text("Allowed", color = MaterialTheme.colorScheme.primary)
+                }
+            },
+        )
+        ListItem(
+            headlineContent = { Text("Do Not Disturb") },
+            supportingContent = { Text("Let tap requests ring through Do Not Disturb") },
+            trailingContent = {
+                if (!dndGranted) {
+                    TextButton(onClick = onRequestDnd) { Text("Allow") }
                 } else {
                     Text("Allowed", color = MaterialTheme.colorScheme.primary)
                 }

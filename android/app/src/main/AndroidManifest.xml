@@ -7,6 +7,10 @@
     <!-- QR pairing scan. Without this declaration Android denies the runtime
          request silently, with no dialog. -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Live Update (status-bar chip) for tap requests on Android 16+. -->
+    <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
+    <!-- Lets the user allow tap requests through Do Not Disturb. -->
+    <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
 

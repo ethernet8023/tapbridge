@@ -34,6 +34,41 @@ class TapBridgeService : Service() {
         const val ACTION_WAKE = "computer.ethernet.tapbridge.WAKE"
         const val EXTRA_HINT = "computer.ethernet.tapbridge.HINT"
         const val CHANNEL_FOREGROUND = "tapbridge_session"
+        /** Tap requests. A new id: a channel's importance and sound are
+         *  frozen once created, so the old "tapbridge_wake" is deleted. */
+        const val CHANNEL_TAP_REQUEST = "tap_request"
+        private const val CHANNEL_TAP_REQUEST_OLD = "tapbridge_wake"
+
+        /** Creates (idempotently) both channels. */
+        fun ensureChannels(context: Context) {
+            val manager = context.getSystemService(NotificationManager::class.java)
+            manager.deleteNotificationChannel(CHANNEL_TAP_REQUEST_OLD)
+            manager.createNotificationChannel(
+                NotificationChannel(
+                    CHANNEL_FOREGROUND,
+                    context.getString(R.string.channel_session),
+                    NotificationManager.IMPORTANCE_LOW,
+                ).apply { description = context.getString(R.string.channel_session_desc) },
+            )
+            manager.createNotificationChannel(
+                NotificationChannel(
+                    CHANNEL_TAP_REQUEST,
+                    context.getString(R.string.channel_tap),
+                    NotificationManager.IMPORTANCE_HIGH,
+                ).apply {
+                    description = context.getString(R.string.channel_tap_desc)
+                    lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                    enableVibration(true)
+                    vibrationPattern = longArrayOf(0, 300, 150, 300, 150, 600)
+                    enableLights(true)
+                    lightColor = 0xFF7C5CFF.toInt()
+                    setShowBadge(true)
+                    // Honored only after the user grants Do Not Disturb
+                    // access (Settings -> Permissions in the app).
+                    setBypassDnd(true)
+                },
+            )
+        }
         const val FOREGROUND_ID = 1
         const val IDLE_TIMEOUT_MS = 60_000L
         const val WAKE_WINDOW_MS = 120_000L
@@ -88,7 +123,7 @@ class TapBridgeService : Service() {
             ACTION_WAKE -> {
                 wakeHint = intent.getStringExtra(EXTRA_HINT)
                 startedFromUi = false
-                foreground()
+                foreground(tapRequest = true)
                 wantsConnection = true
                 retryAttempt = 0
                 openWakeWindow()
@@ -97,7 +132,8 @@ class TapBridgeService : Service() {
             else -> { // ACTION_START / rebind while the UI is visible
                 startedFromUi = true
                 wakeHint = null
-                foreground()
+                // The app is on screen: no need to keep shouting.
+                foreground(tapRequest = false)
                 registerNetworkRetry()
                 connectAsync()
             }
@@ -121,20 +157,49 @@ class TapBridgeService : Service() {
         }
     }
 
-    private fun foreground() {
+    /**
+     * The service's single notification. While a wake window is open it IS
+     * the tap request: high-importance channel, sound and vibration, full
+     * content on the lockscreen, ongoing, and promoted to a Live Update
+     * (status-bar chip, top of the shade) on Android 16+. Otherwise, while
+     * the app itself is on screen, it is the quiet session notice.
+     */
+    private fun foreground(tapRequest: Boolean) {
         val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        manager.createNotificationChannel(
-            NotificationChannel(
-                CHANNEL_FOREGROUND, "Bridge session",
-                NotificationManager.IMPORTANCE_LOW,
-            ).apply { description = "Bridges your security key to the PC" }
-        )
+        ensureChannels(this)
         val launch = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
+            this, 0,
+            Intent(this, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val notification = Notification.Builder(this, CHANNEL_FOREGROUND)
-            .setContentTitle("Tapbridge")
-            .setContentText("Open the app to tap your card")
+        val builder = if (tapRequest) {
+            val pc = IdentityStore.hostName(this)
+            Notification.Builder(this, CHANNEL_TAP_REQUEST)
+                .setContentTitle(getString(R.string.wake_title))
+                .setContentText(
+                    pc?.let { getString(R.string.wake_body_named, it) } ?: getString(R.string.wake_body),
+                )
+                .setCategory(Notification.CATEGORY_STATUS)
+                .setVisibility(Notification.VISIBILITY_PUBLIC)
+                .setWhen(System.currentTimeMillis())
+                .setShowWhen(true)
+                .also { builder ->
+                    if (Build.VERSION.SDK_INT >= 36) {
+                        builder.setShortCriticalText(getString(R.string.wake_chip))
+                        // Live Update request (what AndroidX's
+                        // setRequestPromotedOngoing writes).
+                        builder.addExtras(android.os.Bundle().apply {
+                            putBoolean("android.requestPromotedOngoing", true)
+                        })
+                    }
+                }
+        } else {
+            Notification.Builder(this, CHANNEL_FOREGROUND)
+                .setContentTitle(getString(R.string.app_name))
+                .setContentText(getString(R.string.session_body))
+        }
+        val notification = builder
             .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(launch)
             .setOngoing(true)
@@ -144,6 +209,9 @@ class TapBridgeService : Service() {
         } else {
             startForeground(FOREGROUND_ID, notification)
         }
+        // The heads-up WakeService posts only when the foreground start was
+        // refused; this notification replaces it.
+        if (tapRequest) manager.cancel(WakeService.WAKE_NOTIFICATION_ID)
     }
 
     private fun show(value: Status, error: String? = null) {

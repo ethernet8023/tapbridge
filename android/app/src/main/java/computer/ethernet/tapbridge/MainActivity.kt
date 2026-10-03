@@ -72,6 +72,7 @@ class MainActivity : ComponentActivity() {
         var error by mutableStateOf<String?>(null)
         var cardPresent by mutableStateOf(false)
         var notificationsGranted by mutableStateOf(false)
+        var dndGranted by mutableStateOf(false)
         var addKeyMode by mutableStateOf(false)
         var addKeyError by mutableStateOf<String?>(null)
         var pendingRecord by mutableStateOf<RegisteredKeys.KeyRecord?>(null)
@@ -250,6 +251,12 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         resumed = true
+        state?.let {
+            // Both can change in system settings while the app is away.
+            it.notificationsGranted = hasNotifications()
+            it.dndGranted = getSystemService(android.app.NotificationManager::class.java)
+                .isNotificationPolicyAccessGranted
+        }
         service?.resumeTagDiscovery()
         service?.onAppVisibility(true)
         // DESIGN: opening the app while paired connects immediately.
@@ -348,6 +355,12 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
                 "settings" -> SettingsScreen(
                     phoneName = IdentityStore.phoneName(context),
                     pushEnabled = ui.notificationsGranted,
+                    dndGranted = ui.dndGranted,
+                    onRequestDnd = {
+                        activity.startActivity(
+                            Intent(android.provider.Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS),
+                        )
+                    },
                     paired = IdentityStore.pairedHost(context) != null,
                     onPhoneName = { name ->
                         runCatching { IdentityStore.setPhoneName(context, name) }
