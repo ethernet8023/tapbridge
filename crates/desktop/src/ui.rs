@@ -223,12 +223,11 @@ fn success_badge(diameter: f32) -> impl IntoElement {
         )
         .with_animation(
             "paired-badge",
-            Animation::new(Duration::from_millis(650))
-                .with_easing(gpui::bounce(gpui::ease_out_quint())),
+            Animation::new(Duration::from_millis(550)).with_easing(ease_out_back),
             move |badge, delta| {
                 badge
                     .size(px(diameter * (0.4 + 0.6 * delta)))
-                    .opacity(delta.min(1.0))
+                    .opacity((delta * 2.0).min(1.0))
             },
         )
 }
@@ -334,7 +333,9 @@ pub struct PasskeyView {
 
 enum PasskeyDialog {
     /// Waiting for the UAC prompt and the SYSTEM policy step.
-    Working,
+    Working {
+        since: Instant,
+    },
     Done {
         ok: bool,
         text: String,
@@ -366,7 +367,9 @@ impl PasskeyView {
             return;
         }
         let allow = self.options.phone == passkeys::Phone::Blocked;
-        self.dialog = Some(PasskeyDialog::Working);
+        self.dialog = Some(PasskeyDialog::Working {
+            since: Instant::now(),
+        });
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -407,8 +410,8 @@ impl PasskeyView {
             .border_1()
             .border_color(rgb(0x3A3052));
         let card = match dialog {
-            PasskeyDialog::Working => card
-                .child(spinner(px(56.0)))
+            PasskeyDialog::Working { since } => card
+                .child(spinner(px(56.0), *since))
                 .child(
                     div()
                         .text_size(px(17.0))
@@ -474,10 +477,10 @@ impl PasskeyView {
     }
 }
 
-/// Twelve rounded bars around a circle, the brightest one sweeping round.
-/// The canvas reads the clock; the repeating animation keeps frames coming.
-fn spinner(diameter: Pixels) -> impl IntoElement {
-    let started = Instant::now();
+/// Twelve radial strokes, the brightest one sweeping clockwise. The phase
+/// comes from `since` (owned by the dialog, so it survives re-renders); the
+/// repeating animation only keeps frames coming.
+fn spinner(diameter: Pixels, since: Instant) -> impl IntoElement {
     div()
         .size(diameter)
         .child(
@@ -485,26 +488,25 @@ fn spinner(diameter: Pixels) -> impl IntoElement {
                 |_, _, _| {},
                 move |bounds, (), window, _| {
                     const BARS: usize = 12;
-                    let phase = (started.elapsed().as_secs_f32() * 1.1).fract();
+                    let phase = (since.elapsed().as_secs_f32() / 0.9).fract();
+                    let head = (phase * BARS as f32).floor() as usize;
                     let center = bounds.center();
                     let radius = bounds.size.width.min(bounds.size.height) / 2.0;
-                    let (bar_w, bar_h) = (radius * 0.16, radius * 0.42);
                     for i in 0..BARS {
                         let angle = std::f32::consts::TAU * i as f32 / BARS as f32;
-                        let lag = (phase - i as f32 / BARS as f32).rem_euclid(1.0);
-                        let alpha = (255.0 * (1.0 - lag).powf(1.6)).max(40.0) as u32;
-                        let distance = radius - bar_h / 2.0;
-                        let at = center + point(distance * angle.sin(), -(distance * angle.cos()))
-                            - point(bar_w / 2.0, bar_h / 2.0);
-                        // Bars are drawn axis-aligned but placed round the
-                        // circle; at this size that reads as a spinner.
-                        window.paint_quad(
-                            fill(
-                                Bounds::new(at, size(bar_w, bar_h)),
-                                gpui::rgba((ACCENT_SOFT << 8) | alpha),
-                            )
-                            .corner_radii(bar_w / 2.0),
-                        );
+                        let (sin, cos) = angle.sin_cos();
+                        let inner = center + point(radius * 0.45 * sin, -(radius * 0.45 * cos));
+                        let outer = center + point(radius * 0.92 * sin, -(radius * 0.92 * cos));
+                        // Bars trail the head: full alpha at the head, fading
+                        // over the previous eleven.
+                        let behind = (head + BARS - i) % BARS;
+                        let alpha = (255.0 * (1.0 - behind as f32 / BARS as f32)).max(46.0) as u32;
+                        let mut bar = gpui::PathBuilder::stroke(radius * 0.15);
+                        bar.move_to(inner);
+                        bar.line_to(outer);
+                        if let Ok(path) = bar.build() {
+                            window.paint_path(path, gpui::rgba((ACCENT_SOFT << 8) | alpha));
+                        }
                     }
                 },
             )
@@ -515,6 +517,14 @@ fn spinner(diameter: Pixels) -> impl IntoElement {
             Animation::new(Duration::from_secs(1)).repeat(),
             |spinner, _| spinner,
         )
+}
+
+/// Overshoots a little, then settles exactly at 1 (gpui's `bounce` returns
+/// to 0, which made the badge vanish).
+fn ease_out_back(t: f32) -> f32 {
+    const C1: f32 = 1.70158;
+    const C3: f32 = C1 + 1.0;
+    1.0 + C3 * (t - 1.0).powi(3) + C1 * (t - 1.0).powi(2)
 }
 
 fn checkbox(checked: bool, enabled: bool) -> impl IntoElement {
@@ -806,6 +816,14 @@ fn build_qr(text: &str) -> Option<(Vec<bool>, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn badge_easing_settles_at_full_size() {
+        assert!(ease_out_back(0.0).abs() < 1e-6);
+        assert!((ease_out_back(1.0) - 1.0).abs() < 1e-6);
+        // Overshoots on the way, never ends small.
+        assert!((0..=100).any(|i| ease_out_back(i as f32 / 100.0) > 1.0));
+    }
 
     #[test]
     fn countdown_shows_minutes_and_padded_seconds() {
