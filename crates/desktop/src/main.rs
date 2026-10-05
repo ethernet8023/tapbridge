@@ -8,6 +8,7 @@ mod assets;
 mod autostart;
 mod hostname;
 mod logging;
+mod passkeys;
 mod prompt_watch;
 mod single;
 mod tray;

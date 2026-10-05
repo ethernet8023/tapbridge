@@ -1,5 +1,6 @@
 //! gpui windows: the pairing QR window and the status window. Only these two
 //! surfaces use gpui; the tray and all orchestration live beside them.
+use crate::passkeys;
 use gpui::{
     Animation, AnimationExt, App, Bounds, Context, Task, Window, WindowBounds, WindowHandle,
     WindowOptions, canvas, div, fill, point, prelude::*, px, rgb, size,
@@ -323,6 +324,261 @@ pub fn open_anchor_window(cx: &mut App) -> WindowHandle<Anchor> {
         |_, cx| cx.new(|_| Anchor),
     )
     .expect("anchor window")
+}
+
+/// Passkey options: which choices the Windows passkey dialog offers.
+pub struct PasskeyView {
+    options: passkeys::Options,
+    busy: bool,
+    /// Last result line; `true` marks an error.
+    message: Option<(String, bool)>,
+}
+
+impl PasskeyView {
+    fn new() -> Self {
+        Self {
+            options: passkeys::read(),
+            busy: false,
+            message: None,
+        }
+    }
+
+    fn toggle_windows_hello(&mut self, cx: &mut Context<Self>) {
+        let enable = !self.options.windows_hello;
+        self.message = match passkeys::set_windows_hello(enable) {
+            Ok(()) => None,
+            Err(error) => Some((format!("Couldn't change it: {error}"), true)),
+        };
+        self.options = passkeys::read();
+        cx.notify();
+    }
+
+    fn toggle_phone(&mut self, cx: &mut Context<Self>) {
+        if self.busy || self.options.phone == passkeys::Phone::ManagedElsewhere {
+            return;
+        }
+        let allow = self.options.phone == passkeys::Phone::Blocked;
+        self.busy = true;
+        self.message = Some(("Approve the Windows prompt to continue".into(), false));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { passkeys::set_phone(allow) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.busy = false;
+                view.options = passkeys::read();
+                view.message = Some(match result {
+                    Ok(()) if allow => ("Phone sign-in is allowed again".into(), false),
+                    Ok(()) => ("Phone sign-in is blocked".into(), false),
+                    Err(error) => (error, true),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+}
+
+fn checkbox(checked: bool, enabled: bool) -> impl IntoElement {
+    let color = if enabled { ACCENT } else { 0x5A5070 };
+    div()
+        .size(px(22.0))
+        .flex_none()
+        .rounded(px(6.0))
+        .border_2()
+        .border_color(rgb(color))
+        .when(checked, |box_| {
+            box_.bg(rgb(color)).child(
+                canvas(
+                    |_, _, _| {},
+                    |bounds, (), window, _| {
+                        let d = bounds.size.width;
+                        let at = |x: f32, y: f32| bounds.origin + point(d * x, d * y);
+                        let mut check = gpui::PathBuilder::stroke(d * 0.14);
+                        check.move_to(at(0.22, 0.52));
+                        check.line_to(at(0.42, 0.72));
+                        check.line_to(at(0.78, 0.30));
+                        if let Ok(path) = check.build() {
+                            window.paint_path(path, rgb(0xFFFFFF));
+                        }
+                    },
+                )
+                .size_full(),
+            )
+        })
+}
+
+fn option_row(
+    id: &'static str,
+    checked: bool,
+    enabled: bool,
+    title: &str,
+    detail: String,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(14.0))
+        .p(px(14.0))
+        .rounded(px(12.0))
+        .bg(rgb(PANEL_2))
+        .when(enabled, |row| {
+            row.cursor_pointer().hover(|style| style.bg(rgb(0x2C2340)))
+        })
+        .child(checkbox(checked, enabled))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_size(px(15.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(if enabled { TEXT } else { 0x8A8199 }))
+                        .child(title.to_owned()),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(rgb(ACCENT_SOFT))
+                        .child(detail),
+                ),
+        )
+}
+
+impl Render for PasskeyView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let options = &self.options;
+        let phone_enabled = !self.busy && options.phone != passkeys::Phone::ManagedElsewhere;
+        let phone_detail = match options.phone {
+            passkeys::Phone::Allowed => {
+                "QR code + Bluetooth. Unchecking blocks the FIDO Bluetooth services (admin prompt)."
+                    .to_owned()
+            }
+            passkeys::Phone::Blocked => {
+                "Blocked: Bluetooth allows every common service except FIDO.".to_owned()
+            }
+            passkeys::Phone::ManagedElsewhere => {
+                "Your organization manages the Bluetooth service list.".to_owned()
+            }
+        };
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .p(px(22.0))
+            .size_full()
+            .bg(rgb(PANEL))
+            .text_color(rgb(TEXT))
+            .child(
+                div()
+                    .text_size(px(20.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child("Passkey options"),
+            )
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(rgb(ACCENT_SOFT))
+                    .pb(px(6.0))
+                    .child("Choose what the Windows passkey dialog offers. Unchecked options disappear or stop working."),
+            )
+            .child(option_row(
+                "opt-key",
+                true,
+                false,
+                "Security key",
+                "tapbridge. Always on.".to_owned(),
+            ))
+            .child(
+                option_row(
+                    "opt-hello",
+                    options.windows_hello,
+                    !self.busy,
+                    "This Windows device",
+                    "Passkeys saved with Windows Hello on this PC.".to_owned(),
+                )
+                .on_click(cx.listener(|view, _: &gpui::ClickEvent, _, cx| view.toggle_windows_hello(cx))),
+            )
+            .child(
+                option_row(
+                    "opt-phone",
+                    options.phone != passkeys::Phone::Blocked,
+                    phone_enabled,
+                    "iPhone, iPad, or Android device",
+                    phone_detail,
+                )
+                .on_click(cx.listener(|view, _: &gpui::ClickEvent, _, cx| view.toggle_phone(cx))),
+            );
+        let providers = if options.providers.is_empty() {
+            "No passkey managers (1Password, Bitwarden...) are installed.".to_owned()
+        } else {
+            options
+                .providers
+                .iter()
+                .map(|provider| provider.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        column = column
+            .child(
+                option_row(
+                    "opt-managers",
+                    !options.providers.is_empty(),
+                    !options.providers.is_empty(),
+                    "Passkey managers",
+                    format!("{providers} Switch them in Windows Settings."),
+                )
+                .when(!options.providers.is_empty(), |row| {
+                    row.on_click(|_, _, _| passkeys::open_windows_passkey_settings())
+                }),
+            )
+            .when_some(self.message.clone(), |column, (text, error)| {
+                column.child(
+                    div()
+                        .pt(px(4.0))
+                        .text_size(px(13.0))
+                        .text_color(rgb(if error { WARN } else { GOOD }))
+                        .child(text),
+                )
+            });
+        column
+    }
+}
+
+pub fn open_passkey_window(
+    existing: Option<WindowHandle<PasskeyView>>,
+    cx: &mut App,
+) -> WindowHandle<PasskeyView> {
+    if let Some(handle) = existing {
+        let refreshed = handle.update(cx, |view, window, cx| {
+            view.options = passkeys::read();
+            window.activate_window();
+            cx.notify();
+        });
+        if refreshed.is_ok() {
+            return handle;
+        }
+    }
+    let bounds = Bounds::centered(None, size(px(520.0), px(540.0)), cx);
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(gpui::TitlebarOptions {
+                title: Some("Passkey options".into()),
+                ..Default::default()
+            }),
+            is_resizable: false,
+            ..Default::default()
+        },
+        |_, cx| cx.new(|_| PasskeyView::new()),
+    )
+    .expect("passkey options window")
 }
 
 pub struct StatusView {

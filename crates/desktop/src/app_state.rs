@@ -43,6 +43,7 @@ struct Shell {
     usbip: Usbip,
     pairing: Option<WindowHandle<ui::PairingView>>,
     status: Option<WindowHandle<ui::StatusView>>,
+    passkey_options: Option<WindowHandle<ui::PasskeyView>>,
     /// Shown in the tray until the next state change (e.g. relay problems).
     notice: Option<String>,
     // Held for their Drop / process-lifetime handles.
@@ -86,6 +87,7 @@ pub fn run(state_dir: PathBuf, trace_apdu: bool, instance: single::Instance) {
             },
             pairing: None,
             status: None,
+            passkey_options: None,
             notice: None,
             watcher,
             _instance: instance,
@@ -271,6 +273,11 @@ fn handle_action(action: MenuAction, cx: &mut App) {
             };
             let window = ui::open_status_window(lines, existing, cx);
             cx.update_global::<Shell, _>(|shell, _| shell.status = Some(window));
+        }
+        MenuAction::PasskeyOptions => {
+            let existing = cx.global::<Shell>().passkey_options;
+            let window = ui::open_passkey_window(existing, cx);
+            cx.update_global::<Shell, _>(|shell, _| shell.passkey_options = Some(window));
         }
         MenuAction::ToggleAutostart(enabled) => {
             let result = autostart::set_enabled(enabled);

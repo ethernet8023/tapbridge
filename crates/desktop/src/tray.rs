@@ -11,6 +11,7 @@ pub enum MenuAction {
     Pair,
     Forget,
     OpenStatus,
+    PasskeyOptions,
     ToggleAutostart(bool),
     Quit,
 }
@@ -39,6 +40,7 @@ impl Tray {
         let request_item = MenuItem::with_id("request", "Request tap", true, None);
         let pair_item = MenuItem::with_id("pair", "Pair phone...", true, None);
         let forget_item = MenuItem::with_id("forget", "Forget phone", true, None);
+        let passkeys_item = MenuItem::with_id("passkeys", "Passkey options...", true, None);
         let autostart_item =
             CheckMenuItem::with_id("autostart", "Start at login", true, false, None);
         let quit_item = MenuItem::with_id("quit", "Quit", true, None);
@@ -53,6 +55,7 @@ impl Tray {
             &request_item,
             &pair_item,
             &forget_item,
+            &passkeys_item,
             &separator2,
             &autostart_item,
             &separator3,
@@ -106,6 +109,7 @@ impl Tray {
                 "pair" => MenuAction::Pair,
                 "forget" => MenuAction::Forget,
                 "statuswin" => MenuAction::OpenStatus,
+                "passkeys" => MenuAction::PasskeyOptions,
                 // The check item flips itself on click; its new state is the request.
                 "autostart" => MenuAction::ToggleAutostart(self.autostart_item.is_checked()),
                 "quit" => MenuAction::Quit,
