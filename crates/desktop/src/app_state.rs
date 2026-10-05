@@ -20,8 +20,8 @@ enum UiEvent {
     ServiceFailed(String),
     /// Windows started a WebAuthn ceremony.
     Ceremony,
-    /// Another launch asked for the pairing window.
-    OpenPairing,
+    /// Another launch asked for a window.
+    Open(single::Request),
     UsbipAttached(Result<(), String>),
     Woke(wake::WakeResult),
 }
@@ -64,9 +64,9 @@ pub fn run(state_dir: PathBuf, trace_apdu: bool, instance: single::Instance) {
         })
         .inspect_err(|error| logging::log(&format!("prompt watcher unavailable: {error}")))
         .ok();
-        let pairing = events.clone();
-        instance.listen(move || {
-            let _ = pairing.send(UiEvent::OpenPairing);
+        let requests = events.clone();
+        instance.listen(move |request| {
+            let _ = requests.send(UiEvent::Open(request));
         });
         // Created on the gpui main thread, whose message loop pumps it.
         let tray = Tray::new(crate::assets::Icons::load())
@@ -229,7 +229,8 @@ fn handle_event(event: UiEvent, cx: &mut App) {
             logging::log("wake: WebAuthn ceremony started");
             request_tap(cx);
         }
-        UiEvent::OpenPairing => open_pairing(cx),
+        UiEvent::Open(single::Request::Pairing) => open_pairing(cx),
+        UiEvent::Open(single::Request::PasskeyOptions) => open_passkey_options(cx),
         UiEvent::Woke(result) => {
             let notice = match result {
                 wake::WakeResult::Sent => {
@@ -274,11 +275,7 @@ fn handle_action(action: MenuAction, cx: &mut App) {
             let window = ui::open_status_window(lines, existing, cx);
             cx.update_global::<Shell, _>(|shell, _| shell.status = Some(window));
         }
-        MenuAction::PasskeyOptions => {
-            let existing = cx.global::<Shell>().passkey_options;
-            let window = ui::open_passkey_window(existing, cx);
-            cx.update_global::<Shell, _>(|shell, _| shell.passkey_options = Some(window));
-        }
+        MenuAction::PasskeyOptions => open_passkey_options(cx),
         MenuAction::ToggleAutostart(enabled) => {
             let result = autostart::set_enabled(enabled);
             logging::log(&format!("start at login -> {enabled}: {result:?}"));
@@ -331,6 +328,12 @@ fn request_tap(cx: &mut App) {
         shell.notice = notice;
         shell.refresh_tray();
     });
+}
+
+fn open_passkey_options(cx: &mut App) {
+    let existing = cx.global::<Shell>().passkey_options;
+    let window = ui::open_passkey_window(existing, cx);
+    cx.update_global::<Shell, _>(|shell, _| shell.passkey_options = Some(window));
 }
 
 fn open_pairing(cx: &mut App) {

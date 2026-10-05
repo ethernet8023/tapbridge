@@ -39,6 +39,6 @@ fn main() {
         ));
     }));
     logging::log("tapbridge starting");
-    let instance = single::acquire();
+    let instance = single::acquire(single::Request::from_args(std::env::args().skip(1)));
     app_state::run(dir, trace_apdu, instance);
 }

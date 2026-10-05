@@ -2,8 +2,8 @@
 //! surfaces use gpui; the tray and all orchestration live beside them.
 use crate::passkeys;
 use gpui::{
-    Animation, AnimationExt, App, Bounds, Context, Task, Window, WindowBounds, WindowHandle,
-    WindowOptions, canvas, div, fill, point, prelude::*, px, rgb, size,
+    Animation, AnimationExt, App, Bounds, Context, Pixels, Task, Window, WindowBounds,
+    WindowHandle, WindowOptions, canvas, div, fill, point, prelude::*, px, rgb, size,
 };
 use std::{
     rc::Rc,
@@ -111,7 +111,7 @@ impl Render for PairingView {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(success_badge()),
+                        .child(success_badge(150.0)),
                 )
                 .child(
                     div()
@@ -199,8 +199,7 @@ impl Render for PairingView {
 }
 
 /// Green disc that springs in with a white check mark drawn as a vector path.
-fn success_badge() -> impl IntoElement {
-    let diameter = 150.0;
+fn success_badge(diameter: f32) -> impl IntoElement {
     div()
         .size(px(diameter))
         .rounded_full()
@@ -329,56 +328,193 @@ pub fn open_anchor_window(cx: &mut App) -> WindowHandle<Anchor> {
 /// Passkey options: which choices the Windows passkey dialog offers.
 pub struct PasskeyView {
     options: passkeys::Options,
-    busy: bool,
-    /// Last result line; `true` marks an error.
-    message: Option<(String, bool)>,
+    /// In-window dialog over the options while a change runs or reports.
+    dialog: Option<PasskeyDialog>,
+}
+
+enum PasskeyDialog {
+    /// Waiting for the UAC prompt and the SYSTEM policy step.
+    Working,
+    Done {
+        ok: bool,
+        text: String,
+    },
 }
 
 impl PasskeyView {
     fn new() -> Self {
         Self {
             options: passkeys::read(),
-            busy: false,
-            message: None,
+            dialog: None,
         }
     }
 
     fn toggle_windows_hello(&mut self, cx: &mut Context<Self>) {
         let enable = !self.options.windows_hello;
-        self.message = match passkeys::set_windows_hello(enable) {
-            Ok(()) => None,
-            Err(error) => Some((format!("Couldn't change it: {error}"), true)),
-        };
+        if let Err(error) = passkeys::set_windows_hello(enable) {
+            self.dialog = Some(PasskeyDialog::Done {
+                ok: false,
+                text: format!("Couldn't change Windows Hello passkeys: {error}"),
+            });
+        }
         self.options = passkeys::read();
         cx.notify();
     }
 
     fn toggle_phone(&mut self, cx: &mut Context<Self>) {
-        if self.busy || self.options.phone == passkeys::Phone::ManagedElsewhere {
+        if self.dialog.is_some() || self.options.phone == passkeys::Phone::ManagedElsewhere {
             return;
         }
         let allow = self.options.phone == passkeys::Phone::Blocked;
-        self.busy = true;
-        self.message = Some(("Approve the Windows prompt to continue".into(), false));
+        self.dialog = Some(PasskeyDialog::Working);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { passkeys::set_phone(allow) })
                 .await;
-            let _ = this.update(cx, |view, cx| {
-                view.busy = false;
-                view.options = passkeys::read();
-                view.message = Some(match result {
-                    Ok(()) if allow => ("Phone sign-in is allowed again".into(), false),
-                    Ok(()) => ("Phone sign-in is blocked".into(), false),
-                    Err(error) => (error, true),
+            let _ =
+                this.update(cx, |view, cx| {
+                    view.options = passkeys::read();
+                    view.dialog = Some(match result {
+                    Ok(()) if allow => PasskeyDialog::Done {
+                        ok: true,
+                        text: "Phone sign-in is allowed again.".into(),
+                    },
+                    Ok(()) => PasskeyDialog::Done {
+                        ok: true,
+                        text: "Phone sign-in is blocked. Your other Bluetooth devices keep working."
+                            .into(),
+                    },
+                    Err(error) => PasskeyDialog::Done { ok: false, text: error },
                 });
-                cx.notify();
-            });
+                    cx.notify();
+                });
         })
         .detach();
     }
+
+    fn render_dialog(&self, dialog: &PasskeyDialog, cx: &mut Context<Self>) -> impl IntoElement {
+        let card = div()
+            .w(px(380.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(14.0))
+            .p(px(26.0))
+            .rounded(px(18.0))
+            .bg(rgb(PANEL_2))
+            .border_1()
+            .border_color(rgb(0x3A3052));
+        let card = match dialog {
+            PasskeyDialog::Working => card
+                .child(spinner(px(56.0)))
+                .child(
+                    div()
+                        .text_size(px(17.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child("Waiting for Windows"),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(rgb(ACCENT_SOFT))
+                        .text_center()
+                        .child(
+                            "Approve the administrator prompt (UAC). tapbridge then updates \
+                             the Bluetooth policy. This takes a few seconds.",
+                        ),
+                ),
+            PasskeyDialog::Done { ok, text } => card
+                .child(if *ok {
+                    success_badge(64.0).into_any_element()
+                } else {
+                    div()
+                        .text_size(px(40.0))
+                        .text_color(rgb(WARN))
+                        .child("!")
+                        .into_any_element()
+                })
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .text_center()
+                        .text_color(rgb(if *ok { TEXT } else { WARN }))
+                        .child(text.clone()),
+                )
+                .child(
+                    div()
+                        .id("dialog-done")
+                        .px(px(22.0))
+                        .py(px(8.0))
+                        .rounded(px(10.0))
+                        .bg(rgb(ACCENT))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(0x6A4BEB)))
+                        .text_size(px(14.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .child("Done")
+                        .on_click(cx.listener(|view, _: &gpui::ClickEvent, _, cx| {
+                            view.dialog = None;
+                            cx.notify();
+                        })),
+                ),
+        };
+        // Dim backdrop; occlude so the options behind it can't be clicked.
+        div()
+            .id("dialog-backdrop")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(gpui::rgba(0x0B0814C8))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(card)
+    }
+}
+
+/// Twelve rounded bars around a circle, the brightest one sweeping round.
+/// The canvas reads the clock; the repeating animation keeps frames coming.
+fn spinner(diameter: Pixels) -> impl IntoElement {
+    let started = Instant::now();
+    div()
+        .size(diameter)
+        .child(
+            canvas(
+                |_, _, _| {},
+                move |bounds, (), window, _| {
+                    const BARS: usize = 12;
+                    let phase = (started.elapsed().as_secs_f32() * 1.1).fract();
+                    let center = bounds.center();
+                    let radius = bounds.size.width.min(bounds.size.height) / 2.0;
+                    let (bar_w, bar_h) = (radius * 0.16, radius * 0.42);
+                    for i in 0..BARS {
+                        let angle = std::f32::consts::TAU * i as f32 / BARS as f32;
+                        let lag = (phase - i as f32 / BARS as f32).rem_euclid(1.0);
+                        let alpha = (255.0 * (1.0 - lag).powf(1.6)).max(40.0) as u32;
+                        let distance = radius - bar_h / 2.0;
+                        let at = center + point(distance * angle.sin(), -(distance * angle.cos()))
+                            - point(bar_w / 2.0, bar_h / 2.0);
+                        // Bars are drawn axis-aligned but placed round the
+                        // circle; at this size that reads as a spinner.
+                        window.paint_quad(
+                            fill(
+                                Bounds::new(at, size(bar_w, bar_h)),
+                                gpui::rgba((ACCENT_SOFT << 8) | alpha),
+                            )
+                            .corner_radii(bar_w / 2.0),
+                        );
+                    }
+                },
+            )
+            .size_full(),
+        )
+        .with_animation(
+            "spinner",
+            Animation::new(Duration::from_secs(1)).repeat(),
+            |spinner, _| spinner,
+        )
 }
 
 fn checkbox(checked: bool, enabled: bool) -> impl IntoElement {
@@ -431,7 +567,11 @@ fn option_row(
         })
         .child(checkbox(checked, enabled))
         .child(
+            // flex_1 + min_w(0): take the remaining width and wrap inside it
+            // instead of growing past the window edge.
             div()
+                .flex_1()
+                .min_w(px(0.0))
                 .flex()
                 .flex_col()
                 .gap(px(2.0))
@@ -454,27 +594,40 @@ fn option_row(
 impl Render for PasskeyView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let options = &self.options;
-        let phone_enabled = !self.busy && options.phone != passkeys::Phone::ManagedElsewhere;
+        let idle = self.dialog.is_none();
+        let phone_enabled = idle && options.phone != passkeys::Phone::ManagedElsewhere;
         let phone_detail = match options.phone {
             passkeys::Phone::Allowed => {
-                "QR code + Bluetooth. Unchecking blocks the FIDO Bluetooth services (admin prompt)."
-                    .to_owned()
+                "Sign in with a phone over QR code and Bluetooth. Unchecking blocks the FIDO \
+                 Bluetooth services (asks for admin)."
             }
             passkeys::Phone::Blocked => {
-                "Blocked: Bluetooth allows every common service except FIDO.".to_owned()
+                "Blocked. Bluetooth allows every common service except FIDO."
             }
             passkeys::Phone::ManagedElsewhere => {
-                "Your organization manages the Bluetooth service list.".to_owned()
+                "Your organization manages this PC's Bluetooth services."
             }
+        }
+        .to_owned();
+        let managers_detail = if options.providers.is_empty() {
+            "None installed (1Password, Bitwarden...).".to_owned()
+        } else {
+            format!(
+                "{}. Click to switch them in Windows Settings.",
+                options
+                    .providers
+                    .iter()
+                    .map(|provider| provider.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         };
-        let mut column = div()
+        let column = div()
             .flex()
             .flex_col()
             .gap(px(10.0))
             .p(px(22.0))
             .size_full()
-            .bg(rgb(PANEL))
-            .text_color(rgb(TEXT))
             .child(
                 div()
                     .text_size(px(20.0))
@@ -486,7 +639,10 @@ impl Render for PasskeyView {
                     .text_size(px(13.0))
                     .text_color(rgb(ACCENT_SOFT))
                     .pb(px(6.0))
-                    .child("Choose what the Windows passkey dialog offers. Unchecked options disappear or stop working."),
+                    .child(
+                        "Choose what the Windows passkey dialog offers. Unchecked options \
+                         disappear or stop working.",
+                    ),
             )
             .child(option_row(
                 "opt-key",
@@ -499,11 +655,15 @@ impl Render for PasskeyView {
                 option_row(
                     "opt-hello",
                     options.windows_hello,
-                    !self.busy,
+                    idle,
                     "This Windows device",
                     "Passkeys saved with Windows Hello on this PC.".to_owned(),
                 )
-                .on_click(cx.listener(|view, _: &gpui::ClickEvent, _, cx| view.toggle_windows_hello(cx))),
+                .on_click(cx.listener(|view, _: &gpui::ClickEvent, _, cx| {
+                    if view.dialog.is_none() {
+                        view.toggle_windows_hello(cx)
+                    }
+                })),
             )
             .child(
                 option_row(
@@ -514,40 +674,28 @@ impl Render for PasskeyView {
                     phone_detail,
                 )
                 .on_click(cx.listener(|view, _: &gpui::ClickEvent, _, cx| view.toggle_phone(cx))),
-            );
-        let providers = if options.providers.is_empty() {
-            "No passkey managers (1Password, Bitwarden...) are installed.".to_owned()
-        } else {
-            options
-                .providers
-                .iter()
-                .map(|provider| provider.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        column = column
+            )
             .child(
                 option_row(
                     "opt-managers",
                     !options.providers.is_empty(),
-                    !options.providers.is_empty(),
+                    idle && !options.providers.is_empty(),
                     "Passkey managers",
-                    format!("{providers} Switch them in Windows Settings."),
+                    managers_detail,
                 )
                 .when(!options.providers.is_empty(), |row| {
                     row.on_click(|_, _, _| passkeys::open_windows_passkey_settings())
                 }),
-            )
-            .when_some(self.message.clone(), |column, (text, error)| {
-                column.child(
-                    div()
-                        .pt(px(4.0))
-                        .text_size(px(13.0))
-                        .text_color(rgb(if error { WARN } else { GOOD }))
-                        .child(text),
-                )
-            });
-        column
+            );
+        div()
+            .relative()
+            .size_full()
+            .bg(rgb(PANEL))
+            .text_color(rgb(TEXT))
+            .child(column)
+            .when_some(self.dialog.as_ref(), |root, dialog| {
+                root.child(self.render_dialog(dialog, cx))
+            })
     }
 }
 
@@ -557,7 +705,9 @@ pub fn open_passkey_window(
 ) -> WindowHandle<PasskeyView> {
     if let Some(handle) = existing {
         let refreshed = handle.update(cx, |view, window, cx| {
-            view.options = passkeys::read();
+            if view.dialog.is_none() {
+                view.options = passkeys::read();
+            }
             window.activate_window();
             cx.notify();
         });
