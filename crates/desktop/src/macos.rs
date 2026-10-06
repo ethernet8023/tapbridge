@@ -59,13 +59,17 @@ pub mod dock {
             return; // Not the main thread: AppKit calls are invalid anyway.
         };
         let app = NSApplication::sharedApplication(mtm);
-        // Window activation is handled by gpui (`window.activate_window()`
-        // at every open site); this only toggles Dock presence.
         app.setActivationPolicy(if visible {
             NSApplicationActivationPolicy::Regular
         } else {
             NSApplicationActivationPolicy::Accessory
         });
+        if visible {
+            // An accessory app gaining a Dock icon is not made active by
+            // the policy change; bring tapbridge forward so the new window
+            // lands in front instead of behind the current app.
+            app.activate();
+        }
     }
 }
 

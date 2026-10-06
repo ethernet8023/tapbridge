@@ -254,19 +254,22 @@ pub fn open_pairing_window(
     }
     let invitation = invitation.to_owned();
     let bounds = Bounds::centered(None, size(px(PAIRING_WINDOW), px(PAIRING_WINDOW)), cx);
-    cx.open_window(
-        WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(gpui::TitlebarOptions {
-                title: Some("Pair phone".into()),
+    let window = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(gpui::TitlebarOptions {
+                    title: Some("Pair phone".into()),
+                    ..Default::default()
+                }),
+                is_resizable: false,
                 ..Default::default()
-            }),
-            is_resizable: false,
-            ..Default::default()
-        },
-        move |_window, cx| cx.new(|cx| PairingView::new(&invitation, cx)),
-    )
-    .expect("pairing window")
+            },
+            move |_window, cx| cx.new(|cx| PairingView::new(&invitation, cx)),
+        )
+        .expect("pairing window");
+    window.update(cx, |_, window, _| window.activate_window()).ok();
+    window
 }
 
 /// `Some(true)` when the open pairing window's invitation ran out; `None`
@@ -795,18 +798,21 @@ pub fn open_status_window(
         }
     }
     let bounds = Bounds::centered(None, size(px(420.0), px(260.0)), cx);
-    cx.open_window(
-        WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(gpui::TitlebarOptions {
-                title: Some("tapbridge".into()),
+    let window = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(gpui::TitlebarOptions {
+                    title: Some("tapbridge".into()),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
-        },
-        move |_window, cx| cx.new(|_| StatusView::new(lines)),
-    )
-    .expect("status window")
+            },
+            move |_window, cx| cx.new(|_| StatusView::new(lines)),
+        )
+        .expect("status window");
+    window.update(cx, |_, window, _| window.activate_window()).ok();
+    window
 }
 
 /// Row-major dark modules and the side length in modules.
