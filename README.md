@@ -48,6 +48,7 @@ Requirements: Rust 1.91+, LLVM clang and the MSVC build tools (arm64 and x64 lib
 |---|---|
 | Rust tests, clippy, fmt | `powershell -File scripts\check.ps1` |
 | Desktop installers (`dist\`) | `$env:TAPBRIDGE_RELAY_URL='https://...'; powershell -File scripts\build-desktop.ps1 -Arch both` |
+| macOS pkg (`dist/tapbridge-<version>-macos.pkg`) | `cargo build --release -p tapbridge-desktop && crates/desktop/ifd_shim/build.sh && scripts/build-pkg.sh [--sign "Developer ID Installer: NAME (TEAMID)"]` |
 | Android tests, lint, debug APK | in `android\`: `gradlew.bat testDebugUnitTest lintDebug assembleDebug` |
 | Play bundle (AAB) | in `android\`: `gradlew.bat bundleRelease` |
 | Relay | see `relay\README.md` |

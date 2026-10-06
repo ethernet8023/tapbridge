@@ -1,0 +1,23 @@
+{\rtf1\ansi\deff0
+{\fonttbl{\f0 \fmodern \fsmac \fsys Helvetica;}}
+\fs24
+
+\b Getting started
+
+1.\b0  Start tapbridge from /usr/local/bin (or enable "Start at login" from its tray icon).
+
+2. Verify the reader is registered:
+    system_profiler SPSmartCardsDataType  (or pcsc_scan after brew install pcsc-tools)
+
+3. Pair your phone: tapbridge tray icon > "Pair phone...", then scan the QR code with the tapbridge Android app. You can pair with more than one computer.
+
+4. When a PIV/cert login or client-certificate prompt needs your card, your phone gets a wake notification; unlock the phone and hold the key to its back.
+
+\b Notes
+
+\b0 - The reader supports PIV/smart-card flows (macOS login, Safari client certificates, OpenSC). Website WebAuthn sign-ins use the separate hybrid authenticator (in development).
+- If the reader does not appear, inspect:
+    log show --predicate '(subsystem == "com.apple.CryptoTokenKit")' --info --last 5m
+- Uninstall:
+    sudo rm -rf /usr/local/libexec/SmartCardServices/drivers/tapbridge.bundle /usr/local/bin/tapbridge
+}
