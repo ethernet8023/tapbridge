@@ -16,6 +16,12 @@ import javax.crypto.spec.GCMParameterSpec
  *
  * Keystore failures propagate (fail loud) — we never silently rekey, because
  * that would orphan the pairing on the host side.
+ *
+ * One phone pairs MANY hosts (Track C): per-host records live in one JSON
+ * pref key ([PairedHosts]); the legacy single-host keys are migrated once.
+ * Each host is an independent peer with its own identity key and pairing
+ * capability and still pins exactly one phone. The phone's own identity key
+ * and FCM token belong to this install and are shared by all hosts.
  */
 object IdentityStore {
     private const val KS = "AndroidKeyStore"
@@ -23,6 +29,9 @@ object IdentityStore {
     private const val PREFS = "tapbridge_identity"
     private const val K_KEY = "wrapped_key"
     private const val K_IV = "wrap_iv"
+    private const val K_HOSTS = "paired_hosts"
+    private const val K_LAST_USED = "last_used_host"
+    // Legacy single-host keys (pre multi-PC pairing); read-only after migration.
     private const val K_HOST = "paired_host"
     private const val K_HINT = "cached_hint"
     private const val K_HOST_NAME = "host_name"
@@ -52,48 +61,106 @@ object IdentityStore {
         return key
     }
 
-    fun pairedHost(ctx: Context): String? =
-        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(K_HOST, null)
+    // ------------------------------------------------------------- paired hosts
 
-    /** Called only after the host has accepted the connection. */
-    fun saveHost(ctx: Context, host: String) {
-        check(ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit().putString(K_HOST, host).commit()) { "host pairing could not be saved" }
+    /**
+     * All paired hosts, oldest-paired first (list order = display order).
+     * Runs the one-time legacy migration on first read; never re-keys.
+     */
+    @Synchronized
+    fun pairedHosts(ctx: Context): List<PairedHosts.Record> {
+        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val stored = prefs.getString(K_HOSTS, null)
+        if (stored == null) {
+            // One-time migration from the single-host prefs. The legacy keys
+            // are removed in the SAME commit so a crash cannot double-run or
+            // resurrect the old value; corrupt data fails loudly.
+            val migrated = PairedHosts.migrate(
+                prefs.getString(K_HOST, null),
+                prefs.getString(K_HOST_NAME, null),
+                prefs.getString(K_HINT, null),
+            )
+            check(prefs.edit()
+                .putString(K_HOSTS, PairedHosts.encode(migrated))
+                .remove(K_HOST).remove(K_HINT).remove(K_HOST_NAME)
+                .commit()) { "paired-hosts migration could not be saved" }
+            return migrated
+        }
+        return PairedHosts.decode(stored)
     }
 
-    fun forgetHost(ctx: Context) {
+    private fun saveHosts(ctx: Context, records: List<PairedHosts.Record>) {
         check(ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit()
-            .remove(K_HOST)
-            .remove(K_HINT)
-            .remove(K_HOST_NAME)
-            // The FCM token belongs to this install, not to the pairing: keep
-            // it, or the next PC could never wake this phone.
+            .edit().putString(K_HOSTS, PairedHosts.encode(records)).commit()) {
+            "paired hosts could not be saved"
+        }
+    }
+
+    fun hostById(ctx: Context, hostId: String): PairedHosts.Record? =
+        pairedHosts(ctx).firstOrNull { it.hostId == hostId }
+
+    /** Record after a successful connect/Accepted; keeps pairedAt and renames. */
+    fun saveAcceptedHost(ctx: Context, hostId: String, name: String) {
+        val hosts = pairedHosts(ctx)
+        saveHosts(
+            ctx,
+            PairedHosts.upsertAfterAccept(hosts, hostId, name, System.currentTimeMillis()),
+        )
+        setLastUsedHost(ctx, hostId)
+    }
+
+    /** Update the cached hint for one host; best-effort (non-connection-critical). */
+    fun saveHint(ctx: Context, hostId: String, hint: String) {
+        if (hint.isBlank() || !PairedHosts.validHint(hint)) return
+        val hosts = pairedHosts(ctx)
+        val record = hosts.firstOrNull { it.hostId == hostId } ?: return
+        if (record.cachedHint == hint) return
+        saveHosts(ctx, hosts.map { if (it.hostId == hostId) it.copy(cachedHint = hint) else it })
+    }
+
+    /** Cached hint for one host (HOSTID[;r=..][;d=..]); null when unknown. */
+    fun cachedHint(ctx: Context, hostId: String): String? =
+        hostById(ctx, hostId)?.cachedHint
+
+    /** Per-host rename; Accepted no longer overwrites a user-chosen name. */
+    fun renameHost(ctx: Context, hostId: String, name: String) {
+        saveHosts(ctx, PairedHosts.withRenamed(pairedHosts(ctx), hostId, name.trim()))
+    }
+
+    /**
+     * Forget ONE host ("forget this PC"). The FCM token and the phone identity
+     * belong to this install, not the pairing, and stay — the next PC (or the
+     * remaining ones) still reach this phone.
+     */
+    fun forgetHost(ctx: Context, hostId: String) {
+        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val hosts = pairedHosts(ctx)
+        val remaining = PairedHosts.withoutHost(hosts, hostId)
+        val last = lastUsedHost(ctx)
+        val fallback = PairedHosts.fallbackLastUsed(hosts, hostId, last)
+        check(prefs.edit()
+            .putString(K_HOSTS, PairedHosts.encode(remaining))
+            .putString(K_LAST_USED, fallback)
             .commit()) { "could not forget the paired PC" }
     }
 
     /**
-     * Last wake hint known for the paired host (HOSTID[;r=..][;d=..]).
-     * Cached from every FCM wake and every successful dial so later
-     * reconnects skip discovery. A bare host id is still a valid hint.
+     * The host the app last connected to: UI default and app-open auto-connect.
+     * Null when nothing is paired. Resilient: an unknown value (state restored
+     * from a partial backup) falls back to the most recently paired host.
      */
-    fun cachedHint(ctx: Context): String? =
-        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(K_HINT, null)
-
-    /** Update the cached hint; best-effort (non-connection-critical). */
-    fun saveHint(ctx: Context, hint: String) {
-        if (hint.isBlank()) return
-        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit().putString(K_HINT, hint).apply()
+    fun lastUsedHost(ctx: Context): String? {
+        val hosts = pairedHosts(ctx)
+        if (hosts.isEmpty()) return null
+        val saved = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(K_LAST_USED, null)
+        return if (saved != null && hosts.any { it.hostId == saved }) saved
+        else hosts.maxByOrNull { it.pairedAt }?.hostId
     }
 
-    /** Host display name as reported in Accepted { name }. */
-    fun hostName(ctx: Context): String? =
-        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(K_HOST_NAME, null)
-
-    fun saveHostName(ctx: Context, name: String) {
+    fun setLastUsedHost(ctx: Context, hostId: String) {
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit().putString(K_HOST_NAME, name).apply()
+            .edit().putString(K_LAST_USED, hostId).apply()
     }
 
     /** Current FCM token, sent as Hello.push on the next connect. */
@@ -106,9 +173,8 @@ object IdentityStore {
     }
 
     /** Phone display name shown on the PC. Default derived, editable in settings. */
-    fun phoneName(ctx: Context): String =
-        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(K_PHONE_NAME, null)
-            ?: defaultPhoneName(ctx)
+    fun phoneName(ctx: Context): String = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        .getString(K_PHONE_NAME, null) ?: defaultPhoneName(ctx)
 
     fun setPhoneName(ctx: Context, name: String) {
         val trimmed = name.trim()
