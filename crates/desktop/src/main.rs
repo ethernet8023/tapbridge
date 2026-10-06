@@ -36,7 +36,7 @@ fn state_dir() -> PathBuf {
     }
     #[cfg(target_os = "macos")]
     {
-        return macos::state_dir();
+        macos::state_dir()
     }
     #[cfg(all(not(windows), not(target_os = "macos")))]
     {

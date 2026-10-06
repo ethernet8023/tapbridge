@@ -19,9 +19,9 @@ use aes_gcm::{
 };
 use iroh::SecretKey;
 use security_framework::base::Error as KeychainError;
-use security_framework::passwords::{
-    delete_generic_password, generic_password, set_generic_password_options,
-};
+#[cfg(test)]
+use security_framework::passwords::delete_generic_password;
+use security_framework::passwords::{generic_password, set_generic_password_options};
 use security_framework::passwords_options::PasswordOptions;
 use std::io;
 use std::sync::{Mutex, OnceLock};
@@ -194,9 +194,7 @@ pub fn open(envelope: &[u8]) -> io::Result<Vec<u8>> {
 /// Test-only: delete this process's keychain item (see `service_name`).
 #[cfg(test)]
 pub fn delete_test_item() -> io::Result<()> {
-    delete_generic_password(&service_name(), ACCOUNT)
-        .map(|()| ())
-        .map_err(keychain)
+    delete_generic_password(&service_name(), ACCOUNT).map_err(keychain)
 }
 
 #[cfg(test)]

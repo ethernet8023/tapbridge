@@ -14,7 +14,7 @@ use std::{
     io::{self, Read, Write},
     os::unix::{net::UnixListener, net::UnixStream},
     path::PathBuf,
-    sync::{Mutex, OnceLock},
+    sync::Mutex,
     time::{Duration, Instant},
 };
 use tapbridge_host::{
@@ -31,14 +31,15 @@ pub const IFD_SOCKET_PATH: &str = "/var/tmp/tapbridge-ifd.sock";
 const WAKE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Rate-limit state: last instant a PC/SC-triggered wake was sent.
+/// The daemon owns one; the IFD socket server creates its own instance.
 #[derive(Default)]
-struct WakeLimiter {
+pub(crate) struct WakeLimiter {
     last: Mutex<Option<Instant>>,
 }
 
 impl WakeLimiter {
     /// True when a wake may be sent now (records it).
-    fn allowed(&self) -> bool {
+    pub(crate) fn allowed(&self) -> bool {
         let Ok(mut last) = self.last.lock() else {
             return false;
         };
@@ -51,14 +52,6 @@ impl WakeLimiter {
         }
     }
 }
-
-/// Rate limiter for the production daemon (single global instance).
-fn wake_allowed() -> bool {
-    LAST_WAKE_DAEMON.get_or_init(WakeLimiter::default).allowed()
-}
-
-/// The daemon's wake limiter (exactly one per process).
-static LAST_WAKE_DAEMON: OnceLock<WakeLimiter> = OnceLock::new();
 
 /// State dir: `~/Library/Application Support/tapbridge` (created lazily).
 pub fn state_dir() -> PathBuf {
@@ -259,14 +252,12 @@ pub fn serve(
     let limiter = std::sync::Arc::new(WakeLimiter::default());
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
-        loop {
-            let request = match read_request(&mut stream) {
-                Ok(request) => request,
-                Err(_) => break,
+        while let Ok(request) = read_request(&mut stream) {
+            let response = {
+                let wake = wake.clone();
+                let limiter = limiter.clone();
+                handle_request(&request, &service, move || wake(), &limiter)
             };
-            let wake = wake.clone();
-            let limiter = limiter.clone();
-            let response = handle_request(&request, &service, move || wake(), &limiter);
             if write_response(&mut stream, &response).is_err() {
                 break;
             }
@@ -421,16 +412,14 @@ mod tests {
             impl Drop for KeychainItem {
                 fn drop(&mut self) {
                     // SAFETY: test teardown; no other thread reads the env.
-                    unsafe {
-                        if let Ok(service) = std::env::var("TAPBRIDGE_TEST_KEYCHAIN") {
-                            let _ = std::process::Command::new("security")
-                                .args([
-                                    "delete-generic-password",
-                                    "-s",
-                                    &format!("computer.ethernet.tapbridge.host-record#{service}"),
-                                ])
-                                .status();
-                        }
+                    if let Ok(service) = std::env::var("TAPBRIDGE_TEST_KEYCHAIN") {
+                        let _ = std::process::Command::new("security")
+                            .args([
+                                "delete-generic-password",
+                                "-s",
+                                &format!("computer.ethernet.tapbridge.host-record#{service}"),
+                            ])
+                            .status();
                     }
                 }
             }

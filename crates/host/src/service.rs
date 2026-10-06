@@ -109,7 +109,6 @@ pub type PivResult = Result<Vec<u8>, crate::ifd::TransmitError>;
 
 /// Watchdog notifications for stalled PIV transits travel as
 /// [`Command::PivTimeout`] from the per-transmit timer task.
-
 /// One PIV APDU in flight (size-1 like the reader's `InFlight`).
 #[cfg(target_os = "macos")]
 struct PivInFlight {
@@ -173,7 +172,7 @@ impl ServiceHandle {
     #[cfg(target_os = "macos")]
     pub fn piv_transmit(&self, apdu: Vec<u8>) -> PivResult {
         self.reply_option(|reply| Command::PivTransmit { apdu, reply })
-            .unwrap_or_else(|| Err(crate::ifd::TransmitError::Other))
+            .unwrap_or(Err(crate::ifd::TransmitError::Other))
     }
 
     /// Requests graceful shutdown and waits for the workers to finish.
@@ -572,21 +571,19 @@ async fn run_inner(
                                 }
                             }
                             #[cfg(target_os = "macos")]
-                            if let Frame::Response { id, generation, data } = &frame {
-                                if piv_in_flight.as_ref().is_some_and(|inf| inf.apdu_id == *id && inf.generation == *generation)
+                            if let Frame::Response { id, generation, data } = &frame
+                                && piv_in_flight.as_ref().is_some_and(|inf| inf.apdu_id == *id && inf.generation == *generation)
                                     && let Some(inf) = piv_in_flight.take()
                                 {
                                     let _ = inf.reply.send(Ok(data.clone()));
                                 }
-                            }
                             #[cfg(target_os = "macos")]
-                            if let Frame::Failed { id, generation } = &frame {
-                                if piv_in_flight.as_ref().is_some_and(|inf| inf.apdu_id == *id && inf.generation == *generation)
+                            if let Frame::Failed { id, generation } = &frame
+                                && piv_in_flight.as_ref().is_some_and(|inf| inf.apdu_id == *id && inf.generation == *generation)
                                     && let Some(inf) = piv_in_flight.take()
                                 {
                                     let _ = inf.reply.send(Err(crate::ifd::TransmitError::Other));
                                 }
-                            }
                             tokio::select! {
                                 result = to_reader.send(frame) => result.map_err(|_| io::Error::other("reader stopped"))?,
                                 _ = shutdown.changed() => break,
