@@ -203,24 +203,27 @@ fun KeysScreen(
     }
 }
 
-/** Settings: device name, unpair, and permissions at the bottom. */
+/** Settings: device name, paired PCs (rename/forget each), permissions. */
 @Composable
 fun SettingsScreen(
     phoneName: String,
     pushEnabled: Boolean,
     dndGranted: Boolean,
     onRequestDnd: () -> Unit,
-    paired: Boolean,
+    hosts: List<computer.ethernet.tapbridge.PairedHosts.Record>,
     onPhoneName: (String) -> Unit,
     onRequestNotifications: () -> Unit,
-    onForgetPc: () -> Unit,
+    onRenameHost: (hostId: String, name: String) -> Unit,
+    onForgetHost: (hostId: String) -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     // The saved name is tracked here: the caller's value is not observable.
     var savedName by remember { mutableStateOf(phoneName) }
     var nameDraft by remember { mutableStateOf(phoneName) }
-    var confirmForget by remember { mutableStateOf(false) }
+    var renaming by remember { mutableStateOf<computer.ethernet.tapbridge.PairedHosts.Record?>(null) }
+    var renameText by remember { mutableStateOf("") }
+    var forgetting by remember { mutableStateOf<computer.ethernet.tapbridge.PairedHosts.Record?>(null) }
     val edited = nameDraft.isNotBlank() && nameDraft.trim() != savedName
     Column(
         modifier
@@ -253,13 +256,43 @@ fun SettingsScreen(
                 modifier = Modifier.padding(top = 8.dp),
             ) { Text("Save name") }
         }
-        if (paired) {
-            HorizontalDivider(Modifier.padding(vertical = 16.dp))
-            OutlinedButton(
-                onClick = { confirmForget = true },
-                colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
-                modifier = Modifier.fillMaxWidth(),
-            ) { Text("Unpair your connected PC") }
+        HorizontalDivider(Modifier.padding(vertical = 16.dp))
+        Text(
+            "Paired PCs",
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.padding(bottom = 4.dp),
+        )
+        if (hosts.isEmpty()) {
+            Text(
+                "No PCs paired yet. Scan a PC's pairing code to add it.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(vertical = 12.dp),
+            )
+        }
+        hosts.forEach { host ->
+            ListItem(
+                headlineContent = { Text(host.name, fontWeight = FontWeight.Medium) },
+                supportingContent = {
+                    Text(
+                        host.hostId.take(8) + "…" +
+                            (host.cachedHint?.let { " · cached" } ?: "")
+                    )
+                },
+                trailingContent = {
+                    Row {
+                        IconButton(onClick = {
+                            renaming = host
+                            renameText = host.name
+                        }) {
+                            Icon(Icons.Filled.Edit, contentDescription = "Rename ${host.name}")
+                        }
+                        IconButton(onClick = { forgetting = host }) {
+                            Icon(Icons.Filled.Delete, contentDescription = "Forget ${host.name}")
+                        }
+                    }
+                },
+            )
         }
         HorizontalDivider(Modifier.padding(vertical = 16.dp))
         Text(
@@ -270,7 +303,7 @@ fun SettingsScreen(
         )
         ListItem(
             headlineContent = { Text("Notifications") },
-            supportingContent = { Text("Lets your PC wake this phone when it needs your key") },
+            supportingContent = { Text("Lets your PCs wake this phone when they need your key") },
             trailingContent = {
                 if (!pushEnabled) {
                     TextButton(onClick = onRequestNotifications) { Text("Allow") }
@@ -291,19 +324,47 @@ fun SettingsScreen(
             },
         )
     }
-    if (confirmForget) {
+    if (renaming != null) {
         AlertDialog(
-            onDismissRequest = { confirmForget = false },
-            title = { Text("Unpair this PC?") },
-            text = { Text("You'll need to scan the PC's pairing code again to reconnect.") },
+            onDismissRequest = { renaming = null },
+            title = { Text("Rename PC") },
+            text = {
+                OutlinedTextField(
+                    value = renameText,
+                    onValueChange = { renameText = it.take(64) },
+                    singleLine = true,
+                )
+            },
             confirmButton = {
-                TextButton(onClick = {
-                    confirmForget = false
-                    onForgetPc()
-                }) { Text("Unpair") }
+                TextButton(
+                    enabled = renameText.isNotBlank(),
+                    onClick = {
+                        val host = renaming
+                        if (host != null && renameText.isNotBlank()) {
+                            onRenameHost(host.hostId, renameText.trim())
+                        }
+                        renaming = null
+                    },
+                ) { Text("Save") }
             },
             dismissButton = {
-                TextButton(onClick = { confirmForget = false }) { Text("Cancel") }
+                TextButton(onClick = { renaming = null }) { Text("Cancel") }
+            },
+        )
+    }
+    if (forgetting != null) {
+        AlertDialog(
+            onDismissRequest = { forgetting = null },
+            title = { Text("Forget ${forgetting?.name ?: "this PC"}?") },
+            text = { Text("You'll need to scan that PC's pairing code again to reconnect. Your other PCs stay paired.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    forgetting?.let { onForgetHost(it.hostId) }
+                    forgetting = null
+                }) { Text("Forget") }
+            },
+            dismissButton = {
+                TextButton(onClick = { forgetting = null }) { Text("Cancel") }
             },
         )
     }

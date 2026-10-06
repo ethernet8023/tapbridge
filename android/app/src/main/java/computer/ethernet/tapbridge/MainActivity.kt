@@ -259,8 +259,9 @@ class MainActivity : ComponentActivity() {
         }
         service?.resumeTagDiscovery()
         service?.onAppVisibility(true)
-        // DESIGN: opening the app while paired connects immediately.
-        if (IdentityStore.pairedHost(this) != null) {
+        // DESIGN: opening the app while paired connects immediately (to the
+        // last-used host).
+        if (IdentityStore.pairedHosts(this).isNotEmpty()) {
             startTapService()
         }
         try {
@@ -306,6 +307,7 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
     val context = LocalContext.current
     var screen by rememberSaveable { mutableStateOf("home") }
     var keys by remember { mutableStateOf(RegisteredKeys.list(context)) }
+    var hosts by remember { mutableStateOf(IdentityStore.pairedHosts(context)) }
 
     // System back (and predictive back) returns to home from any sub-screen.
     BackHandler(enabled = screen != "home") { screen = "home" }
@@ -326,6 +328,7 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
                     onPaired = {
                         PairingState.setPendingInvitation(it)
                         activity.startTapService()
+                        hosts = IdentityStore.pairedHosts(context)
                         // Wake alerts need notifications; ask while the user
                         // is setting the app up.
                         if (!ui.notificationsGranted && Build.VERSION.SDK_INT >= 33) {
@@ -361,7 +364,7 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
                             Intent(android.provider.Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS),
                         )
                     },
-                    paired = IdentityStore.pairedHost(context) != null,
+                    hosts = hosts,
                     onPhoneName = { name ->
                         runCatching { IdentityStore.setPhoneName(context, name) }
                     },
@@ -370,10 +373,17 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
                             android.Manifest.permission.POST_NOTIFICATIONS,
                         )
                     },
-                    onForgetPc = {
+                    onRenameHost = { hostId, name ->
+                        runCatching { IdentityStore.renameHost(context, hostId, name) }
+                        hosts = IdentityStore.pairedHosts(context)
+                    },
+                    onForgetHost = { hostId ->
+                        // The connection is shared state: stop it when the
+                        // host it serves is forgotten, or when nothing is
+                        // left to connect to.
                         activity.stopTapService()
-                        IdentityStore.forgetHost(context)
-                        screen = "home"
+                        IdentityStore.forgetHost(context, hostId)
+                        hosts = IdentityStore.pairedHosts(context)
                     },
                     onBack = { screen = "home" },
                     Modifier.fillMaxSize(),
