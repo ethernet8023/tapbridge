@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<pkg-info overwrite-permissions="true" relocatable="false" identifier="computer.ethernet.tapbridge" postinstall-action="none" version="0.1.0" format-version="2" generator-version="InstallCmds-864.12 (25G83)" install-location="/" auth="root">
+    <payload numberOfFiles="19" installKBytes="23954"/>
+    <bundle path="./Applications/tapbridge.app" id="computer.ethernet.tapbridge" CFBundleShortVersionString="0.1.0" CFBundleVersion="0.1.0"/>
+    <bundle path="./usr/local/libexec/SmartCardServices/drivers/tapbridge.bundle" id="computer.ethernet.tapbridge.mac.ifd-tapbridge" CFBundleShortVersionString="0.1.0" CFBundleVersion="0.1.0"/>
+    <bundle-version>
+        <bundle id="computer.ethernet.tapbridge"/>
+        <bundle id="computer.ethernet.tapbridge.mac.ifd-tapbridge"/>
+    </bundle-version>
+    <upgrade-bundle>
+        <bundle id="computer.ethernet.tapbridge"/>
+        <bundle id="computer.ethernet.tapbridge.mac.ifd-tapbridge"/>
+    </upgrade-bundle>
+    <update-bundle/>
+    <atomic-update-bundle/>
+    <strict-identifier>
+        <bundle id="computer.ethernet.tapbridge"/>
+    </strict-identifier>
+    <relocate>
+        <bundle id="computer.ethernet.tapbridge"/>
+    </relocate>
+    <scripts>
+        <postinstall file="./postinstall" timeout="600"/>
+    </scripts>
+</pkg-info>

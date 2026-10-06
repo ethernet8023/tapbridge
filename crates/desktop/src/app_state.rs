@@ -299,6 +299,20 @@ fn tick(inbox: &mpsc::Receiver<UiEvent>, cx: &mut App) {
             None => cx.update_global::<Shell, _>(|shell, _| shell.pairing = None),
         }
     }
+    // Prune a closed status window (a failed update means it is gone).
+    if let Some(window) = cx.global::<Shell>().status
+        && window.update(cx, |_, _, _| ()).is_err()
+    {
+        cx.update_global::<Shell, _>(|shell, _| shell.status = None);
+    }
+    // macOS: show the Dock icon only while a visible window is open.
+    #[cfg(target_os = "macos")]
+    {
+        let shell = cx.global::<Shell>();
+        let visible =
+            shell.pairing.is_some() as usize + shell.status.is_some() as usize;
+        macos::dock::sync(visible);
+    }
     let actions = cx
         .global::<Shell>()
         .tray

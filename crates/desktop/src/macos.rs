@@ -30,6 +30,45 @@ pub const IFD_SOCKET_PATH: &str = "/var/tmp/tapbridge-ifd.sock";
 /// activity (pcscd polls presence ~1 Hz; a burst must wake at most once).
 const WAKE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Dock-icon policy: the app is tray-only (no Dock icon) while no visible
+/// window is open. `LSUIElement` in Info.plist hides it at launch; the UI
+/// tick calls [`dock::sync`] with the count of live windows, which flips the
+/// activation policy at runtime. Idempotent: state changes only on a
+/// transition. All calls must come from the gpui main thread (AppKit).
+#[cfg(target_os = "macos")]
+pub mod dock {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static SHOWING: AtomicBool = AtomicBool::new(false);
+
+    /// Reports how many visible windows are open; shows/hides the Dock icon
+    /// on transitions. The anchor window is excluded (it is never visible).
+    pub fn sync(visible_windows: usize) {
+        let should_show = visible_windows > 0;
+        let was_showing = SHOWING.swap(should_show, Ordering::SeqCst);
+        if should_show == was_showing {
+            return;
+        }
+        set_policy(should_show);
+    }
+
+    fn set_policy(visible: bool) {
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+        let Some(mtm) = MainThreadMarker::new() else {
+            return; // Not the main thread: AppKit calls are invalid anyway.
+        };
+        let app = NSApplication::sharedApplication(mtm);
+        // Window activation is handled by gpui (`window.activate_window()`
+        // at every open site); this only toggles Dock presence.
+        app.setActivationPolicy(if visible {
+            NSApplicationActivationPolicy::Regular
+        } else {
+            NSApplicationActivationPolicy::Accessory
+        });
+    }
+}
+
 /// Rate-limit state: last instant a PC/SC-triggered wake was sent.
 /// The daemon owns one; the IFD socket server creates its own instance.
 #[derive(Default)]

@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<installer-gui-script min-spec-version="2" minSpecVersion="1">
+    <title>tapbridge</title>
+    <organization>computer.ethernet</organization>
+    <domains>
+        <!-- System component (PC/SC driver dir + /usr/local/bin); no per-user choice -->
+        <domain enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+    </domains>
+    <options hostArchitectures="arm64" customize="never" require-admin="true"/>
+    <installation-check script="install_check()"/>
+    <script>
+        function install_check() {
+            // PIV reader phase 1 ships an arm64 daemon + shim. Guard the
+            // architecture probe: on some installer versions the property is
+            // absent, and a thrown TypeError aborts package verification.
+            var archs = (typeof system === 'object' &amp;&amp; system !== null &amp;&amp;
+                         Array.isArray(system.architectures)) ? system.architectures : null;
+            if (archs === null || archs.indexOf('arm64') === -1) {
+                my.result.title = 'Apple silicon required';
+                my.result.message = 'This build of tapbridge supports Apple silicon Macs only.';
+                return false;
+            }
+            return true;
+        }
+    </script>
+    <choices-outline>
+        <line choice="tapbridge"/>
+    </choices-outline>
+    <choice id="tapbridge" title="tapbridge" description="Use your Android phone as your Mac's smart-card reader (PIV).">
+        <pkg-ref id="computer.ethernet.tapbridge"/>
+    </choice>
+    <pkg-ref id="computer.ethernet.tapbridge" version="0.1.0" onConclusion="none" installKBytes="23954" updateKBytes="0">#tapbridge-components.pkg</pkg-ref>
+    <welcome file="Welcome.rtf" mime-type="text/rtf"/>
+    <readme file="ReadMe.rtf" mime-type="text/rtf"/>
+    <pkg-ref id="computer.ethernet.tapbridge">
+        <bundle-version>
+            <bundle CFBundleShortVersionString="0.1.0" CFBundleVersion="0.1.0" id="computer.ethernet.tapbridge" path="Applications/tapbridge.app"/>
+            <bundle CFBundleShortVersionString="0.1.0" CFBundleVersion="0.1.0" id="computer.ethernet.tapbridge.mac.ifd-tapbridge" path="usr/local/libexec/SmartCardServices/drivers/tapbridge.bundle"/>
+        </bundle-version>
+    </pkg-ref>
+    <product version="0.1.0"/>
+</installer-gui-script>
