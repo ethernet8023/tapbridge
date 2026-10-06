@@ -14,7 +14,8 @@
     <script>
         function install_check() {
             // PIV reader phase 1 ships an arm64 daemon + shim.
-            if (system architectures contains only 'arm64') return true;
+            var archs = system.architectures;
+            if (archs.length === 1 &amp;&amp; archs[0] === 'arm64') return true;
             my.result.title = 'Apple silicon required';
             my.result.message = 'This build of tapbridge supports Apple silicon Macs only.';
             return false;
