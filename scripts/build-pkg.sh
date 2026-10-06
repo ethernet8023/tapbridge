@@ -1,13 +1,12 @@
 #!/bin/bash
 # Builds the tapbridge macOS installer package (pkg).
 #
-# Product layout (root:admin, as macOS expects for system components):
+# Product layout:
+#   /Applications/tapbridge.app                                       (tray app)
 #   /usr/local/libexec/SmartCardServices/drivers/tapbridge.bundle   (IFD shim)
-#   /usr/local/bin/tapbridge                                         (daemon)
 #
-# The LaunchAgent is NOT installed by the pkg: the user enables
-# "Start at login" from the tray (it lives in ~/Library/LaunchAgents and
-# must point at the user's daemon), or the daemon writes it itself.
+# /usr/local/bin/tapbridge is NOT installed: the .app's inner binary is the
+# daemon; the tray's "start at login" writes a LaunchAgent pointing at it.
 #
 # Usage: scripts/build-pkg.sh [--sign <SIGNER_IDENTITY>]
 # Requirements: Xcode tools (clang, pkgbuild, productbuild) and a prior
@@ -33,6 +32,7 @@ done
 DAEMON="target/release/tapbridge"
 SHIM_DIR="crates/desktop/ifd_shim"
 BUNDLE="$SHIM_DIR/dist/tapbridge.bundle"
+ICONS="crates/desktop/assets/icons"
 
 if [[ ! -x "$DAEMON" ]]; then
     echo "error: $DAEMON missing; run: cargo build --release -p tapbridge-desktop" >&2
@@ -47,11 +47,48 @@ fi
 STAGE="$OUT/pkgroot"
 rm -rf "$STAGE"
 mkdir -p "$STAGE/usr/local/libexec/SmartCardServices/drivers"
-mkdir -p "$STAGE/usr/local/bin"
+mkdir -p "$STAGE/Applications"
 
+# --- tapbridge.app -------------------------------------------------------
+APP="$STAGE/Applications/tapbridge.app"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp "$DAEMON" "$APP/Contents/MacOS/tapbridge"
+chmod 755 "$APP/Contents/MacOS/tapbridge"
+cat > "$APP/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key><string>tapbridge</string>
+    <key>CFBundleDisplayName</key><string>tapbridge</string>
+    <key>CFBundleIdentifier</key><string>computer.ethernet.tapbridge</string>
+    <key>CFBundleVersion</key><string>$VERSION</string>
+    <key>CFBundleShortVersionString</key><string>$VERSION</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleExecutable</key><string>tapbridge</string>
+    <key>LSMinimumSystemVersion</key><string>13.0</string>
+    <key>LSUIElement</key><true/>
+    <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+PLIST
+# App icon set (Apple requires a compiled .icns; built from the repo PNGs).
+ICONSET="AppIcon.iconset"
+mkdir -p "$APP/Contents/Resources/$ICONSET"
+cp "$ICONS/app-16.png"  "$APP/Contents/Resources/$ICONSET/icon_16x16.png"
+cp "$ICONS/app-32.png"  "$APP/Contents/Resources/$ICONSET/icon_16x16@2x.png"
+cp "$ICONS/app-32.png"  "$APP/Contents/Resources/$ICONSET/icon_32x32.png"
+cp "$ICONS/app-64.png"  "$APP/Contents/Resources/$ICONSET/icon_32x32@2x.png"
+cp "$ICONS/app-128.png" "$APP/Contents/Resources/$ICONSET/icon_128x128.png"
+cp "$ICONS/app-256.png" "$APP/Contents/Resources/$ICONSET/icon_128x128@2x.png"
+cp "$ICONS/app-256.png" "$APP/Contents/Resources/$ICONSET/icon_256x256.png"
+cp "$ICONS/app-256.png" "$APP/Contents/Resources/$ICONSET/icon_256x256@2x.png"
+iconutil -c icns "$APP/Contents/Resources/$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+rm -rf "$APP/Contents/Resources/$ICONSET"
+plutil -lint "$APP/Contents/Info.plist" >/dev/null
+
+# --- IFD shim bundle ------------------------------------------------------
 cp -R "$BUNDLE" "$STAGE/usr/local/libexec/SmartCardServices/drivers/tapbridge.bundle"
-cp "$DAEMON" "$STAGE/usr/local/bin/tapbridge"
-chmod 755 "$STAGE/usr/local/bin/tapbridge"
 
 # pkgbuild: component package; `recommended` records root:wheel for system
 # paths without needing sudo on the build machine.
@@ -63,6 +100,7 @@ pkgbuild \
     --version "$VERSION" \
     --ownership recommended \
     --install-location "/" \
+    --scripts scripts/pkg-scripts \
     "$COMPONENT"
 
 # productbuild: wrap the component with the distribution definition

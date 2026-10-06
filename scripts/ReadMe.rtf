@@ -4,7 +4,7 @@
 
 \b Getting started
 
-1.\b0  Start tapbridge from /usr/local/bin (or enable "Start at login" from its tray icon).
+1.\b0  Open tapbridge from /Applications (it appears as a tray icon; enable "Start at login" there).
 
 2. Verify the reader is registered:
     system_profiler SPSmartCardsDataType  (or pcsc_scan after brew install pcsc-tools)
@@ -19,5 +19,5 @@
 - If the reader does not appear, inspect:
     log show --predicate '(subsystem == "com.apple.CryptoTokenKit")' --info --last 5m
 - Uninstall:
-    sudo rm -rf /usr/local/libexec/SmartCardServices/drivers/tapbridge.bundle /usr/local/bin/tapbridge
+    sudo rm -rf /Applications/tapbridge.app /usr/local/libexec/SmartCardServices/drivers/tapbridge.bundle
 }

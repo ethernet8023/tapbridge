@@ -1,0 +1,20 @@
+#!/bin/bash
+# tapbridge postinstall: run by the macOS installer as root.
+set -euo pipefail
+
+# Remove the bare binary from earlier 0.1.0 builds (the .app supersedes it;
+# keep it if it is not ours to avoid stomping anything unrelated).
+if [[ -x /usr/local/bin/tapbridge ]]; then
+    if grep -aq "tapbridge" /usr/local/bin/tapbridge 2>/dev/null; then
+        rm -f /usr/local/bin/tapbridge
+    fi
+fi
+
+# Kill any running copy of the old daemon so the new .app binary is the one
+# that runs next (best-effort; a stale tray process may hold the IFD socket).
+killall tapbridge 2>/dev/null || true
+
+# Restart the PC/SC reader daemon so it enumerates the new IFD bundle.
+killall -SIGKILL com.apple.ifdreader 2>/dev/null || true
+
+exit 0
