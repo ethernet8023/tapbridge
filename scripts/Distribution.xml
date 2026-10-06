@@ -13,12 +13,17 @@
     <installation-check script="install_check()"/>
     <script>
         function install_check() {
-            // PIV reader phase 1 ships an arm64 daemon + shim.
-            var archs = system.architectures;
-            if (archs.length === 1 &amp;&amp; archs[0] === 'arm64') return true;
-            my.result.title = 'Apple silicon required';
-            my.result.message = 'This build of tapbridge supports Apple silicon Macs only.';
-            return false;
+            // PIV reader phase 1 ships an arm64 daemon + shim. Guard the
+            // architecture probe: on some installer versions the property is
+            // absent, and a thrown TypeError aborts package verification.
+            var archs = (typeof system === 'object' &amp;&amp; system !== null &amp;&amp;
+                         Array.isArray(system.architectures)) ? system.architectures : null;
+            if (archs === null || archs.indexOf('arm64') === -1) {
+                my.result.title = 'Apple silicon required';
+                my.result.message = 'This build of tapbridge supports Apple silicon Macs only.';
+                return false;
+            }
+            return true;
         }
     </script>
     <choices-outline>
