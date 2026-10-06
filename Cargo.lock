@@ -7290,6 +7290,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tapbridge-hybrid"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "hmac",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "tapbridge-phone"
 version = "0.1.0"
 dependencies = [
