@@ -204,6 +204,22 @@ fn invalid() -> io::Error {
     )
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
+fn protect(data: &[u8]) -> io::Result<Vec<u8>> {
+    Ok(data.to_vec())
+}
+#[cfg(all(unix, not(target_os = "macos")))]
+fn unprotect(data: &[u8]) -> io::Result<Vec<u8>> {
+    Ok(data.to_vec())
+}
+#[cfg(target_os = "macos")]
+fn protect(data: &[u8]) -> io::Result<Vec<u8>> {
+    crate::keychain::seal(data)
+}
+#[cfg(target_os = "macos")]
+fn unprotect(data: &[u8]) -> io::Result<Vec<u8>> {
+    crate::keychain::open(data)
+}
 #[cfg(windows)]
 fn crypt(data: &[u8], encrypt: bool) -> io::Result<Vec<u8>> {
     use windows_sys::Win32::{
@@ -268,14 +284,6 @@ fn protect(data: &[u8]) -> io::Result<Vec<u8>> {
 fn unprotect(data: &[u8]) -> io::Result<Vec<u8>> {
     crypt(data, false)
 }
-#[cfg(not(windows))]
-fn protect(data: &[u8]) -> io::Result<Vec<u8>> {
-    Ok(data.to_vec())
-}
-#[cfg(not(windows))]
-fn unprotect(data: &[u8]) -> io::Result<Vec<u8>> {
-    Ok(data.to_vec())
-}
 
 #[cfg(test)]
 mod tests {
@@ -283,6 +291,7 @@ mod tests {
 
     #[test]
     fn corrupt_state_fails_without_replacing_identity() {
+        let _session = crate::keychain::TestSession::begin();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("identity.bin");
         fs::write(&path, b"broken").unwrap();
@@ -293,6 +302,7 @@ mod tests {
     #[test]
     fn failed_persistence_does_not_change_in_memory_pairing() {
         let dir = tempfile::tempdir().unwrap();
+        let _session = crate::keychain::TestSession::begin();
         let mut store = Store::open(dir.path()).unwrap();
         fs::remove_file(dir.path().join("identity.bin")).unwrap();
         fs::create_dir(dir.path().join("identity.bin")).unwrap();
@@ -307,6 +317,7 @@ mod tests {
     #[test]
     fn revocation_is_persisted_without_changing_host_identity() {
         let dir = tempfile::tempdir().unwrap();
+        let _session = crate::keychain::TestSession::begin();
         let mut store = Store::open(dir.path()).unwrap();
         let id = store.key.public();
         store
@@ -324,6 +335,7 @@ mod tests {
     #[test]
     fn windows_record_is_dpapi_protected() {
         let dir = tempfile::tempdir().unwrap();
+        let _session = crate::keychain::TestSession::begin();
         let store = Store::open(dir.path()).unwrap();
         let disk = fs::read(dir.path().join("identity.bin")).unwrap();
         assert!(!disk.windows(32).any(|bytes| bytes == store.key.to_bytes()));
@@ -335,6 +347,7 @@ mod tests {
     #[test]
     fn identity_and_pairing_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
+        let _session = crate::keychain::TestSession::begin();
         let peer = SecretKey::generate().public();
         let id = {
             let mut store = Store::open(dir.path()).unwrap();
@@ -349,6 +362,7 @@ mod tests {
     #[test]
     fn phone_name_and_push_token_persist_and_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
+        let _session = crate::keychain::TestSession::begin();
         let peer = SecretKey::generate().public();
         {
             let mut store = Store::open(dir.path()).unwrap();
@@ -366,6 +380,7 @@ mod tests {
     #[test]
     fn newest_accepted_hello_name_and_token_win() {
         let dir = tempfile::tempdir().unwrap();
+        let _session = crate::keychain::TestSession::begin();
         let peer = SecretKey::generate().public();
         let mut store = Store::open(dir.path()).unwrap();
         store
@@ -384,6 +399,7 @@ mod tests {
     #[test]
     fn set_peer_clears_remembered_phone_info() {
         let dir = tempfile::tempdir().unwrap();
+        let _session = crate::keychain::TestSession::begin();
         let mut store = Store::open(dir.path()).unwrap();
         let peer = SecretKey::generate().public();
         store
@@ -404,6 +420,7 @@ mod tests {
         // A pinned phone cannot exist before pairing, but the API must not
         // silently drop a push-only update when called defensively.
         let dir = tempfile::tempdir().unwrap();
+        let _session = crate::keychain::TestSession::begin();
         let mut store = Store::open(dir.path()).unwrap();
         let peer = SecretKey::generate().public();
         store

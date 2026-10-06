@@ -48,20 +48,37 @@ impl Tray {
         let separator2 = PredefinedMenuItem::separator();
         let separator3 = PredefinedMenuItem::separator();
         let menu = Menu::new();
-        menu.append_items(&[
-            &status_item,
-            &statuswin_item,
-            &separator,
-            &request_item,
-            &pair_item,
-            &forget_item,
-            &passkeys_item,
-            &separator2,
-            &autostart_item,
-            &separator3,
-            &quit_item,
-        ])
-        .map_err(|e| e.to_string())?;
+        if cfg!(windows) {
+            menu.append_items(&[
+                &status_item,
+                &statuswin_item,
+                &separator,
+                &request_item,
+                &pair_item,
+                &forget_item,
+                &passkeys_item,
+                &separator2,
+                &autostart_item,
+                &separator3,
+                &quit_item,
+            ])
+            .map_err(|e| e.to_string())?;
+        } else {
+            // macOS: WebAuthn/passkeys are Track B, not this reader.
+            menu.append_items(&[
+                &status_item,
+                &statuswin_item,
+                &separator,
+                &request_item,
+                &pair_item,
+                &forget_item,
+                &separator2,
+                &autostart_item,
+                &separator3,
+                &quit_item,
+            ])
+            .map_err(|e| e.to_string())?;
+        }
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("tapbridge")
