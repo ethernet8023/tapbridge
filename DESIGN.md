@@ -20,12 +20,12 @@ No always-on phone connection: iroh heartbeats every 5 s (`iroh/src/socket.rs` `
 1. Trigger on the PC: Windows starts a WebAuthn ceremony, or the user picks "Request tap" in the tray. Generic CCID polling does not identify a ceremony, so the desktop subscribes (`EvtSubscribe`, no elevation) to the `Microsoft-Windows-WebAuthN/Operational` log for event 1000 (MakeCredential started) and 1003 (GetAssertion started). Measured on build 28120. The dialog window is not used as a signal: `CredentialUIBroker.exe` (class `Credential Dialog Xaml Host`, title "Windows Security") also hosts password prompts, and its content is not readable by UI Automation from another process.
 2. If a phone session is already live, the host sends `ReadCard` (phone shows "tap now"). Otherwise, if a push token is stored, the desktop POSTs `{token, host, hint}` to the relay.
 3. Relay sends an FCM data message (`priority: high`, `ttl: 60s`): `{"t":"wake","host":ID,"hint":HINT}`.
-4. Phone checks `host` == paired host (anything else is dropped), starts a `connectedDevice` foreground service, connects using the hint, posts a heads-up "Tap your key for <PC>" notification, and enables the NFC tap gate for 120 s.
+4. Phone routes the wake by host id: one phone may be paired with MANY hosts at once, and each wake names exactly one. The `host` id must match one of the paired hosts (anything else is dropped); the service connects using that host's hint (pushed hint, else its cached hint, else the bare host id), posts a heads-up "Tap your key for <PC>" notification naming the requesting PC, and enables the NFC tap gate for 120 s.
 5. Session idles out 60 s after the last card/APDU activity (or after connect, if nothing happens) while the app is not visible; the service stops and the gate is disabled. A visible app keeps its session.
 
-The wake message is an unauthenticated hint. Authority is always the iroh-authenticated pinned identity. A forged wake can at most make the phone dial its own paired PC.
+The wake message is an unauthenticated hint. Authority is always the iroh-authenticated pinned identity. A forged wake can at most make the phone dial one of its own paired PCs.
 
-Opening the app while paired connects immediately (cached hint) and, while the UI is visible, retries on drop: 0.25, 0.5, 1, 2, 3 s cap, plus immediate retry on network change.
+Opening the app while paired connects immediately (to the last-used host, cached hint) and, while the UI is visible, retries on drop: 0.25, 0.5, 1, 2, 3 s cap, plus immediate retry on network change.
 
 ## Registered keys and the tap gate
 
@@ -50,6 +50,8 @@ Max APDU 65536 bytes, ATR <=33, total frame <=65600. Strict decode: unknown vers
 Invitation (QR) `tapbridge:1:HOSTID:CAPHEX`: 32-byte CSPRNG capability, 5 min, single use, minting another revokes the previous one, only on explicit user request. The core pairing gate is pure in-memory state; the caller persists the authenticated phone id BEFORE `Accepted`. Persist failure rejects. A lost acknowledgement is recoverable by pinned identity. Reject unknown peers, wrong/expired/replayed capability, and a second active session without replacing the first.
 
 Host state is DPAPI-protected (`%LOCALAPPDATA%\tapbridge`): host key, paired phone id, phone name, push token. Phone identity is Android Keystore-wrapped, backups disabled. Missing identity generates one; corrupt state fails loudly and never silently re-keys. No keys, capabilities, push tokens, PINs or APDU bytes in logs.
+
+**Many hosts per phone.** A phone may hold several paired hosts at once (a Windows PC and a Mac, home and office); each host is an independent peer with its own identity key and pairing capability, and each host still pins exactly ONE phone. The phone stores per-host records `host_id → {name, cached_hint, paired_at}` in one pref key; the legacy single-host prefs migrate once on first read. Forgetting is per host (Settings → Paired PCs); revocation on capability minting is unchanged. The phone's identity key and FCM token belong to the install and are shared by all hosts. The wire contract does not change.
 
 ## Relay API
 
