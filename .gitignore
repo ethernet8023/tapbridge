@@ -19,3 +19,5 @@
 ifd_shim/dist/
 dist/
 .DS_Store
+tapbridge-components.pkg/
+dist/
