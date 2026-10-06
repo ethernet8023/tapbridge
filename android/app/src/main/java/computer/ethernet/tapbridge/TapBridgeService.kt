@@ -32,6 +32,8 @@ class TapBridgeService : Service() {
         const val ACTION_START = "computer.ethernet.tapbridge.START"
         const val ACTION_STOP = "computer.ethernet.tapbridge.STOP"
         const val ACTION_WAKE = "computer.ethernet.tapbridge.WAKE"
+        /** Wake target host id (64 hex chars); the hint alone no longer names a PC. */
+        const val EXTRA_HOST = "computer.ethernet.tapbridge.HOST"
         const val EXTRA_HINT = "computer.ethernet.tapbridge.HINT"
         const val CHANNEL_FOREGROUND = "tapbridge_session"
         /** Tap requests. A new id: a channel's importance and sound are
@@ -111,6 +113,10 @@ class TapBridgeService : Service() {
         private set
     @Volatile var startedFromUi = false
         private set
+    /** Host id this wake (or app-open auto-connect) is for; the per-host
+     *  record supplies the cached hint. */
+    @Volatile var targetHost: String? = null
+        private set
     @Volatile var wakeHint: String? = null
         private set
     private var retryAttempt = 0
@@ -121,6 +127,7 @@ class TapBridgeService : Service() {
         when (intent?.action) {
             ACTION_STOP -> { stopSession(); stopSelf() }
             ACTION_WAKE -> {
+                targetHost = intent.getStringExtra(EXTRA_HOST)
                 wakeHint = intent.getStringExtra(EXTRA_HINT)
                 startedFromUi = false
                 foreground(tapRequest = true)
@@ -132,6 +139,7 @@ class TapBridgeService : Service() {
             else -> { // ACTION_START / rebind while the UI is visible
                 startedFromUi = true
                 wakeHint = null
+                targetHost = null // app-open: connect to the last-used host
                 // The app is on screen: no need to keep shouting.
                 foreground(tapRequest = false)
                 registerNetworkRetry()
@@ -174,7 +182,7 @@ class TapBridgeService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val builder = if (tapRequest) {
-            val pc = IdentityStore.hostName(this)
+            val pc = targetHost?.let { IdentityStore.hostById(this, it)?.name }
             Notification.Builder(this, CHANNEL_TAP_REQUEST)
                 .setContentTitle(getString(R.string.wake_title))
                 .setContentText(
@@ -234,12 +242,18 @@ class TapBridgeService : Service() {
                 NativeBridge.initialize(applicationContext)
                 val key = IdentityStore.getOrCreateKey(this@TapBridgeService)
                 val invite = PairingState.consumePendingInvitation()
-                val cachedHost = IdentityStore.pairedHost(this@TapBridgeService)
+                val hosts = IdentityStore.pairedHosts(this@TapBridgeService)
+                val invitedHost = invite.takeIf { it.isNotEmpty() }?.let {
+                    Invitation.parse(it)?.host ?: throw IOException("invalid invitation")
+                }
+                // Connect-by-host-id: a wake names its host; the app (or a
+                // fresh pairing) uses the last-used/invited host. The hint is
+                // always scoped to THAT host's record.
+                val hostId = targetHost ?: invitedHost ?: IdentityStore.lastUsedHost(this@TapBridgeService)
+                val record = hostId?.let { id -> hosts.firstOrNull { it.hostId == id } }
                 val hint = when {
-                    invite.isNotEmpty() -> {
-                        Invitation.parse(invite)?.host ?: throw IOException("invalid invitation")
-                    }
-                    cachedHost != null -> (wakeHint ?: IdentityStore.cachedHint(this@TapBridgeService) ?: cachedHost)
+                    invitedHost != null -> invitedHost
+                    record != null -> (wakeHint ?: record.cachedHint ?: record.hostId)
                     else -> throw IOException("scan the PC's pairing QR first")
                 }
                 pointer = try {
@@ -250,13 +264,18 @@ class TapBridgeService : Service() {
                     )
                 } finally { key.fill(0) }
                 if (!wantsConnection || requested.get() != attempt) return@execute
-                // Persist pairing before any session use; cache the dial hint.
-                IdentityStore.saveHost(this@TapBridgeService, hint.substringBefore(";"))
-                NativeBridge.usedHint(pointer)?.let { IdentityStore.saveHint(this@TapBridgeService, it) }
-                IdentityStore.saveHostName(
+                // Persist the pairing before any session use; cache the dial
+                // hint on THIS host's record.
+                val acceptedHost = hint.substringBefore(";")
+                IdentityStore.saveAcceptedHost(
                     this@TapBridgeService,
+                    acceptedHost,
                     NativeBridge.hostName(pointer) ?: "PC",
                 )
+                targetHost = acceptedHost
+                NativeBridge.usedHint(pointer)?.let {
+                    IdentityStore.saveHint(this@TapBridgeService, acceptedHost, it)
+                }
                 val epoch = gate.install(pointer)
                 pointer = 0L
                 session.bindHandle(epoch)

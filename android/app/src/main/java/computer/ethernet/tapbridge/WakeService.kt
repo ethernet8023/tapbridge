@@ -15,11 +15,15 @@ import com.google.firebase.messaging.RemoteMessage
 
 /**
  * FCM wake receiver (DESIGN "Nothing runs at rest"). Data message:
- * `{"t":"wake","host":ID,"hint":HINT}`. Anything without t=wake, or for a
- * host other than the paired one, is dropped. On match: start the
- * connectedDevice foreground service with the hint, post a heads-up
- * "Tap your key for <PC>" notification and enable the tap gate for 120 s
- * (the service manages the window).
+ * `{"t":"wake","host":ID,"hint":HINT}`. Anything without t=wake, or whose
+ * host is not one of the paired PCs, is dropped. On match: start the
+ * connectedDevice foreground service with the wake host id + hint, post a
+ * heads-up "Tap your key for <PC>" notification naming the requesting PC,
+ * and enable the tap gate for 120 s (the service manages the window).
+ *
+ * The phone may hold many paired hosts; each wake names exactly one, and the
+ * service dials that host's record (hint fallback: pushed hint, cached hint,
+ * bare host id).
  */
 class WakeService : FirebaseMessagingService() {
 
@@ -28,15 +32,18 @@ class WakeService : FirebaseMessagingService() {
         if (data["t"] != "wake") return
         val host = data["host"] ?: return
         val hint = data["hint"]
-        val paired = IdentityStore.pairedHost(this) ?: return
-        if (host != paired) return
+        val wake = PairedHosts.routeForWake(IdentityStore.pairedHosts(this), host, hint)
+            ?: return // unknown host: dropped, as mismatched hosts always were
 
-        // Cache the newest hint so app-open reconnects dial fresh addresses.
-        if (!hint.isNullOrBlank()) IdentityStore.saveHint(this, hint)
+        // Cache the newest hint for THIS host so app-open reconnects dial
+        // fresh addresses.
+        IdentityStore.saveHint(this, wake.hostId, wake.hint)
+        IdentityStore.setLastUsedHost(this, wake.hostId)
 
         val service = Intent(this, TapBridgeService::class.java)
             .setAction(TapBridgeService.ACTION_WAKE)
-            .putExtra(TapBridgeService.EXTRA_HINT, hint ?: paired)
+            .putExtra(TapBridgeService.EXTRA_HOST, wake.hostId)
+            .putExtra(TapBridgeService.EXTRA_HINT, wake.hint)
         try {
             // The service's foreground notification is the tap request.
             startForegroundService(service)
@@ -45,15 +52,16 @@ class WakeService : FirebaseMessagingService() {
             // delivered the message without its high-priority exemption.
             // Post the same tap request directly; tapping it opens the app,
             // which connects from the foreground.
-            notifyTapRequest()
+            notifyTapRequest(wake.hostId)
         }
     }
 
-    private fun notifyTapRequest() {
+    /** Heads-up fallback naming the requesting PC. */
+    private fun notifyTapRequest(hostId: String) {
         if (Build.VERSION.SDK_INT >= 33 &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
-            PackageManager.PERMISSION_GRANTED
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) return
+        val pc = IdentityStore.hostById(this, hostId)?.name
         TapBridgeService.ensureChannels(this)
         val launch = PendingIntent.getActivity(
             this, 0,
@@ -65,8 +73,7 @@ class WakeService : FirebaseMessagingService() {
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(getString(R.string.wake_title))
             .setContentText(
-                IdentityStore.hostName(this)
-                    ?.let { getString(R.string.wake_body_named, it) }
+                pc?.let { getString(R.string.wake_body_named, it) }
                     ?: getString(R.string.wake_body),
             )
             .setPriority(NotificationCompat.PRIORITY_MAX)

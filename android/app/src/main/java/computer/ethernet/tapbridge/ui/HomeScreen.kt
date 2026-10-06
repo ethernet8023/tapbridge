@@ -33,8 +33,10 @@ fun HomeScreen(
     modifier: Modifier = Modifier,
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
-    val paired = IdentityStore.pairedHost(context) != null
-    val hostName = IdentityStore.hostName(context)
+    val hosts = IdentityStore.pairedHosts(context)
+    val paired = hosts.isNotEmpty()
+    // The home card names the last-used PC; wakes name their own.
+    val hostName = hosts.firstOrNull { it.hostId == IdentityStore.lastUsedHost(context) }?.name
     val status = when {
         !paired -> HomeStatus.UNPAIRED
         ui.status == TapBridgeService.Status.CONNECTED -> HomeStatus.CONNECTED
@@ -90,17 +92,19 @@ fun HomeScreen(
                 else PairHero(Modifier.widthIn(max = 400.dp))
             }
         }
-        if (!paired) {
-            Button(
-                onClick = onStartPair,
-                contentPadding = PaddingValues(vertical = 16.dp),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Icon(Icons.Filled.QrCodeScanner, contentDescription = null)
-                Spacer(Modifier.width(10.dp))
-                Text("Scan pairing code", style = MaterialTheme.typography.titleMedium)
-            }
-        } else {
+        Button(
+            onClick = onStartPair,
+            contentPadding = PaddingValues(vertical = if (paired) 10.dp else 16.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Icon(Icons.Filled.QrCodeScanner, contentDescription = null)
+            Spacer(Modifier.width(10.dp))
+            Text(
+                if (paired) "Pair another PC" else "Scan pairing code",
+                style = MaterialTheme.typography.titleMedium,
+            )
+        }
+        if (paired) {
             AnimatedContent(
                 targetState = phase,
                 transitionSpec = { fadeIn(tween(220)).togetherWith(fadeOut(tween(150))) },

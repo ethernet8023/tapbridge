@@ -28,7 +28,7 @@ You can also open the phone app first, or select tray icon → **Request tap**.
 ## Security
 
 - Each PC and phone has its own identity key. The PC key is protected by Windows DPAPI. The phone key is wrapped by Android Keystore and is not backed up.
-- A pairing works only for the one phone that scanned the QR code. To pair again, select **Forget phone** first.
+- One phone can be paired with several PCs at once (say a desktop and a laptop). Each PC still accepts exactly one phone: to pair a PC with a different phone, select **Forget phone** on that PC first. On the phone, Settings → **Paired PCs** lists every paired PC with per-PC rename and **Forget**.
 - The iroh connection is end-to-end encrypted. Public iroh relays and the wake relay see connection metadata only.
 - Logs never contain keys, invitations, push tokens, PINs or card data.
 
