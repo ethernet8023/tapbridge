@@ -16,3 +16,4 @@
 /installer/usbip/*.exe
 /relay/node_modules/
 /relay/dist/
+ifd_shim/dist/
