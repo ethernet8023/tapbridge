@@ -18,3 +18,4 @@
 /relay/dist/
 ifd_shim/dist/
 dist/
+.DS_Store
