@@ -1,9 +1,10 @@
 //! gpui windows: the pairing QR window and the status window. Only these two
 //! surfaces use gpui; the tray and all orchestration live beside them.
+#[cfg(windows)]
 use crate::passkeys;
 use gpui::{
-    Animation, AnimationExt, App, Bounds, Context, Pixels, Task, Window, WindowBounds,
-    WindowHandle, WindowOptions, canvas, div, fill, point, prelude::*, px, rgb, size,
+    Animation, AnimationExt, App, Bounds, Context, Task, Window, WindowBounds, WindowHandle,
+    WindowOptions, canvas, div, fill, point, prelude::*, px, rgb, size,
 };
 use std::{
     rc::Rc,
@@ -325,12 +326,14 @@ pub fn open_anchor_window(cx: &mut App) -> WindowHandle<Anchor> {
 }
 
 /// Passkey options: which choices the Windows passkey dialog offers.
+#[cfg(windows)]
 pub struct PasskeyView {
     options: passkeys::Options,
     /// In-window dialog over the options while a change runs or reports.
     dialog: Option<PasskeyDialog>,
 }
 
+#[cfg(windows)]
 enum PasskeyDialog {
     /// Waiting for the UAC prompt and the SYSTEM policy step.
     Working {
@@ -342,6 +345,7 @@ enum PasskeyDialog {
     },
 }
 
+#[cfg(windows)]
 impl PasskeyView {
     fn new() -> Self {
         Self {
@@ -480,6 +484,7 @@ impl PasskeyView {
 /// Twelve radial strokes, the brightest one sweeping clockwise. The phase
 /// comes from `since` (owned by the dialog, so it survives re-renders); the
 /// repeating animation only keeps frames coming.
+#[cfg(windows)]
 fn spinner(diameter: Pixels, since: Instant) -> impl IntoElement {
     div()
         .size(diameter)
@@ -527,6 +532,7 @@ fn ease_out_back(t: f32) -> f32 {
     1.0 + C3 * (t - 1.0).powi(3) + C1 * (t - 1.0).powi(2)
 }
 
+#[cfg(windows)]
 fn checkbox(checked: bool, enabled: bool) -> impl IntoElement {
     let color = if enabled { ACCENT } else { 0x5A5070 };
     div()
@@ -556,6 +562,7 @@ fn checkbox(checked: bool, enabled: bool) -> impl IntoElement {
         })
 }
 
+#[cfg(windows)]
 fn option_row(
     id: &'static str,
     checked: bool,
@@ -601,6 +608,7 @@ fn option_row(
         )
 }
 
+#[cfg(windows)]
 impl Render for PasskeyView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let options = &self.options;
@@ -709,6 +717,7 @@ impl Render for PasskeyView {
     }
 }
 
+#[cfg(windows)]
 pub fn open_passkey_window(
     existing: Option<WindowHandle<PasskeyView>>,
     cx: &mut App,

@@ -7266,10 +7266,12 @@ name = "tapbridge-desktop"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "iroh",
  "png 0.18.1",
  "qrcode",
  "tapbridge-core",
  "tapbridge-host",
+ "tempfile",
  "tokio",
  "tray-icon",
  "ureq",
@@ -7281,8 +7283,10 @@ dependencies = [
 name = "tapbridge-host"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "iroh",
  "qrcode",
+ "security-framework",
  "tapbridge-core",
  "tempfile",
  "tokio",

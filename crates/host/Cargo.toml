@@ -19,5 +19,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Memory",
 ] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+aes-gcm = "0.10"
+security-framework = { version = "3", features = ["OSX_10_15"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
