@@ -1,0 +1,11 @@
+[package]
+name = "tapbridge-hybrid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+aes = "0.8"
+hmac = "0.12"
+sha2 = "0.10"
