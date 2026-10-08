@@ -79,12 +79,15 @@ impl Tray {
             ])
             .map_err(|e| e.to_string())?;
         }
-        let tray = TrayIconBuilder::new()
+        let builder = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("tapbridge")
-            .with_icon(icons.idle.clone())
-            .build()
-            .map_err(|e| e.to_string())?;
+            .with_tooltip("tapbridge");
+        let builder = if assets::Icons::TEMPLATE {
+            builder.with_icon_templated(icons.idle.clone())
+        } else {
+            builder.with_icon(icons.idle.clone())
+        };
+        let tray = builder.build().map_err(|e| e.to_string())?;
         Ok(Self {
             tray,
             status_item,
@@ -101,7 +104,11 @@ impl Tray {
             TrayState::Phone => self.icons.phone.clone(),
             TrayState::Idle => self.icons.idle.clone(),
         };
-        let _ = self.tray.set_icon(Some(icon));
+        let _ = if assets::Icons::TEMPLATE {
+            self.tray.set_icon_templated(Some(icon))
+        } else {
+            self.tray.set_icon(Some(icon))
+        };
         if state == TrayState::MissingUsbip {
             let _ = self
                 .tray

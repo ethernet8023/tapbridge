@@ -43,6 +43,13 @@ fn main() {
         // tray-icon embeds the 32px variant.
         fs::write(icons.join(format!("{name}.png")), render(&svg, 32)).unwrap();
     }
+    // macOS menu bar template glyphs: 22pt tall, rendered @2x (44px). tray-icon
+    // caps the NSImage at 22pt, so the 44px bitmap draws retina-sharp.
+    let menubar = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/brand/macos/menubar");
+    for state in ["idle", "phone", "card", "error"] {
+        let svg = fs::read_to_string(menubar.join(format!("menubar-{state}.svg"))).unwrap();
+        fs::write(icons.join(format!("menubar-{state}.png")), render(&svg, 44)).unwrap();
+    }
     println!("icons written to {OUT}");
 }
 

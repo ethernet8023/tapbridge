@@ -9,7 +9,8 @@
 # daemon; the tray's "start at login" writes a LaunchAgent pointing at it.
 #
 # Usage: scripts/build-pkg.sh [--sign <SIGNER_IDENTITY>]
-# Requirements: Xcode tools (clang, pkgbuild, productbuild) and a prior
+# Requirements: Xcode 26+ tools (clang, pkgbuild, productbuild, actool,
+#   Icon Composer) and a prior
 #   cargo build --release -p tapbridge-desktop
 # Output: dist/tapbridge-<version>-macos.pkg
 #   --sign: Developer ID Installer identity for a signed product pkg
@@ -32,7 +33,6 @@ done
 DAEMON="target/release/tapbridge"
 SHIM_DIR="crates/desktop/ifd_shim"
 BUNDLE="$SHIM_DIR/dist/tapbridge.bundle"
-ICONS="crates/desktop/assets/icons"
 
 if [[ ! -x "$DAEMON" ]]; then
     echo "error: $DAEMON missing; run: cargo build --release -p tapbridge-desktop" >&2
@@ -74,19 +74,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
-# App icon set (Apple requires a compiled .icns; built from the repo PNGs).
-ICONSET="AppIcon.iconset"
-mkdir -p "$APP/Contents/Resources/$ICONSET"
-cp "$ICONS/app-16.png"  "$APP/Contents/Resources/$ICONSET/icon_16x16.png"
-cp "$ICONS/app-32.png"  "$APP/Contents/Resources/$ICONSET/icon_16x16@2x.png"
-cp "$ICONS/app-32.png"  "$APP/Contents/Resources/$ICONSET/icon_32x32.png"
-cp "$ICONS/app-64.png"  "$APP/Contents/Resources/$ICONSET/icon_32x32@2x.png"
-cp "$ICONS/app-128.png" "$APP/Contents/Resources/$ICONSET/icon_128x128.png"
-cp "$ICONS/app-256.png" "$APP/Contents/Resources/$ICONSET/icon_128x128@2x.png"
-cp "$ICONS/app-256.png" "$APP/Contents/Resources/$ICONSET/icon_256x256.png"
-cp "$ICONS/app-256.png" "$APP/Contents/Resources/$ICONSET/icon_256x256@2x.png"
-iconutil -c icns "$APP/Contents/Resources/$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
-rm -rf "$APP/Contents/Resources/$ICONSET"
+# App icon: Liquid Glass Assets.car (light/dark/tinted, macOS 26+) plus a
+# flat AppIcon.icns fallback, both from assets/brand/macos/tapbridge.icon.
+scripts/build-macos-icon.sh "$APP/Contents/Resources"
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
 
 # --- IFD shim bundle ------------------------------------------------------

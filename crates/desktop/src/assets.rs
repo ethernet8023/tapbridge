@@ -1,4 +1,8 @@
 //! Embedded tray icons (generated PNGs under assets/icons, decoded to RGBA).
+//!
+//! macOS gets monochrome menu bar glyphs drawn as template images (the system
+//! tints them for light/dark menu bars and the highlighted state); Windows
+//! keeps the full-colour brand icon with a state badge.
 
 pub struct Icons {
     pub idle: tray_icon::Icon,
@@ -17,6 +21,20 @@ fn load(embedded: &[u8]) -> tray_icon::Icon {
 }
 
 impl Icons {
+    /// Whether these icons must be drawn as macOS template images.
+    pub const TEMPLATE: bool = cfg!(target_os = "macos");
+
+    #[cfg(target_os = "macos")]
+    pub fn load() -> Self {
+        Self {
+            idle: load(include_bytes!("../assets/icons/menubar-idle.png")),
+            phone: load(include_bytes!("../assets/icons/menubar-phone.png")),
+            card: load(include_bytes!("../assets/icons/menubar-card.png")),
+            error: load(include_bytes!("../assets/icons/menubar-error.png")),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
     pub fn load() -> Self {
         Self {
             idle: load(include_bytes!("../assets/icons/tray-idle.png")),
