@@ -65,8 +65,13 @@ const MAX_RETAPS: usize = 8;
 /// Why a card step did not produce a reply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PortError {
-    /// The card left (transport failure, or a different tap generation).
+    /// The card left (transport failure, or a different tap generation)
+    /// and the request may have reached it.
     Lost,
+    /// The card left before any byte of this request went out (the port
+    /// saw the new tap first): the card never saw it, so even a
+    /// not-yet-verified pinHash may be retried.
+    NotSent,
     /// The card refused at the ISO 7816 level (no FIDO applet, bad SW).
     Card,
     /// The request ends with this CTAP status (cancel, timeout).
@@ -157,7 +162,7 @@ enum Fail {
 impl From<PortError> for Fail {
     fn from(error: PortError) -> Self {
         match error {
-            PortError::Lost => Fail::Lost,
+            PortError::Lost | PortError::NotSent => Fail::Lost,
             PortError::Card => Fail::Status(status::OTHER),
             PortError::Ended(code) => Fail::Status(code),
         }
@@ -280,7 +285,7 @@ impl PinProxy {
         for _ in 0..=MAX_RETAPS {
             let generation = match port.open(new_tap) {
                 Ok(generation) => generation,
-                Err(PortError::Lost) => {
+                Err(PortError::Lost | PortError::NotSent) => {
                     self.state(port, auth::REMOVED);
                     new_tap = true;
                     continue;
@@ -1400,6 +1405,38 @@ mod tests {
         );
         assert_eq!(phone.taps_left, 10, "no new tap was waited for");
         assert_eq!(phone.states.last(), Some(&auth::FAILED));
+    }
+
+    #[test]
+    fn a_retap_caught_before_get_pin_token_went_out_is_retried() {
+        // The port saw the new tap before sending anything: the card never
+        // saw this pinHash, so a retry on the new tap is safe.
+        struct Stale<'a>(&'a mut Phone, usize);
+        impl CardPort for Stale<'_> {
+            fn open(&mut self, new_tap: bool) -> Result<u64, PortError> {
+                self.0.open(new_tap)
+            }
+            fn exchange(&mut self, request: &[u8]) -> Result<Vec<u8>, PortError> {
+                let is_token = request[0] == 0x06 && request.windows(2).any(|w| w == [0x02, 0x05]);
+                if is_token && self.1 == 0 {
+                    self.1 += 1;
+                    self.0.retap();
+                    return Err(PortError::NotSent);
+                }
+                self.0.exchange(request)
+            }
+            fn auth_state(&mut self, state: u8) {
+                self.0.auth_state(state);
+            }
+        }
+        let mut phone = Phone::new(Authenticator::new(Some(PIN), &[2]));
+        let mut proxy = PinProxy::new();
+        let platform = Platform::new(Protocol::Two);
+        let mut port = Stale(&mut phone, 0);
+        let mut send = |request: &[u8]| proxy.handle(7, request, &mut port, Instant::now());
+        assert!(platform.token(&mut send, PIN, None).is_ok());
+        assert_eq!(phone.card.counters.wrong_pin, 0);
+        assert_eq!(phone.card.counters.tokens_issued, 1);
     }
 
     #[test]

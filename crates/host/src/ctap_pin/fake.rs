@@ -52,6 +52,9 @@ pub struct Authenticator {
     /// Every request after SELECT, raw (command byte first).
     pub requests: Vec<Vec<u8>>,
     selected: bool,
+    /// The FIDO applet is the default one: usable without SELECT after a
+    /// power-up (some cards behave so; it makes stale sends dangerous).
+    pub auto_select: bool,
     chain: Vec<u8>,
     pending: Vec<u8>,
 }
@@ -110,6 +113,7 @@ impl Authenticator {
             log: Vec::new(),
             requests: Vec::new(),
             selected: false,
+            auto_select: false,
             chain: Vec::new(),
             pending: Vec::new(),
         }
@@ -121,7 +125,7 @@ impl Authenticator {
         self.key = KeyAgreement::generate();
         self.token = None;
         self.consecutive_failures = 0;
-        self.selected = false;
+        self.selected = self.auto_select;
         self.chain.clear();
         self.pending.clear();
     }
