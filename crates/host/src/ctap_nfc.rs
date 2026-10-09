@@ -60,11 +60,30 @@ pub fn relay<E>(
     if request.is_empty() {
         return Err(RelayError::Empty);
     }
+    select(&mut transmit)?;
+    exchange(request, transmit)
+}
+
+/// SELECTs the FIDO applet: the start of a card session. Several
+/// [`exchange`]s may follow on the same tap.
+pub fn select<E>(
+    mut transmit: impl FnMut(Vec<u8>) -> Result<Vec<u8>, E>,
+) -> Result<(), RelayError<E>> {
     let (_, sw) = split(transmit(select_apdu()).map_err(RelayError::Transport)?);
     if sw != [0x90, 0x00] {
         return Err(RelayError::Card(sw));
     }
+    Ok(())
+}
 
+/// One CTAP request on an already selected applet.
+pub fn exchange<E>(
+    request: &[u8],
+    mut transmit: impl FnMut(Vec<u8>) -> Result<Vec<u8>, E>,
+) -> Result<Vec<u8>, RelayError<E>> {
+    if request.is_empty() {
+        return Err(RelayError::Empty);
+    }
     let apdus = msg_apdus(request);
     let last = apdus.len() - 1;
     let mut reply = Vec::new();
@@ -226,6 +245,27 @@ mod tests {
             (msg_apdus(&[0x02, 0xA0])[0].clone(), vec![0x2E, 0x90, 0x00]),
         ]);
         assert_eq!(relay(&[0x02, 0xA0], |a| card.transmit(a)).unwrap(), [0x2E]);
+    }
+
+    #[test]
+    fn one_select_then_several_exchanges_share_a_card_session() {
+        // The PIN proxy's getKeyAgreement + getPinToken + makeCredential
+        // run in one session: one SELECT, then plain NFCCTAP_MSGs.
+        let mut card = Script::new(vec![
+            select_ok(),
+            (msg_apdus(&[0x06, 0xA0])[0].clone(), vec![0x00, 0x90, 0x00]),
+            (msg_apdus(&[0x01, 0xA0])[0].clone(), vec![0x2E, 0x90, 0x00]),
+        ]);
+        select(|a| card.transmit(a)).unwrap();
+        assert_eq!(
+            exchange(&[0x06, 0xA0], |a| card.transmit(a)).unwrap(),
+            [0x00]
+        );
+        assert_eq!(
+            exchange(&[0x01, 0xA0], |a| card.transmit(a)).unwrap(),
+            [0x2E]
+        );
+        assert!(card.0.is_empty());
     }
 
     #[test]
