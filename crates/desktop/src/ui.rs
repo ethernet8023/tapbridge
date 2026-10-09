@@ -1,10 +1,11 @@
 //! gpui windows: the pairing QR window and the Settings window. Only these
 //! surfaces use gpui; the tray and all orchestration live beside them.
+use crate::glass;
 #[cfg(windows)]
 use crate::passkeys;
 use gpui::{
     Animation, AnimationExt, App, Bounds, Context, FocusHandle, Task, Window, WindowBounds,
-    WindowHandle, WindowOptions, canvas, div, fill, point, prelude::*, px, rgb, size,
+    WindowHandle, WindowOptions, canvas, div, fill, point, prelude::*, px, rgb, rgba, size,
 };
 #[cfg(windows)]
 use gpui::{Entity, Pixels};
@@ -24,8 +25,10 @@ const QUIET_ZONE: u16 = 4;
 /// How long the "Phone paired" confirmation stays up before the window closes.
 const PAIRED_CLOSE_DELAY: Duration = Duration::from_millis(2800);
 
-const PANEL: u32 = 0x17121F;
+#[cfg(windows)]
 const PANEL_2: u32 = 0x221A30;
+/// macOS draws the traffic lights over our content (transparent titlebar).
+const TITLEBAR_INSET: f32 = if cfg!(target_os = "macos") { 28.0 } else { 0.0 };
 const TEXT: u32 = 0xF2EFFA;
 const ACCENT: u32 = 0x7C5CFF;
 const GOOD: u32 = 0x3DDC97;
@@ -80,7 +83,7 @@ fn countdown(remaining: Duration) -> String {
 }
 
 impl Render for PairingView {
-    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dimension = self.dimension;
         // Whole device pixels per module: fractional modules leave seams.
         let scale = window.scale_factor();
@@ -90,14 +93,16 @@ impl Render for PairingView {
         let stage = side + px(20.0);
 
         let root = div()
+            .relative()
             .flex()
             .flex_col()
             .items_center()
             .justify_center()
             .size_full()
             .gap(px(18.0))
-            .bg(rgb(PANEL))
-            .text_color(rgb(TEXT));
+            .pt(px(TITLEBAR_INSET))
+            .text_color(rgb(TEXT))
+            .child(glass::backdrop());
 
         if let Some(phone) = &self.paired {
             return root
@@ -161,8 +166,7 @@ impl Render for PairingView {
                     ring.opacity(0.25 + 0.75 * wave)
                 },
             );
-        let card = div()
-            .relative()
+        let card = glass::panel("pairing-card", 20.0, cx)
             .size(stage)
             .flex()
             .items_center()
@@ -247,7 +251,7 @@ pub fn open_pairing_window(
         let text = invitation.to_owned();
         let refreshed = handle.update(cx, |view, window, cx| {
             *view = PairingView::new(&text, cx);
-            window.activate_window();
+            window.activate();
             cx.notify();
         });
         if refreshed.is_ok() {
@@ -262,6 +266,7 @@ pub fn open_pairing_window(
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(gpui::TitlebarOptions {
                     title: Some("Pair phone".into()),
+                    appears_transparent: cfg!(target_os = "macos"),
                     ..Default::default()
                 }),
                 is_resizable: false,
@@ -270,9 +275,7 @@ pub fn open_pairing_window(
             move |_window, cx| cx.new(|cx| PairingView::new(&invitation, cx)),
         )
         .expect("pairing window");
-    window
-        .update(cx, |_, window, _| window.activate_window())
-        .ok();
+    window.update(cx, |_, window, _| window.activate()).ok();
     window
 }
 
@@ -574,18 +577,18 @@ fn option_row(
     enabled: bool,
     title: &str,
     detail: String,
+    cx: &mut App,
 ) -> gpui::Stateful<gpui::Div> {
-    div()
+    glass::panel(id, 14.0, cx)
         .id(id)
         .flex()
         .flex_row()
         .items_center()
         .gap(px(14.0))
         .p(px(14.0))
-        .rounded(px(12.0))
-        .bg(rgb(PANEL_2))
         .when(enabled, |row| {
-            row.cursor_pointer().hover(|style| style.bg(rgb(0x2C2340)))
+            row.cursor_pointer()
+                .hover(|style| style.bg(rgba(0xFFFFFF0A)))
         })
         .child(checkbox(checked, enabled))
         .child(
@@ -666,6 +669,7 @@ impl Render for PasskeyView {
                 false,
                 "Security key",
                 "tapbridge. Always on.".to_owned(),
+                cx,
             ))
             .child(
                 option_row(
@@ -674,6 +678,7 @@ impl Render for PasskeyView {
                     idle,
                     "This Windows device",
                     "Passkeys saved with Windows Hello on this PC.".to_owned(),
+                    cx,
                 )
                 .on_click(cx.listener(|view, _: &gpui::ClickEvent, _, cx| {
                     if view.dialog.is_none() {
@@ -688,6 +693,7 @@ impl Render for PasskeyView {
                     phone_enabled,
                     "iPhone, iPad, or Android device",
                     phone_detail,
+                    cx,
                 )
                 .on_click(cx.listener(|view, _: &gpui::ClickEvent, _, cx| view.toggle_phone(cx))),
             )
@@ -698,6 +704,7 @@ impl Render for PasskeyView {
                     idle && !options.providers.is_empty(),
                     "Passkey managers",
                     managers_detail,
+                    cx,
                 )
                 .when(!options.providers.is_empty(), |row| {
                     row.on_click(|_, _, _| passkeys::open_windows_passkey_settings())
@@ -799,18 +806,17 @@ fn section_title(title: &str) -> impl IntoElement {
 fn button(
     id: &'static str,
     label: impl Into<gpui::SharedString>,
-    color: u32,
-    hover: u32,
+    tint: u32,
+    opacity: f32,
+    cx: &mut App,
 ) -> gpui::Stateful<gpui::Div> {
-    div()
+    glass::capsule(id, tint, opacity, cx)
         .id(id)
         .flex_none()
-        .px(px(14.0))
-        .py(px(7.0))
-        .rounded(px(9.0))
-        .bg(rgb(color))
+        .px(px(16.0))
+        .py(px(8.0))
         .cursor_pointer()
-        .hover(move |style| style.bg(rgb(hover)))
+        .hover(|style| style.bg(rgba(0xFFFFFF14)))
         .text_size(px(13.0))
         .font_weight(gpui::FontWeight::MEDIUM)
         .child(label.into())
@@ -860,11 +866,12 @@ impl Render for SettingsView {
                 "forget",
                 label,
                 if self.confirm_forget {
-                    0x8A2E3B
+                    0xE0455A
                 } else {
-                    0x2C2340
+                    0xFFFFFF
                 },
-                0x9C3646,
+                if self.confirm_forget { 0.55 } else { 0.06 },
+                cx,
             )
             .on_click(cx.listener(|view, _: &gpui::ClickEvent, _, cx| {
                 if view.confirm_forget {
@@ -876,7 +883,7 @@ impl Render for SettingsView {
                 cx.notify();
             }))
         } else {
-            button("pair", "Pair phone\u{2026}", ACCENT, 0x6A4BEB).on_click(
+            button("pair", "Pair phone\u{2026}", ACCENT, 0.6, cx).on_click(
                 cx.listener(|view, _: &gpui::ClickEvent, _, cx| view.act(SettingsAction::Pair, cx)),
             )
         };
@@ -886,14 +893,12 @@ impl Render for SettingsView {
             .gap(px(10.0))
             .child(section_title("Phone"))
             .child(
-                div()
+                glass::panel("phone-card", 14.0, cx)
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(14.0))
                     .p(px(14.0))
-                    .rounded(px(12.0))
-                    .bg(rgb(PANEL_2))
                     .child(
                         div()
                             .flex_1()
@@ -935,6 +940,7 @@ impl Render for SettingsView {
                     true,
                     "Start at login",
                     login_detail.to_owned(),
+                    cx,
                 )
                 .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
                     // Optimistic; the shell's next snapshot has the real state.
@@ -964,6 +970,7 @@ impl Render for SettingsView {
             .flex_col()
             .gap(px(22.0))
             .p(px(22.0))
+            .pt(px(TITLEBAR_INSET + 14.0))
             .child(header)
             .child(phone)
             .child(general);
@@ -971,13 +978,19 @@ impl Render for SettingsView {
         let column = column.child(self.passkeys.clone());
         let column = column.child(details);
         div()
-            .id("settings")
-            .track_focus(&self.focus)
+            .relative()
             .size_full()
-            .overflow_y_scroll()
-            .bg(rgb(PANEL))
             .text_color(rgb(TEXT))
-            .child(column)
+            .child(glass::backdrop())
+            .child(
+                div()
+                    .id("settings")
+                    .track_focus(&self.focus)
+                    .absolute()
+                    .inset_0()
+                    .overflow_y_scroll()
+                    .child(column),
+            )
     }
 }
 
@@ -1000,7 +1013,7 @@ pub fn open_settings_window(
                     cx.notify();
                 }
             });
-            window.activate_window();
+            window.activate();
         });
         if refreshed.is_ok() {
             return handle;
@@ -1022,6 +1035,7 @@ pub fn open_settings_window(
                         }
                         .into(),
                     ),
+                    appears_transparent: cfg!(target_os = "macos"),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -1029,15 +1043,13 @@ pub fn open_settings_window(
             move |window, cx| {
                 cx.new(|cx| {
                     let view = SettingsView::new(snapshot, on_action, cx);
-                    view.focus.focus(window);
+                    view.focus.focus(window, cx);
                     view
                 })
             },
         )
         .expect("settings window");
-    window
-        .update(cx, |_, window, _| window.activate_window())
-        .ok();
+    window.update(cx, |_, window, _| window.activate()).ok();
     window
 }
 

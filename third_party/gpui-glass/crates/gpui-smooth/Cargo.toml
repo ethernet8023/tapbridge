@@ -1,0 +1,15 @@
+[package]
+name = "gpui-smooth"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Lisse capsule and uniform rounded-rectangle contours, with optional GPUI-CE painting"
+license = "BSD-3-Clause"
+readme = "README.md"
+
+[features]
+default = []
+gpui = ["dep:gpui"]
+
+[dependencies]
+gpui = { package = "gpui-ce", version = "0.2.2", default-features = false, optional = true }
