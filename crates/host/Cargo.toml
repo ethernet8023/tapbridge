@@ -22,6 +22,8 @@ windows-sys = { version = "0.61", features = [
 [target.'cfg(target_os = "macos")'.dependencies]
 aes-gcm = "0.10"
 security-framework = { version = "3", features = ["OSX_10_15"] }
+security-framework-sys = "2.17"
+core-foundation = "0.10"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

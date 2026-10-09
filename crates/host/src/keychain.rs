@@ -21,8 +21,9 @@ use iroh::SecretKey;
 use security_framework::base::Error as KeychainError;
 #[cfg(test)]
 use security_framework::passwords::delete_generic_password;
-use security_framework::passwords::{generic_password, set_generic_password_options};
+use security_framework::passwords::generic_password;
 use security_framework::passwords_options::PasswordOptions;
+use security_framework_sys::base::errSecItemNotFound;
 use std::io;
 use std::sync::{Mutex, OnceLock};
 
@@ -144,19 +145,52 @@ fn record_key() -> io::Result<[u8; 32]> {
     // A panicking holder must not poison first-use for the rest of the
     // process; the keychain item itself is the source of truth.
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let found = generic_password(options()).map_err(keychain);
-    match found {
+    match generic_password(options()) {
         Ok(found) => found.try_into().map_err(|_| invalid()),
-        Err(_) => {
+        // Only a genuinely missing item may be created. Any other failure
+        // (an ACL prompt that cannot be shown, a locked keychain, "dark
+        // wake") must surface: treating it as missing would replace the key
+        // that `identity.bin` is sealed with and destroy the identity.
+        Err(error) if error.code() == errSecItemNotFound => {
             let key = SecretKey::generate().to_bytes();
-            set_generic_password_options(&key, options()).map_err(keychain)?;
-            // A concurrent first run may have won the write race; seal and
+            add_only(&key)?;
+            // A concurrent first run may have won the add race; seal and
             // open with whatever the keychain now holds.
             generic_password(options())
                 .map_err(keychain)?
                 .try_into()
                 .map_err(|_| invalid())
         }
+        Err(error) => Err(keychain(error)),
+    }
+}
+
+/// `SecItemAdd` without the update fallback `set_generic_password_options`
+/// has: an existing key item is never overwritten. A duplicate means another
+/// first run created it first, which is fine.
+fn add_only(key: &[u8]) -> io::Result<()> {
+    use core_foundation::{
+        base::{CFType, TCFType},
+        data::CFData,
+        dictionary::CFDictionary,
+        string::CFString,
+    };
+    use security_framework_sys::{
+        base::errSecDuplicateItem, item::kSecValueData, keychain_item::SecItemAdd,
+    };
+    // The same item query `generic_password` uses, plus the value.
+    #[allow(deprecated)] // `query` is the only public view of the options.
+    let mut pairs: Vec<(CFString, CFType)> = options().query;
+    // SAFETY: kSecValueData is a static CFString provided by Security.framework.
+    let value_key = unsafe { CFString::wrap_under_get_rule(kSecValueData) };
+    pairs.push((value_key, CFData::from_buffer(key).into_CFType()));
+    let params = CFDictionary::from_CFType_pairs(&pairs);
+    // SAFETY: valid dictionary; the result pointer is unused (null allowed).
+    let status = unsafe { SecItemAdd(params.as_concrete_TypeRef(), std::ptr::null_mut()) };
+    match status {
+        0 => Ok(()),
+        status if status == errSecDuplicateItem => Ok(()),
+        status => Err(keychain(KeychainError::from_code(status))),
     }
 }
 
