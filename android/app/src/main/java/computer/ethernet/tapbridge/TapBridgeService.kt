@@ -457,12 +457,13 @@ class TapBridgeService : Service() {
         } catch (failure: Exception) { error = failure.message ?: "connection lost" }
         gate.closeIfActive()
         session.close()
-        // The session is over: its sign-in state and tap request with it.
+        // The session is over and its sign-in state with it, even when a
+        // reconnect already started (the old PC's PIN prompt must not carry
+        // over). A wake's tap request outlives a reconnect, so only this
+        // attempt's end clears it.
         main.post {
-            if (requested.get() == attempt) {
-                setAuthState(AuthState.IDLE)
-                setTapRequested(false)
-            }
+            clearAuthState()
+            if (requested.get() == attempt) setTapRequested(false)
         }
         if (destroyed) return
         lifecycle.execute {
@@ -589,6 +590,15 @@ class TapBridgeService : Service() {
             authState = value
             listener?.onAuthState(value)
         }
+        updateNotice()
+    }
+
+    /** Drops the sign-in state without touching the tap request. Main thread. */
+    private fun clearAuthState() {
+        main.removeCallbacks(clearAuthRunnable)
+        if (authState == AuthState.IDLE) return
+        authState = AuthState.IDLE
+        listener?.onAuthState(AuthState.IDLE)
         updateNotice()
     }
 
