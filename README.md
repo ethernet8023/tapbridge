@@ -23,12 +23,12 @@ Nothing stays connected while you are not signing in, so tapbridge does not drai
 2. Your phone shows "Tap your security key". Unlock the phone (most phones turn NFC off while locked).
 3. Hold the key against the back of the phone until Windows finishes.
 
-You can also open the phone app first, or select tray icon → **Request tap**.
+You can also open the phone app first.
 
 ## Security
 
 - Each PC and phone has its own identity key. The PC key is protected by Windows DPAPI. The phone key is wrapped by Android Keystore and is not backed up.
-- One phone can be paired with several PCs at once (say a desktop and a laptop). Each PC still accepts exactly one phone: to pair a PC with a different phone, select **Forget phone** on that PC first. On the phone, Settings → **Paired PCs** lists every paired PC with per-PC rename and **Forget**.
+- One phone can be paired with several PCs at once (say a desktop and a laptop). Each PC still accepts exactly one phone: to pair a PC with a different phone, open **Settings… (⌘, / Ctrl+,)** from the tray icon on that PC and select **Forget phone** first. On the phone, Settings → **Paired PCs** lists every paired PC with per-PC rename and **Forget**.
 - The iroh connection is end-to-end encrypted. Public iroh relays and the wake relay see connection metadata only.
 - Logs never contain keys, invitations, push tokens, PINs or card data.
 
@@ -49,6 +49,7 @@ Requirements: Rust 1.91+, LLVM clang and the MSVC build tools (arm64 and x64 lib
 | Rust tests, clippy, fmt | `powershell -File scripts\check.ps1` |
 | Desktop installers (`dist\`) | `$env:TAPBRIDGE_RELAY_URL='https://...'; powershell -File scripts\build-desktop.ps1 -Arch both` |
 | macOS pkg (`dist/tapbridge-<version>-macos.pkg`) | `cargo build --release -p tapbridge-desktop && crates/desktop/ifd_shim/build.sh && scripts/build-pkg.sh [--sign "Developer ID Installer: NAME (TEAMID)"]` |
+| Debug APK on macOS/Linux (Nix dev shell: Rust + Android target, JDK 17, SDK 36, NDK 27.2, adb) | `nix develop -c scripts/build-android.sh`, then `adb install -r android/app/build/outputs/apk/debug/app-debug.apk` |
 | Android tests, lint, debug APK | in `android\`: `gradlew.bat testDebugUnitTest lintDebug assembleDebug` |
 | Play bundle (AAB) | in `android\`: `gradlew.bat bundleRelease` |
 | Relay | see `relay\README.md` |
