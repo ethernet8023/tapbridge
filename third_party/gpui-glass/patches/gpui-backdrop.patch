@@ -1,0 +1,679 @@
+diff --git a/crates/gpui/src/scene.rs b/crates/gpui/src/scene.rs
+--- a/crates/gpui/src/scene.rs
++++ b/crates/gpui/src/scene.rs
+@@ -870,12 +870,24 @@
+     }
+ }
+ 
++/// Renderer-specific backdrop payload. Core GPUI remains independent of the GPU API.
++#[derive(Clone)]
++pub struct CustomBackdrop(pub std::sync::Arc<dyn std::any::Any + Send + Sync>);
++
++impl std::fmt::Debug for CustomBackdrop {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("CustomBackdrop")
++    }
++}
++
+ /// A backdrop filter blurs (and may otherwise filter) the content already rendered behind
+ /// `bounds`, compositing the result into a rounded rectangle — the frosted-glass effect.
+ /// Emitted by [`crate::Window::paint_backdrop_filter`]; produces the CSS `backdrop-filter` effect.
+ #[derive(Default, Debug, Clone)]
+ #[expect(missing_docs)]
+ pub struct BackdropFilter {
++    /// Optional renderer-specific backdrop effect. Unsupported renderers use the filter chain.
++    pub custom: Option<CustomBackdrop>,
+     pub order: DrawOrder,
+     pub bounds: Bounds<ScaledPixels>,
+     pub content_mask: ContentMask<ScaledPixels>,
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -4454,6 +4454,7 @@
+         }
+ 
+         self.next_frame.scene.insert_primitive(BackdropFilter {
++            custom: None,
+             order: 0,
+             bounds: self.snap_bounds(bounds),
+             content_mask: self.snapped_content_mask(),
+@@ -4461,6 +4462,23 @@
+             corner_smoothing: corner_smoothing.clamp(0.0, 1.0),
+             filters,
+             opacity: self.element_opacity(),
++        });
++    }
++
++    /// Paint a renderer-specific backdrop at this point in scene order.
++    /// The payload is interpreted by the active renderer; children can be painted afterwards.
++    pub fn paint_custom_backdrop(
++        &mut self,
++        bounds: Bounds<Pixels>,
++        effect: crate::CustomBackdrop,
++    ) {
++        self.invalidator.debug_assert_paint();
++        self.next_frame.scene.insert_primitive(BackdropFilter {
++            bounds: self.snap_bounds(bounds),
++            content_mask: self.snapped_content_mask(),
++            opacity: self.element_opacity(),
++            custom: Some(effect),
++            ..Default::default()
+         });
+     }
+ 
+diff --git a/crates/gpui_wgpu/src/gpui_wgpu.rs b/crates/gpui_wgpu/src/gpui_wgpu.rs
+--- a/crates/gpui_wgpu/src/gpui_wgpu.rs
++++ b/crates/gpui_wgpu/src/gpui_wgpu.rs
+@@ -12,3 +12,6 @@
+ pub use wgpu_renderer::{
+     FontRasterizationSettings, GpuContext, SubpixelOrder, WgpuRenderer, WgpuSurfaceConfig,
+ };
++
++mod backdrop;
++pub use backdrop::*;
+diff --git a/crates/gpui_wgpu/src/wgpu_renderer/filters.rs b/crates/gpui_wgpu/src/wgpu_renderer/filters.rs
+--- a/crates/gpui_wgpu/src/wgpu_renderer/filters.rs
++++ b/crates/gpui_wgpu/src/wgpu_renderer/filters.rs
+@@ -174,7 +174,29 @@
+         encoder: &mut wgpu::CommandEncoder,
+         filter: &BackdropFilter,
+         scene_color_view: &wgpu::TextureView,
+-    ) {
++        frame_id: u64,
++        sequence: u64,
++        source_damage: [f32; 4],
++    ) -> gpui::Bounds<gpui::ScaledPixels> {
++        if let Some(effect) = filter
++            .custom
++            .as_ref()
++            .and_then(|payload| payload.0.downcast_ref::<crate::WgpuBackdropEffect>())
++        {
++            effect.0.paint(crate::BackdropContext {
++                device: &self.resources().device,
++                queue: &self.resources().queue,
++                encoder,
++                scene: scene_color_view,
++                format: self.target.format(),
++                viewport: [self.target.width(), self.target.height()],
++                filter,
++                frame_id,
++                sequence,
++                source_damage,
++            });
++            return effect.0.damage_bounds(filter);
++        }
+         self.blur_and_composite(
+             encoder,
+             scene_color_view,
+@@ -189,6 +211,7 @@
+                 clip: FilterCompositeClip::RoundedBounds,
+             },
+         );
++        filter.bounds
+     }
+ 
+     pub(super) fn blit_to_frame(
+diff --git a/crates/gpui_wgpu/src/backdrop.rs b/crates/gpui_wgpu/src/backdrop.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/gpui_wgpu/src/backdrop.rs
+@@ -0,0 +1,40 @@
++//! Opt-in backdrop callback. The application owns shader resources, GPUI owns scene ordering.
++use std::sync::Arc;
++
++/// GPU access for one backdrop draw. Source and target alias: sample the source only in a
++/// separate pass into application-owned scratch storage before compositing to the target.
++pub struct BackdropContext<'a> {
++    pub device: &'a wgpu::Device,
++    pub queue: &'a wgpu::Queue,
++    pub encoder: &'a mut wgpu::CommandEncoder,
++    pub scene: &'a wgpu::TextureView,
++    pub format: wgpu::TextureFormat,
++    pub viewport: [u32; 2],
++    /// Unique command-frame identity; changes even when the target is reused.
++    pub frame_id: u64,
++    /// Monotonic backdrop position within this frame.
++    pub sequence: u64,
++    /// Conservative changed region since the previous backdrop: left/top/right/bottom.
++    pub source_damage: [f32; 4],
++    pub filter: &'a gpui::BackdropFilter,
++}
++
++/// Implementations must encode into the supplied encoder, never submit/wait/read back.
++/// Resources must be recreated when `device` changes, and respect the filter content mask.
++pub trait WgpuBackdrop: Send + Sync + 'static {
++    fn paint(&self, context: BackdropContext<'_>);
++    /// Conservative output bounds. Unknown effects invalidate the complete content mask.
++    fn damage_bounds(&self, filter: &gpui::BackdropFilter) -> gpui::Bounds<gpui::ScaledPixels> {
++        filter.content_mask.bounds
++    }
++}
++
++/// Typed envelope used by the WGPU backend; other backends fall back to the ordinary chain.
++#[derive(Clone)]
++pub struct WgpuBackdropEffect(pub Arc<dyn WgpuBackdrop>);
++
++impl WgpuBackdropEffect {
++    pub fn into_gpui(self) -> gpui::CustomBackdrop {
++        gpui::CustomBackdrop(Arc::new(self))
++    }
++}
+diff --git a/crates/gpui_wgpu/src/wgpu_renderer/headless.rs b/crates/gpui_wgpu/src/wgpu_renderer/headless.rs
+--- a/crates/gpui_wgpu/src/wgpu_renderer/headless.rs
++++ b/crates/gpui_wgpu/src/wgpu_renderer/headless.rs
+@@ -1,4 +1,38 @@
++#[cfg(target_os = "macos")]
++use objc2_metal::{
++    MTLBlitCommandEncoder as _, MTLCommandBuffer as _, MTLCommandEncoder as _,
++    MTLCommandQueue as _, MTLDevice as _,
++};
+ use std::sync::Arc;
++
++#[cfg(target_os = "macos")]
++struct MetalFrameClock {
++    queue: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandQueue>>,
++    buffer: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
++}
++#[cfg(target_os = "macos")]
++impl MetalFrameClock {
++    fn marker(
++        &self,
++    ) -> Option<
++        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>,
++    > {
++        let command = self.queue.commandBuffer()?;
++        let blit = command.blitCommandEncoder()?;
++        // A tiny real blit prevents empty marker command buffers being discarded.
++        unsafe {
++            blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
++                &self.buffer,
++                0,
++                &self.buffer,
++                4,
++                4,
++            );
++        }
++        blit.endEncoding();
++        Some(command)
++    }
++}
+ 
+ use gpui::{DevicePixels, Scene, Size};
+ 
+@@ -143,11 +177,60 @@
+ pub struct WgpuHeadlessRenderer {
+     renderer: WgpuRenderer,
+     target: Option<OffscreenTarget>,
++    timestamps: Option<super::frame::FrameTimestamps>,
++    #[cfg(target_os = "macos")]
++    metal_clock: Option<MetalFrameClock>,
+ }
+ 
+ impl WgpuHeadlessRenderer {
+     pub fn new() -> anyhow::Result<Self> {
+-        let context = WgpuContext::new_headless(None)?;
++        Self::from_context(WgpuContext::new_headless(None)?, false)
++    }
++
++    /// Benchmark-only GPU timing. Metal brackets the prepared frame with native
++    /// queue markers; other backends request optional timestamp queries.
++    /// Normal renderer construction does neither.
++    pub fn new_with_timestamps() -> anyhow::Result<Self> {
++        #[cfg(target_os = "macos")]
++        {
++            let mut headless = Self::new()?;
++            let queue = unsafe {
++                headless
++                    .renderer
++                    .resources()
++                    .queue
++                    .as_hal::<wgpu::hal::api::Metal>()
++            };
++            if let Some(ref queue) = queue {
++                let raw = queue.as_raw();
++                let buffer = raw.device().newBufferWithLength_options(
++                    8,
++                    objc2_metal::MTLResourceOptions::StorageModeShared,
++                );
++                if let Some(buffer) = buffer {
++                    let queue =
++                        unsafe { objc2::rc::Retained::retain(raw as *const _ as *mut _) }.unwrap();
++                    headless.metal_clock = Some(MetalFrameClock { queue, buffer });
++                }
++            }
++            drop(queue);
++            Ok(headless)
++        }
++        #[cfg(not(target_os = "macos"))]
++        {
++            let requirements = crate::WgpuDeviceRequirements {
++                features: wgpu::Features::TIMESTAMP_QUERY
++                    | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS,
++                limits: None,
++            };
++            match WgpuContext::new_headless(Some(&requirements)) {
++                Ok(context) => Self::from_context(context, true),
++                Err(_) => Self::new(),
++            }
++        }
++    }
++
++    fn from_context(context: WgpuContext, timing: bool) -> anyhow::Result<Self> {
+         let renderer = WgpuRenderer::new_headless(
+             &context,
+             Size {
+@@ -155,10 +238,160 @@
+                 height: DevicePixels(1),
+             },
+         )?;
++        let timestamps = timing.then(|| {
++            let device = &renderer.resources().device;
++            super::frame::FrameTimestamps {
++                marker: device.create_buffer(&wgpu::BufferDescriptor {
++                    label: Some("gpui_bench_timestamp_marker"),
++                    size: 4,
++                    usage: wgpu::BufferUsages::COPY_DST,
++                    mapped_at_creation: false,
++                }),
++                queries: device.create_query_set(&wgpu::QuerySetDescriptor {
++                    label: Some("gpui_bench_timestamps"),
++                    ty: wgpu::QueryType::Timestamp,
++                    count: 2,
++                }),
++                resolved: device.create_buffer(&wgpu::BufferDescriptor {
++                    label: Some("gpui_bench_timestamp_resolve"),
++                    size: 16,
++                    usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
++                    mapped_at_creation: false,
++                }),
++                readback: device.create_buffer(&wgpu::BufferDescriptor {
++                    label: Some("gpui_bench_timestamp_readback"),
++                    size: 16,
++                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
++                    mapped_at_creation: false,
++                }),
++            }
++        });
+         Ok(Self {
+             renderer,
+             target: None,
++            timestamps,
++            #[cfg(target_os = "macos")]
++            metal_clock: None,
+         })
++    }
++
++    /// GPU duration in milliseconds. Metal returns the interval between two
++    /// native queue markers around the prepared frame, including inter-buffer
++    /// scheduling gaps and possible independent-stage overlap. It is a
++    /// diagnostic queue interval, not isolated shader time or GPU occupancy.
++    /// Other backends return timestamp-query duration without resolve/readback.
++    /// CPU scene preparation and native presentation are excluded.
++    pub fn render_scene_timed_and_wait(
++        &mut self,
++        scene: &Scene,
++        size: Size<DevicePixels>,
++    ) -> anyhow::Result<Option<f64>> {
++        #[cfg(target_os = "macos")]
++        if self.metal_clock.is_some() {
++            self.ensure_target(size)?;
++            let target = self.target.as_ref().unwrap();
++            let encoded =
++                super::frame::encode_for_headless_timing(&mut self.renderer, scene, &target.view)
++                    .ok_or_else(|| anyhow::anyhow!("failed to encode timed frame"))?;
++            let clock = self.metal_clock.as_ref().unwrap();
++            let before = clock
++                .marker()
++                .ok_or_else(|| anyhow::anyhow!("failed to create Metal begin marker"))?;
++            let after = clock
++                .marker()
++                .ok_or_else(|| anyhow::anyhow!("failed to create Metal end marker"))?;
++            // Prepare all CPU work first, then submit the three buffers without
++            // waiting between them. The measured queue interval includes gaps
++            // between command buffers and may overlap independent GPU stages;
++            // this is a queue diagnostic, not isolated execution or active time.
++            before.commit();
++            let submission = self.renderer.resources().queue.submit([encoded]);
++            after.commit();
++            after.waitUntilCompleted();
++            self.renderer
++                .resources()
++                .device
++                .poll(wgpu::PollType::Wait {
++                    submission_index: Some(submission),
++                    timeout: None,
++                })
++                .map_err(|error| anyhow::anyhow!("failed to wait for timed frame: {error}"))?;
++            let start = before.GPUEndTime();
++            let end = after.GPUStartTime();
++            if start > 0. && end > start {
++                return Ok(Some((end - start) * 1000.));
++            }
++            self.metal_clock = None;
++            return Ok(None);
++        }
++        if self.timestamps.is_none() {
++            self.render_scene_and_wait(scene, size)?;
++            return Ok(None);
++        }
++        self.ensure_target(size)?;
++        let timestamps = self.timestamps.as_ref().unwrap();
++        let target = self.target.as_ref().unwrap();
++        let submission =
++            super::frame::render_to_view_timed(&mut self.renderer, scene, &target.view, timestamps)
++                .ok_or_else(|| anyhow::anyhow!("failed to render timed headless scene"))?;
++        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
++        timestamps
++            .readback
++            .slice(..)
++            .map_async(wgpu::MapMode::Read, move |result| {
++                let _ = sender.send(result);
++            });
++        self.renderer
++            .resources()
++            .device
++            .poll(wgpu::PollType::Wait {
++                submission_index: Some(submission),
++                timeout: None,
++            })
++            .map_err(|error| anyhow::anyhow!("failed to wait for timestamps: {error}"))?;
++        receiver
++            .recv()
++            .map_err(|error| anyhow::anyhow!("timestamp callback dropped: {error}"))?
++            .map_err(|error| anyhow::anyhow!("failed to map timestamps: {error}"))?;
++        let mapped = timestamps.readback.slice(..).get_mapped_range();
++        let start = u64::from_le_bytes(mapped[0..8].try_into().unwrap());
++        let end = u64::from_le_bytes(mapped[8..16].try_into().unwrap());
++        drop(mapped);
++        timestamps.readback.unmap();
++        // Some drivers advertise timestamp support but return an all-zero pair.
++        // Do not turn unavailable instrumentation into a false zero-cost result.
++        if start == 0 || end <= start {
++            self.timestamps = None;
++            return Ok(None);
++        }
++        let elapsed = end.wrapping_sub(start) as f64
++            * self.renderer.resources().queue.get_timestamp_period() as f64
++            / 1_000_000.;
++        Ok(Some(elapsed))
++    }
++
++    pub fn gpu_timing_source(&self) -> &'static str {
++        #[cfg(target_os = "macos")]
++        if self.metal_clock.is_some() {
++            return "Metal marker interval (diagnostic only; gaps and independent-stage overlap)";
++        }
++        if self.timestamps.is_some() {
++            "GPU timestamp queries"
++        } else {
++            "unavailable"
++        }
++    }
++
++    pub fn gpu_timing_enabled(&self) -> bool {
++        #[cfg(target_os = "macos")]
++        if self.metal_clock.is_some() {
++            return true;
++        }
++        self.timestamps.is_some()
++    }
++
++    pub fn adapter_description(&self) -> String {
++        format!("{:?}", self.renderer.adapter_info)
+     }
+ 
+     fn ensure_target(&mut self, size: Size<DevicePixels>) -> anyhow::Result<()> {
+diff --git a/crates/gpui_wgpu/src/wgpu_renderer/frame.rs b/crates/gpui_wgpu/src/wgpu_renderer/frame.rs
+--- a/crates/gpui_wgpu/src/wgpu_renderer/frame.rs
++++ b/crates/gpui_wgpu/src/wgpu_renderer/frame.rs
+@@ -20,6 +20,68 @@
+     frame_view: &wgpu::TextureView,
+     readback: Option<ReadbackCopy<'_>>,
+ ) -> Option<wgpu::SubmissionIndex> {
++    render_to_view_inner(
++        renderer,
++        scene,
++        frame_view,
++        readback,
++        #[cfg(feature = "test-support")]
++        None,
++    )
++}
++
++#[cfg(feature = "test-support")]
++pub(super) struct FrameTimestamps {
++    pub queries: wgpu::QuerySet,
++    pub resolved: wgpu::Buffer,
++    pub readback: wgpu::Buffer,
++    pub marker: wgpu::Buffer,
++}
++
++#[cfg(feature = "test-support")]
++pub(super) fn render_to_view_timed(
++    renderer: &mut WgpuRenderer,
++    scene: &Scene,
++    frame_view: &wgpu::TextureView,
++    timestamps: &FrameTimestamps,
++) -> Option<wgpu::SubmissionIndex> {
++    render_to_view_inner(renderer, scene, frame_view, None, Some(timestamps))
++}
++
++fn render_to_view_inner(
++    renderer: &mut WgpuRenderer,
++    scene: &Scene,
++    frame_view: &wgpu::TextureView,
++    readback: Option<ReadbackCopy<'_>>,
++    #[cfg(feature = "test-support")] timestamps: Option<&FrameTimestamps>,
++) -> Option<wgpu::SubmissionIndex> {
++    encode_to_view_inner(
++        renderer,
++        scene,
++        frame_view,
++        readback,
++        #[cfg(feature = "test-support")]
++        timestamps,
++    )
++    .map(|command_buffer| renderer.resources().queue.submit([command_buffer]))
++}
++
++#[cfg(all(feature = "test-support", target_os = "macos"))]
++pub(super) fn encode_for_headless_timing(
++    renderer: &mut WgpuRenderer,
++    scene: &Scene,
++    frame_view: &wgpu::TextureView,
++) -> Option<wgpu::CommandBuffer> {
++    encode_to_view_inner(renderer, scene, frame_view, None, None)
++}
++
++fn encode_to_view_inner(
++    renderer: &mut WgpuRenderer,
++    scene: &Scene,
++    frame_view: &wgpu::TextureView,
++    readback: Option<ReadbackCopy<'_>>,
++    #[cfg(feature = "test-support")] timestamps: Option<&FrameTimestamps>,
++) -> Option<wgpu::CommandBuffer> {
+     let Some(targets) = PreparedTargets::prepare(renderer, scene, frame_view) else {
+         return None;
+     };
+@@ -27,8 +89,12 @@
+     // texture that reappears after an intervening primitive and recreate its platform view.
+     renderer.retain_surface_cache(&scene.surfaces);
+ 
+-    match FrameEncoder::new(renderer, scene, targets).encode(readback) {
+-        Ok(command_buffer) => Some(renderer.resources().queue.submit([command_buffer])),
++    match FrameEncoder::new(renderer, scene, targets).encode(
++        readback,
++        #[cfg(feature = "test-support")]
++        timestamps,
++    ) {
++        Ok(command_buffer) => Some(command_buffer),
+         Err(DrawError::ExternalSurface) => None,
+         Err(DrawError::CapacityPlanningInvariant) => {
+             log::error!("frame storage exceeded its precomputed capacity");
+@@ -346,7 +412,14 @@
+     fn encode(
+         mut self,
+         readback: Option<ReadbackCopy<'_>>,
++        #[cfg(feature = "test-support")] timestamps: Option<&FrameTimestamps>,
+     ) -> Result<wgpu::CommandBuffer, DrawError> {
++        #[cfg(feature = "test-support")]
++        if let Some(timestamps) = timestamps {
++            self.encoder.write_timestamp(&timestamps.queries, 0);
++            // Metal timestamp sampling needs actual work at an encoder boundary.
++            self.encoder.clear_buffer(&timestamps.marker, 0, None);
++        }
+         let result = self.encode_commands();
+         if result.is_ok() {
+             if let Some(offscreen) = &self.offscreen {
+@@ -374,11 +447,35 @@
+         }
+         self.instances.finish(&mut self.encoder);
+         self.renderer.resources().finish_frame_uploads();
++        #[cfg(feature = "test-support")]
++        if let Some(timestamps) = timestamps {
++            self.encoder.write_timestamp(&timestamps.queries, 1);
++            self.encoder.clear_buffer(&timestamps.marker, 0, None);
++            self.encoder
++                .resolve_query_set(&timestamps.queries, 0..2, &timestamps.resolved, 0);
++            self.encoder.copy_buffer_to_buffer(
++                &timestamps.resolved,
++                0,
++                &timestamps.readback,
++                0,
++                16,
++            );
++        }
+         let command_buffer = self.encoder.finish();
+         result.map(|()| command_buffer)
+     }
+ 
+     fn encode_commands(&mut self) -> DrawResult {
++        static NEXT_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
++        let frame_id = NEXT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        let mut sequence = 0;
++        let full = [
++            0.,
++            0.,
++            self.renderer.target.width() as f32,
++            self.renderer.target.height() as f32,
++        ];
++        let mut damage = full;
+         let mut pass = begin_scene_render_pass(
+             self.renderer,
+             &mut self.encoder,
+@@ -388,6 +485,13 @@
+         );
+ 
+         for command in self.scene.render_commands() {
++            match command {
++                RenderCommand::Batch(PrimitiveBatch::BackdropFilters(_)) => {}
++                RenderCommand::Batch(batch) => {
++                    accumulate_damage(&mut damage, self.scene, batch, full)
++                }
++                _ => damage = full,
++            }
+             match command {
+                 RenderCommand::Batch(PrimitiveBatch::Paths {
+                     range,
+@@ -421,11 +525,16 @@
+                 RenderCommand::Batch(PrimitiveBatch::BackdropFilters(range)) => {
+                     drop(pass);
+                     for filter in &self.scene.backdrop_filters[range.clone()] {
+-                        self.renderer.draw_backdrop_filter(
++                        let painted = self.renderer.draw_backdrop_filter(
+                             &mut self.encoder,
+                             filter,
+                             self.targets.current(),
++                            frame_id,
++                            sequence,
++                            damage,
+                         );
++                        damage = damage_rect(painted);
++                        sequence += 1;
+                     }
+                     pass = begin_scene_render_pass(
+                         self.renderer,
+@@ -624,3 +733,69 @@
+         }
+     }
+ }
++
++// Bounds are deliberately conservative. Transformed glyphs and external surfaces
++// invalidate the whole target; these paths must never reuse potentially stale pixels.
++fn damage_rect(b: gpui::Bounds<gpui::ScaledPixels>) -> [f32; 4] {
++    [
++        b.origin.x.0 - 2.,
++        b.origin.y.0 - 2.,
++        b.origin.x.0 + b.size.width.0 + 2.,
++        b.origin.y.0 + b.size.height.0 + 2.,
++    ]
++}
++fn accumulate_damage(d: &mut [f32; 4], scene: &Scene, batch: &PrimitiveBatch, full: [f32; 4]) {
++    let mut add = |b| {
++        let r = damage_rect(b);
++        d[0] = d[0].min(r[0]);
++        d[1] = d[1].min(r[1]);
++        d[2] = d[2].max(r[2]);
++        d[3] = d[3].max(r[3]);
++    };
++    match batch {
++        PrimitiveBatch::Quads { range, .. } => {
++            for p in &scene.quads[range.clone()] {
++                add(p.bounds);
++            }
++        }
++        PrimitiveBatch::Shadows { range, .. } => {
++            for p in &scene.shadows[range.clone()] {
++                add(p.bounds.dilate(gpui::ScaledPixels(p.blur_radius.0 * 3.)));
++            }
++        }
++        PrimitiveBatch::Paths { range, .. } => {
++            for p in &scene.paths[range.clone()] {
++                add(p.bounds);
++            }
++        }
++        PrimitiveBatch::Underlines(range) => {
++            for p in &scene.underlines[range.clone()] {
++                add(p.bounds);
++            }
++        }
++        PrimitiveBatch::PolychromeSprites { range, .. } => {
++            for p in &scene.polychrome_sprites[range.clone()] {
++                add(p.bounds);
++            }
++        }
++        PrimitiveBatch::MonochromeSprites { range, .. } => {
++            for p in &scene.monochrome_sprites[range.clone()] {
++                if p.transformation != gpui::TransformationMatrix::unit() {
++                    *d = full;
++                    return;
++                }
++                add(p.bounds);
++            }
++        }
++        PrimitiveBatch::SubpixelSprites { range, .. } => {
++            for p in &scene.subpixel_sprites[range.clone()] {
++                if p.transformation != gpui::TransformationMatrix::unit() {
++                    *d = full;
++                    return;
++                }
++                add(p.bounds);
++            }
++        }
++        _ => *d = full,
++    }
++}
+diff --git a/crates/gpui_wgpu/src/wgpu_context.rs b/crates/gpui_wgpu/src/wgpu_context.rs
+--- a/crates/gpui_wgpu/src/wgpu_context.rs
++++ b/crates/gpui_wgpu/src/wgpu_context.rs
+@@ -647,7 +647,9 @@
+                 .features()
+                 .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
+ 
+-        let mut required_features = wgpu::Features::empty();
++        // Optional native half arithmetic for custom backdrop shaders.
++        // Unsupported adapters retain the portable f32 path.
++        let mut required_features = adapter.features() & wgpu::Features::SHADER_F16;
+         if dual_source_blending {
+             required_features |= wgpu::Features::DUAL_SOURCE_BLENDING;
+         } else {

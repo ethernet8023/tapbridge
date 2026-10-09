@@ -1,0 +1,21 @@
+[package]
+name = "gpui-glass"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Cached backdrop refraction and frost for GPUI-CE's WGPU renderer"
+license = "BSD-3-Clause"
+readme = "README.md"
+
+[dependencies]
+gpui = { package = "gpui-ce", version = "=0.2.2", default-features = false }
+gpui_wgpu = { package = "gpui_ce_wgpu", version = "=0.1.0" }
+gpui-smooth = { version = "0.1.0", path = "../gpui-smooth" }
+bytemuck = { version = "1", features = ["derive"] }
+anyhow = "1"
+half = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+naga = { version = "29", features = ["wgsl-in"] }
