@@ -11,6 +11,7 @@ mod macos;
 mod app_state;
 mod assets;
 mod autostart;
+mod glass;
 mod hostname;
 mod logging;
 #[cfg(windows)]
@@ -45,6 +46,11 @@ fn state_dir() -> PathBuf {
 }
 
 fn main() {
+    // Dev aid: open the windows with sample data. No service, no state, no keychain.
+    if std::env::args().any(|arg| arg == "--preview-ui") {
+        app_state::preview_ui();
+        return;
+    }
     let trace_apdu = std::env::args().any(|arg| arg == "--trace-apdu");
     let dir = state_dir();
     logging::init(&logging::log_dir(&dir));

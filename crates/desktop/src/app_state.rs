@@ -12,7 +12,7 @@ use crate::{
 };
 #[cfg(windows)]
 use crate::{prompt_watch, single, usbip};
-use gpui::{App, Application, AsyncApp, BorrowAppContext, Global, KeyBinding, WindowHandle};
+use gpui::{App, AsyncApp, BorrowAppContext, Global, KeyBinding, WindowHandle};
 use std::{
     path::PathBuf,
     sync::mpsc,
@@ -139,12 +139,34 @@ pub fn run(state_dir: PathBuf, trace_apdu: bool, instance: impl InstanceGuard) {
         .inspect_err(|error| logging::log(&format!("prompt watcher unavailable: {error}")))
         .ok()
     };
-    Application::new().run(move |cx: &mut App| {
+    gpui_platform::application().run(move |cx: &mut App| {
         spawn_service(state_dir.clone(), trace_apdu, events.clone());
         #[cfg(windows)]
         shell_setup(cx, events, inbox, state_dir, trace_apdu, watcher, instance);
         #[cfg(not(windows))]
         shell_setup(cx, events, inbox, state_dir, trace_apdu, instance);
+    });
+}
+
+/// `--preview-ui`: Settings and pairing windows with sample data, for design work.
+/// Touches no state directory and starts no service.
+pub fn preview_ui() {
+    gpui_platform::application().run(|cx: &mut App| {
+        let snapshot = crate::ui::SettingsSnapshot {
+            summary: "Phone connected".into(),
+            health: crate::ui::Health::Good,
+            phone: Some("Pixel 9 Pro XL".into()),
+            phone_connected: true,
+            autostart: true,
+            details: vec![
+                "Host: iris".into(),
+                "Reader: tapbridge virtual reader".into(),
+                "Relay: use1-1.relay.iroh.network".into(),
+            ],
+        };
+        crate::ui::open_settings_window(snapshot, None, |_, _| {}, cx);
+        crate::ui::open_pairing_window("tapbridge-preview-invitation-0123456789abcdef", None, cx);
+        cx.activate(true);
     });
 }
 
@@ -201,9 +223,7 @@ fn shell_setup(
     cx.spawn(async move |cx: &mut AsyncApp| {
         loop {
             cx.background_executor().timer(TICK).await;
-            if cx.update(|cx| tick(&inbox, cx)).is_err() {
-                break;
-            }
+            cx.update(|cx| tick(&inbox, cx));
         }
     })
     .detach();
@@ -458,6 +478,7 @@ fn install_commands(cx: &mut App) {
             gpui::MenuItem::separator(),
             gpui::MenuItem::action("Quit tapbridge", Quit),
         ],
+        disabled: false,
     }]);
 }
 

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-exclude = ["tools"]
+exclude = ["tools", "third_party"]
 
 [workspace.package]
 version = "0.1.0"
@@ -18,3 +18,10 @@ strip = "debuginfo"
 # lto = "thin" crashes rustc (0xc0000005 STATUS_ACCESS_VIOLATION) linking
 # tapbridge.exe on rustc 1.98.0 aarch64-pc-windows-msvc; LTO off builds clean.
 lto = "off"
+
+# Liquid Glass UI: gpui-glass needs a patched GPUI-CE (custom backdrop hook).
+# Cargo overrides only work from the workspace root.
+[patch.crates-io]
+gpui-ce = { path = "third_party/gpui-glass/vendor/gpui-ce/crates/gpui" }
+gpui_ce_wgpu = { path = "third_party/gpui-glass/vendor/gpui-ce/crates/gpui_wgpu" }
+gpui_ce_platform = { path = "third_party/gpui-glass/vendor/gpui-ce/crates/gpui_platform" }
