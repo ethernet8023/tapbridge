@@ -194,7 +194,7 @@ impl SharedSecret {
     }
 
     fn encrypt_with_iv(&self, plaintext: &[u8], iv: [u8; 16]) -> Vec<u8> {
-        assert!(plaintext.len() % 16 == 0, "whole AES blocks only");
+        assert!(plaintext.len().is_multiple_of(16), "whole AES blocks only");
         let mut buf = plaintext.to_vec();
         let len = buf.len();
         Aes256CbcEnc::new_from_slices(self.aes_key(), &iv)
@@ -224,7 +224,7 @@ impl SharedSecret {
                 (iv.try_into().ok()?, body)
             }
         };
-        if body.is_empty() || body.len() % 16 != 0 {
+        if body.is_empty() || !body.len().is_multiple_of(16) {
             return None;
         }
         let mut buf = Zeroizing::new(body.to_vec());

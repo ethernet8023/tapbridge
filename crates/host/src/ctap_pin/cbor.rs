@@ -291,6 +291,45 @@ impl RawMap {
             .map(|entry| entry.raw_value.as_slice())
     }
 
+    /// The raw value bytes of any key.
+    pub fn raw_for(&self, key: &Value) -> Option<&[u8]> {
+        self.entries
+            .iter()
+            .find(|entry| entry.key == *key)
+            .map(|entry| entry.raw_value.as_slice())
+    }
+
+    /// Replaces integer key `key`, or inserts it before the first larger
+    /// integer key (CTAP2 canonical order for integer-keyed maps).
+    pub fn set(&mut self, key: i64, value: &Value) {
+        if self.replace(key, value) {
+            return;
+        }
+        let rank = |k: &Value| match k {
+            Value::Uint(n) => Some(i128::from(*n)),
+            Value::Nint(n) => Some(-1 - i128::from(*n)),
+            _ => None,
+        };
+        // Canonical CBOR sorts by encoded length then bytes: positive
+        // integers before negative ones, smaller first.
+        let canonical = |k: i128| if k >= 0 { (0, k) } else { (1, -k) };
+        let wanted = canonical(i128::from(key));
+        let at = self
+            .entries
+            .iter()
+            .position(|entry| rank(&entry.key).is_none_or(|k| canonical(k) > wanted))
+            .unwrap_or(self.entries.len());
+        let key = Value::int(key);
+        self.entries.insert(
+            at,
+            RawEntry {
+                raw_key: encode(&key),
+                key,
+                raw_value: encode(value),
+            },
+        );
+    }
+
     /// The decoded value of integer key `key` (None when absent or
     /// malformed).
     pub fn get(&self, key: i64) -> Option<Value> {
@@ -406,6 +445,22 @@ mod tests {
         assert_eq!(rewritten.get(8), Some(&Value::Bytes(vec![0x55; 16])));
         assert_eq!(rewritten.get(9), Some(&Value::Uint(2)));
         assert_eq!(rewritten.get(1), Some(&Value::Bytes(vec![1, 2])));
+    }
+
+    #[test]
+    fn raw_map_set_inserts_missing_keys_in_canonical_order() {
+        // {1: 1, 3: 3, 0x14: 20}
+        let mut map = RawMap::parse(&[0xA3, 0x01, 0x01, 0x03, 0x03, 0x14, 0x14]).unwrap();
+        map.set(6, &Value::Uint(6));
+        map.set(0x20, &Value::Uint(0));
+        map.set(3, &Value::Uint(4));
+        assert_eq!(
+            map.to_bytes(),
+            [
+                0xA5, 0x01, 0x01, 0x03, 0x04, 0x06, 0x06, 0x14, 0x14, 0x18, 0x20, 0x00
+            ]
+        );
+        assert_eq!(map.raw_for(&Value::Uint(6)), Some(&[0x06][..]));
     }
 
     #[test]

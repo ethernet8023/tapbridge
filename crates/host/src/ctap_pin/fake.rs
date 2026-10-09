@@ -62,6 +62,34 @@ struct Token {
     rp_id: Option<String>,
 }
 
+/// Where makeCredential / getAssertion keep their fields.
+#[derive(Clone, Copy)]
+struct SigningKeys {
+    cdh: i64,
+    param: i64,
+    protocol: i64,
+    permission: u8,
+    rp: i64,
+    options: i64,
+}
+
+const MAKE_CREDENTIAL: SigningKeys = SigningKeys {
+    cdh: 1,
+    param: 8,
+    protocol: 9,
+    permission: PERM_MC,
+    rp: 2,
+    options: 7,
+};
+const GET_ASSERTION: SigningKeys = SigningKeys {
+    cdh: 2,
+    param: 6,
+    protocol: 7,
+    permission: PERM_GA,
+    rp: 1,
+    options: 5,
+};
+
 const PERM_MC: u8 = 0x01;
 const PERM_GA: u8 = 0x02;
 const PERM_CM: u8 = 0x04;
@@ -96,6 +124,12 @@ impl Authenticator {
         self.selected = false;
         self.chain.clear();
         self.pending.clear();
+    }
+
+    /// The card's own token timer ran out (CTAP 2.1 §6.5.2.1) while the
+    /// card stayed on the phone.
+    pub fn expire_token(&mut self) {
+        self.token = None;
     }
 
     pub fn pin_is(&self, pin: &str) -> bool {
@@ -173,11 +207,11 @@ impl Authenticator {
             0x06 => self.client_pin(&params),
             0x01 => {
                 self.log.push("makeCredential".into());
-                self.signing(&params, 1, 8, 9, PERM_MC, 2)
+                self.signing(&params, &MAKE_CREDENTIAL)
             }
             0x02 => {
                 self.log.push("getAssertion".into());
-                self.signing(&params, 2, 6, 7, PERM_GA, 1)
+                self.signing(&params, &GET_ASSERTION)
             }
             0x0A | 0x41 => {
                 self.log.push("credentialManagement".into());
@@ -423,15 +457,23 @@ impl Authenticator {
     }
 
     /// makeCredential / getAssertion: the PIN rules plus a dummy result.
-    fn signing(
-        &mut self,
-        params: &RawMap,
-        cdh_key: i64,
-        param_key: i64,
-        protocol_key: i64,
-        permission: u8,
-        rp_key: i64,
-    ) -> Result<Value, u8> {
+    fn signing(&mut self, params: &RawMap, keys: &SigningKeys) -> Result<Value, u8> {
+        let SigningKeys {
+            cdh: cdh_key,
+            param: param_key,
+            protocol: protocol_key,
+            permission,
+            rp: rp_key,
+            options: options_key,
+        } = *keys;
+        let silent = params
+            .get(options_key)
+            .is_some_and(|options| match options {
+                Value::Map(entries) => entries
+                    .iter()
+                    .any(|(k, v)| k.as_text() == Some("up") && *v == Value::Bool(false)),
+                _ => false,
+            });
         let cdh = bytes(params, cdh_key)?;
         let rp_id = match params.get(rp_key) {
             Some(Value::Text(id)) => Some(id),
@@ -455,8 +497,9 @@ impl Authenticator {
                     &cdh,
                     rp_id.as_deref(),
                 )?;
-                // CTAP 2.1: the permissions are spent (lbw survives).
-                if let Some(token) = self.token.as_mut() {
+                // CTAP 2.1: user presence spends the permissions (lbw
+                // survives); a silent (up=false) preflight does not.
+                if let Some(token) = self.token.as_mut().filter(|_| !silent) {
                     token.permissions &= PERM_LBW;
                 }
             }

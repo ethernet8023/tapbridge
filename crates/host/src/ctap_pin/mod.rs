@@ -4,3 +4,4 @@ pub mod cbor;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake;
 pub mod protocol;
+pub mod proxy;
