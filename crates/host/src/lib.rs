@@ -2,6 +2,7 @@
 
 pub mod ccid;
 pub mod ctap_nfc;
+pub mod ctap_pin;
 pub mod ctaphid;
 #[cfg(target_os = "macos")]
 pub mod ifd;

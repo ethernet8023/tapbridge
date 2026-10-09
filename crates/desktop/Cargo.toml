@@ -50,6 +50,7 @@ dispatch2 = "0.3"
 core-foundation = "0.10"
 
 [dev-dependencies]
+tapbridge-host = { path = "../host", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 
