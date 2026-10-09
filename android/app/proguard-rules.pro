@@ -4,6 +4,10 @@
 # renaming would break every bridge call.
 -keep class computer.ethernet.tapbridge.NativeBridge { *; }
 -keep interface computer.ethernet.tapbridge.NativeBridge$Callbacks { *; }
+# read() calls request/cancel/readCard/authState by name on the callbacks
+# object (an anonymous class in TapBridgeService); keep the implementations'
+# names too rather than rely on R8 tying them to the kept interface.
+-keepclassmembers class * implements computer.ethernet.tapbridge.NativeBridge$Callbacks { *; }
 
 # The lifecycle classes Kotlin passes into JNI as callback objects.
 -keep class computer.ethernet.tapbridge.NativeGate { *; }

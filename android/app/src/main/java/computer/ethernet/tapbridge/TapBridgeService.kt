@@ -74,6 +74,9 @@ class TapBridgeService : Service() {
         const val FOREGROUND_ID = 1
         const val IDLE_TIMEOUT_MS = 60_000L
         const val WAKE_WINDOW_MS = 120_000L
+        /** How long the success / failure art stays before returning to idle. */
+        const val SUCCESS_HOLD_MS = 2_500L
+        const val FAILED_HOLD_MS = 4_000L
         private val RETRY_DELAYS_MS = longArrayOf(250, 500, 1000, 2000, 3000)
     }
 
@@ -83,6 +86,8 @@ class TapBridgeService : Service() {
         fun onCardPresent(present: Boolean)
         /** A PC is asking for a tap (wake or ReadCard), or stopped asking. */
         fun onTapRequested(requested: Boolean) {}
+        /** The PC's sign-in state changed (Auth frame, or a local timeout). */
+        fun onAuthState(state: AuthState) {}
     }
     inner class LocalBinder : Binder() { val service get() = this@TapBridgeService }
     private val binder = LocalBinder()
@@ -91,7 +96,11 @@ class TapBridgeService : Service() {
     private val nfcWorker = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(8))
     private val requested = AtomicLong()
     private val main = Handler(Looper.getMainLooper())
-    private val session = NfcCardSession(gate)
+    private val session = NfcCardSession(gate).also { s ->
+        // Presence loss, transceive failure or cancel dropped the tag: the
+        // host already has the absent Card frame; update the UI and notice.
+        s.onTagLost = { main.post { onCardGone() } }
+    }
     private val connectivity = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             // Immediate retry after a network change while the UI is visible.
@@ -106,6 +115,14 @@ class TapBridgeService : Service() {
     @Volatile private var visible = false
     private val closeWakeWindowRunnable = Runnable { closeWakeWindow() }
     private val endTapRequestRunnable = Runnable { setTapRequested(false) }
+    private val clearAuthRunnable = Runnable { setAuthState(AuthState.IDLE) }
+    /** The PC's latest sign-in state; IDLE without a session. Main thread. */
+    @Volatile var authState = AuthState.IDLE
+        private set
+    /** The foreground notification currently shown, null when none. Main
+     *  thread. Re-posting only on change keeps the tap alert from buzzing
+     *  again for every unrelated update. */
+    private var notice: TapNotice? = null
     /** A PC asked for a tap and no card has answered it yet. Drives the home
      *  screen's tap animation; cleared by a card, the session ending or
      *  [WAKE_WINDOW_MS]. */
@@ -138,7 +155,7 @@ class TapBridgeService : Service() {
                 targetHost = intent.getStringExtra(EXTRA_HOST)
                 wakeHint = intent.getStringExtra(EXTRA_HINT)
                 startedFromUi = false
-                foreground(tapRequest = true)
+                foreground(TapNotice.TAP)
                 wantsConnection = true
                 retryAttempt = 0
                 openWakeWindow()
@@ -149,7 +166,7 @@ class TapBridgeService : Service() {
                 wakeHint = null
                 targetHost = null // app-open: connect to the last-used host
                 // The app is on screen: no need to keep shouting.
-                foreground(tapRequest = false)
+                foreground(TapNotice.QUIET)
                 registerNetworkRetry()
                 connectAsync()
             }
@@ -170,7 +187,22 @@ class TapBridgeService : Service() {
             if (wantsConnection && status != Status.CONNECTED && status != Status.CONNECTING) connectAsync()
         } else {
             bumpActivity()
+            // Left the app mid-request: the tap gate must catch the re-tap,
+            // since reader mode is off while the app is hidden.
+            if (tapRequested) openWakeWindow(restartRequest = false)
         }
+        main.post { updateNotice() }
+    }
+
+    /**
+     * Shows the notification [TapNotice.decide] picks for the current state.
+     * Only while the service is in the foreground: after stopSession the
+     * notification is gone and must stay gone. Main thread.
+     */
+    private fun updateNotice() {
+        val current = notice ?: return
+        val next = TapNotice.decide(visible, tapRequested, authState, session.hasTagPublic())
+        if (next != current) foreground(next)
     }
 
     /**
@@ -180,7 +212,8 @@ class TapBridgeService : Service() {
      * (status-bar chip, top of the shade) on Android 16+. Otherwise, while
      * the app itself is on screen, it is the quiet session notice.
      */
-    private fun foreground(tapRequest: Boolean) {
+    private fun foreground(kind: TapNotice) {
+        val tapRequest = kind != TapNotice.QUIET
         val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         ensureChannels(this)
         val launch = PendingIntent.getActivity(
@@ -191,11 +224,16 @@ class TapBridgeService : Service() {
         )
         val builder = if (tapRequest) {
             val pc = targetHost?.let { IdentityStore.hostById(this, it)?.name }
+            val body = if (kind == TapNotice.TAP_AGAIN) {
+                pc?.let { getString(R.string.removed_body_named, it) } ?: getString(R.string.removed_body)
+            } else {
+                pc?.let { getString(R.string.wake_body_named, it) } ?: getString(R.string.wake_body)
+            }
             Notification.Builder(this, CHANNEL_TAP_REQUEST)
-                .setContentTitle(getString(R.string.wake_title))
-                .setContentText(
-                    pc?.let { getString(R.string.wake_body_named, it) } ?: getString(R.string.wake_body),
+                .setContentTitle(
+                    getString(if (kind == TapNotice.TAP_AGAIN) R.string.removed_title else R.string.wake_title),
                 )
+                .setContentText(body)
                 .setCategory(Notification.CATEGORY_STATUS)
                 .setVisibility(Notification.VISIBILITY_PUBLIC)
                 .setWhen(System.currentTimeMillis())
@@ -220,10 +258,20 @@ class TapBridgeService : Service() {
             .setContentIntent(launch)
             .setOngoing(true)
             .build()
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(FOREGROUND_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
-        } else {
-            startForeground(FOREGROUND_ID, notification)
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                startForeground(FOREGROUND_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            } else {
+                startForeground(FOREGROUND_ID, notification)
+            }
+            notice = kind
+        } catch (_: IllegalStateException) {
+            // ForegroundServiceStartNotAllowedException: a bound-only service
+            // (the app's deferred start) can't enter the foreground from the
+            // background. Post it as a plain notification instead; the
+            // session itself is unaffected.
+            runCatching { manager.notify(FOREGROUND_ID, notification) }
+            notice = kind
         }
         // The heads-up WakeService posts only when the foreground start was
         // refused; this notification replaces it.
@@ -387,13 +435,17 @@ class TapBridgeService : Service() {
                 } catch (_: RejectedExecutionException) { gate.closeIfActive() }
             }
             override fun cancel(id: Long) { session.onCancel(id) }
-            override fun authState(state: Int) { /* phone UI states: wired up next */ }
+            override fun authState(state: Int) {
+                bumpActivity()
+                val value = AuthState.fromWire(state)
+                main.post { if (requested.get() == attempt) setAuthState(value) }
+            }
             override fun readCard() {
                 bumpActivity()
                 main.post {
                     val present = session.hasTagPublic()
                     listener?.onCardPresent(present)
-                    if (!present) beginTapRequest()
+                    if (!present) requestTap()
                 }
             }
         }
@@ -405,6 +457,13 @@ class TapBridgeService : Service() {
         } catch (failure: Exception) { error = failure.message ?: "connection lost" }
         gate.closeIfActive()
         session.close()
+        // The session is over: its sign-in state and tap request with it.
+        main.post {
+            if (requested.get() == attempt) {
+                setAuthState(AuthState.IDLE)
+                setTapRequested(false)
+            }
+        }
         if (destroyed) return
         lifecycle.execute {
             if (requested.get() == attempt) {
@@ -445,6 +504,7 @@ class TapBridgeService : Service() {
                     val present = session.hasTagPublic()
                     listener?.onCardPresent(present)
                     if (present) setTapRequested(false)
+                    updateNotice()
                 }
             }
         } catch (_: RejectedExecutionException) { session.close() }
@@ -456,16 +516,22 @@ class TapBridgeService : Service() {
 
     @Synchronized
     fun stopSession() {
+        // First: the state resets below must not re-post a notification
+        // that stopForeground is about to remove.
+        notice = null
         wantsConnection = false
         requested.incrementAndGet()
         gate.closeIfActive(); session.close(); nfcWorker.queue.clear()
         closeWakeWindow()
         setTapRequested(false)
+        setAuthState(AuthState.IDLE)
         unregisterNetworkRetry()
         main.removeCallbacks(idleRunnable)
         show(Status.IDLE)
         lifecycle.execute { cleanup() }
         stopForeground(STOP_FOREGROUND_REMOVE)
+        // Covers the plain-notification fallback in foreground().
+        getSystemService(NotificationManager::class.java)?.cancel(FOREGROUND_ID)
     }
 
     /** Releases the current native session only; network retry and the idle
@@ -484,16 +550,65 @@ class TapBridgeService : Service() {
         setTapRequested(true)
     }
 
+    /**
+     * A connected PC wants the card (ReadCard, or the card left mid-auth).
+     * Visible: the tap art (and its haptic) is enough. Hidden: reader mode
+     * is off, so open the tap gate like an FCM wake does; [updateNotice]
+     * (via setTapRequested) raises the tap-request notification. Main thread.
+     */
+    private fun requestTap() {
+        if (visible) beginTapRequest() else openWakeWindow()
+    }
+
     private fun setTapRequested(value: Boolean) {
         if (!value) main.removeCallbacks(endTapRequestRunnable)
         if (tapRequested == value) return
         tapRequested = value
-        main.post { listener?.onTapRequested(value) }
+        main.post {
+            listener?.onTapRequested(value)
+            updateNotice()
+        }
     }
 
-    /** Wake window: tap gate enabled for 120 s, disabled on session stop. */
-    private fun openWakeWindow() {
-        beginTapRequest()
+    /**
+     * Applies the PC's sign-in state. SUCCESS and FAILED are final for this
+     * sign-in: they end the tap request and clear themselves after a short
+     * hold, so a lost IDLE frame can't leave the art stuck. REMOVED asks for
+     * the card again. Main thread.
+     */
+    private fun setAuthState(value: AuthState) {
+        main.removeCallbacks(clearAuthRunnable)
+        when (value) {
+            AuthState.SUCCESS -> { setTapRequested(false); main.postDelayed(clearAuthRunnable, SUCCESS_HOLD_MS) }
+            AuthState.FAILED -> { setTapRequested(false); main.postDelayed(clearAuthRunnable, FAILED_HOLD_MS) }
+            AuthState.IDLE -> setTapRequested(false)
+            AuthState.REMOVED -> if (!session.hasTagPublic()) requestTap()
+            AuthState.WORKING, AuthState.PIN -> {}
+        }
+        if (authState != value) {
+            authState = value
+            listener?.onAuthState(value)
+        }
+        updateNotice()
+    }
+
+    /** The held tag was dropped (presence loss, I/O failure, cancel). */
+    private fun onCardGone() {
+        if (session.hasTagPublic()) return // a new tag already replaced it
+        listener?.onCardPresent(false)
+        when (authState) {
+            // Success art returns to idle once the card leaves.
+            AuthState.SUCCESS -> setAuthState(AuthState.IDLE)
+            // REMOVED arrived while we still thought the card was there.
+            AuthState.REMOVED -> requestTap()
+            else -> updateNotice()
+        }
+    }
+
+    /** Wake window: tap gate enabled for 120 s, disabled on session stop.
+     *  [restartRequest] false keeps the current request's own 120 s timer. */
+    private fun openWakeWindow(restartRequest: Boolean = true) {
+        if (restartRequest) beginTapRequest()
         TapGateActivity.setGateEnabled(this, true)
         // A newer wake restarts the window instead of an older timer closing it.
         main.removeCallbacks(closeWakeWindowRunnable)
