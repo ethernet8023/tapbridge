@@ -11,7 +11,7 @@
 
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -19,6 +19,7 @@ use std::{
 };
 use tapbridge_host::{
     ctap_nfc::{self, RelayError},
+    ctap_pin::proxy::{CardPort, PinProxy, PortError},
     ctaphid::{self, Engine, Report},
     service::ServiceHandle,
 };
@@ -30,50 +31,150 @@ const POLL: Duration = Duration::from_millis(100);
 /// CTAP status bytes the relay itself produces.
 const CTAP2_ERR_KEEPALIVE_CANCEL: u8 = 0x2D;
 const CTAP2_ERR_USER_ACTION_TIMEOUT: u8 = 0x2F;
+#[cfg(test)]
 const CTAP1_ERR_OTHER: u8 = 0x7F;
 
 /// What the request worker needs from the outside world (a trait so the
 /// waiting/relay rules are tested without a phone).
 pub trait Card {
-    fn present(&self) -> bool;
-    /// Ask the phone for a tap (wake it or show "tap now"). Called once per
-    /// request that finds no card.
+    /// The current tap's generation, None when no card is on the phone.
+    /// Each tap is a new generation: the card powered up afresh.
+    fn generation(&self) -> Option<u64>;
+    /// Ask the phone for a tap (wake it or show "tap now").
     fn request_tap(&self);
     fn transmit(&self, apdu: Vec<u8>) -> Result<Vec<u8>, String>;
+    /// Shows a sign-in state ([`tapbridge_core::wire::auth`]) on the
+    /// phone's tap animation.
+    fn auth_state(&self, state: u8);
 }
 
-/// Carries out one CTAP request: waits (up to [`TAP_TIMEOUT`]) for a card,
-/// then relays. Always returns a CTAP reply (status byte first): relay
+/// Carries out one CTAP request through the PIN proxy: waits (up to
+/// `timeout`) for a card, retries on a new tap when the card is lost.
+/// `status` receives the keepalive status to report (UPNEEDED while
+/// waiting for a tap). Always returns a CTAP reply (status byte first):
 /// failures become CTAP errors the browser understands.
 pub fn run_request(
     request: &[u8],
+    cid: u32,
+    proxy: &mut PinProxy,
     card: &dyn Card,
     cancelled: &AtomicBool,
-    mut waiting_for_tap: impl FnMut(),
+    status: impl FnMut(u8),
     timeout: Duration,
 ) -> Vec<u8> {
-    let started = Instant::now();
-    if !card.present() {
-        card.request_tap();
-        waiting_for_tap();
-        while !card.present() {
-            if cancelled.load(Ordering::SeqCst) {
-                return vec![CTAP2_ERR_KEEPALIVE_CANCEL];
+    let mut port = RelayPort {
+        card,
+        cancelled,
+        status: Box::new(status),
+        deadline: Instant::now() + timeout,
+        opened: None,
+        lost: None,
+    };
+    proxy.handle(cid, request, &mut port, Instant::now())
+}
+
+/// The proxy's view of the card: tap waiting, SELECT and the generation
+/// checks that turn a re-tap into a lost card.
+struct RelayPort<'a> {
+    card: &'a dyn Card,
+    cancelled: &'a AtomicBool,
+    status: Box<dyn FnMut(u8) + 'a>,
+    deadline: Instant,
+    /// Generation of the tap the applet was SELECTed on.
+    opened: Option<u64>,
+    /// Generation that was lost: the next open waits for a different one.
+    lost: Option<u64>,
+}
+
+impl RelayPort<'_> {
+    fn check_cancel(&self) -> Result<(), PortError> {
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err(PortError::Ended(CTAP2_ERR_KEEPALIVE_CANCEL));
+        }
+        Ok(())
+    }
+
+    /// A usable tap: present, and not the one that was lost.
+    fn usable(&self) -> Option<u64> {
+        self.card
+            .generation()
+            .filter(|generation| Some(*generation) != self.lost)
+    }
+
+    /// Waits for a usable tap, asking the phone for one first.
+    fn wait_for_tap(&mut self) -> Result<u64, PortError> {
+        if let Some(generation) = self.usable() {
+            return Ok(generation);
+        }
+        self.card.request_tap();
+        (self.status)(ctaphid::STATUS_UPNEEDED);
+        loop {
+            self.check_cancel()?;
+            if let Some(generation) = self.usable() {
+                (self.status)(ctaphid::STATUS_PROCESSING);
+                return Ok(generation);
             }
-            if started.elapsed() >= timeout {
-                return vec![CTAP2_ERR_USER_ACTION_TIMEOUT];
+            if Instant::now() >= self.deadline {
+                return Err(PortError::Ended(CTAP2_ERR_USER_ACTION_TIMEOUT));
             }
             std::thread::sleep(POLL);
         }
     }
-    if cancelled.load(Ordering::SeqCst) {
-        return vec![CTAP2_ERR_KEEPALIVE_CANCEL];
+
+    /// Marks the opened tap lost (the next open waits for another).
+    fn lose(&mut self) -> PortError {
+        self.lost = self.opened.take().or(self.lost);
+        PortError::Lost
     }
-    match ctap_nfc::relay(request, |apdu| card.transmit(apdu)) {
-        Ok(reply) => reply,
-        Err(RelayError::Transport(_)) | Err(RelayError::Card(_)) | Err(RelayError::Empty) => {
-            vec![CTAP1_ERR_OTHER]
+}
+
+impl CardPort for RelayPort<'_> {
+    fn open(&mut self, new_tap: bool) -> Result<u64, PortError> {
+        self.check_cancel()?;
+        if new_tap && self.lost.is_none() {
+            self.lost = self.opened.or_else(|| self.card.generation());
         }
+        let generation = self.wait_for_tap()?;
+        self.opened = Some(generation);
+        let card = self.card;
+        match ctap_nfc::select(|apdu| card.transmit(apdu)) {
+            Ok(()) if self.card.generation() == Some(generation) => Ok(generation),
+            Ok(()) | Err(RelayError::Transport(_)) => Err(self.lose()),
+            Err(_) if self.card.generation() != Some(generation) => Err(self.lose()),
+            Err(_) => Err(PortError::Card),
+        }
+    }
+
+    fn exchange(&mut self, request: &[u8]) -> Result<Vec<u8>, PortError> {
+        self.check_cancel()?;
+        let Some(opened) = self.opened else {
+            return Err(PortError::Lost);
+        };
+        let card = self.card;
+        // Every APDU checks the tap first: a re-tap means a card that was
+        // never SELECTed and has a new PIN key, so nothing may go to it.
+        let mut sent = false;
+        let result = ctap_nfc::exchange(request, |apdu| {
+            if card.generation() != Some(opened) {
+                return Err("card re-tapped".to_owned());
+            }
+            sent = true;
+            card.transmit(apdu)
+        });
+        match result {
+            Ok(reply) => Ok(reply),
+            Err(RelayError::Transport(_)) if !sent => {
+                self.lose();
+                Err(PortError::NotSent)
+            }
+            Err(RelayError::Transport(_)) => Err(self.lose()),
+            Err(_) if card.generation() != Some(opened) => Err(self.lose()),
+            Err(_) => Err(PortError::Card),
+        }
+    }
+
+    fn auth_state(&mut self, state: u8) {
+        self.card.auth_state(state);
     }
 }
 
@@ -84,8 +185,9 @@ struct ServiceCard {
 }
 
 impl Card for ServiceCard {
-    fn present(&self) -> bool {
-        self.service.status().card_present
+    fn generation(&self) -> Option<u64> {
+        let status = self.service.status();
+        status.card_present.then_some(status.card_generation)
     }
     fn request_tap(&self) {
         (self.wake)();
@@ -95,12 +197,51 @@ impl Card for ServiceCard {
             .ctap_transmit(apdu)
             .map_err(|error| format!("{error:?}"))
     }
+    fn auth_state(&self, state: u8) {
+        self.service.send_auth_state(state);
+    }
+}
+
+/// The PIN proxy shared by the driver and its request workers. The
+/// driver never blocks on the proxy (a worker may hold it for a whole
+/// request): resyncs queue up and are applied on the next tick or
+/// request.
+#[derive(Default)]
+struct Shared {
+    proxy: Mutex<PinProxy>,
+    resyncs: Mutex<Vec<u32>>,
+}
+
+impl Shared {
+    /// CTAPHID INIT resynced `cid`: forget its cached PIN state.
+    fn resync(&self, cid: u32) {
+        if let Ok(mut resyncs) = self.resyncs.lock() {
+            resyncs.push(cid);
+        }
+    }
+
+    /// Applies queued resyncs and the idle timeout when no request holds
+    /// the proxy.
+    fn tick(&self, now: Instant) {
+        if let Ok(mut proxy) = self.proxy.try_lock() {
+            self.apply(&mut proxy, now);
+        }
+    }
+
+    fn apply(&self, proxy: &mut PinProxy, now: Instant) {
+        if let Ok(mut resyncs) = self.resyncs.lock() {
+            for cid in resyncs.drain(..) {
+                proxy.on_resync(cid);
+            }
+        }
+        proxy.expire(now);
+    }
 }
 
 enum Input {
     Report(Vec<u8>),
     Done { cid: u32, reply: Vec<u8> },
-    WaitingForTap { cid: u32 },
+    Status { cid: u32, status: u8 },
 }
 
 /// Creates the virtual security key and serves it on background threads.
@@ -146,6 +287,7 @@ fn drive(
     log: Arc<dyn Fn(&str) + Send + Sync>,
 ) {
     let mut engine = Engine::new();
+    let shared = Arc::new(Shared::default());
     let mut cancel_flag: Option<Arc<AtomicBool>> = None;
     let send = |reports: Vec<Report>| {
         for report in reports {
@@ -157,6 +299,9 @@ fn drive(
             Ok(Input::Report(report)) => {
                 let out = engine.on_report(&report, Instant::now());
                 send(out.reports);
+                if let Some(cid) = out.resync {
+                    shared.resync(cid);
+                }
                 if out.cancel
                     && let Some(flag) = cancel_flag.take()
                 {
@@ -168,6 +313,8 @@ fn drive(
                     }
                 }
                 if let Some(request) = out.start {
+                    // Command byte and length only: payloads carry PIN
+                    // material.
                     log(&format!(
                         "security key: CTAP2 command 0x{:02x} ({} bytes)",
                         request.payload.first().copied().unwrap_or(0),
@@ -176,26 +323,38 @@ fn drive(
                     let flag = Arc::new(AtomicBool::new(false));
                     cancel_flag = Some(flag.clone());
                     let card = card.clone();
+                    let shared = shared.clone();
                     let tx = tx.clone();
                     let cid = request.cid;
                     std::thread::spawn(move || {
-                        let waiting = tx.clone();
+                        let statuses = tx.clone();
+                        let Ok(mut proxy) = shared.proxy.lock() else {
+                            let _ = tx.send(Input::Done {
+                                cid,
+                                reply: vec![0x7F],
+                            });
+                            return;
+                        };
+                        shared.apply(&mut proxy, Instant::now());
                         let reply = run_request(
                             &request.payload,
+                            cid,
+                            &mut proxy,
                             card.as_ref(),
                             &flag,
-                            || {
-                                let _ = waiting.send(Input::WaitingForTap { cid });
+                            |status| {
+                                let _ = statuses.send(Input::Status { cid, status });
                             },
                             TAP_TIMEOUT,
                         );
+                        drop(proxy);
                         let _ = tx.send(Input::Done { cid, reply });
                     });
                 }
             }
-            Ok(Input::WaitingForTap { cid }) => {
+            Ok(Input::Status { cid, status }) => {
                 if engine.busy_cid() == Some(cid) {
-                    engine.set_status(ctaphid::STATUS_UPNEEDED);
+                    engine.set_status(status);
                 }
             }
             Ok(Input::Done { cid, reply }) => {
@@ -212,6 +371,7 @@ fn drive(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
+        shared.tick(Instant::now());
         send(engine.on_tick(Instant::now()));
     }
 }
@@ -352,51 +512,9 @@ mod hid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-    use std::sync::atomic::AtomicUsize;
-
-    /// Fake phone card: becomes present after `present_after` polls,
-    /// answers SELECT + one NFCCTAP_MSG.
-    struct FakeCard {
-        polls: AtomicUsize,
-        present_after: usize,
-        taps: AtomicUsize,
-        apdus: Mutex<Vec<Vec<u8>>>,
-        fail: bool,
-    }
-
-    impl FakeCard {
-        fn new(present_after: usize) -> Self {
-            Self {
-                polls: AtomicUsize::new(0),
-                present_after,
-                taps: AtomicUsize::new(0),
-                apdus: Mutex::new(Vec::new()),
-                fail: false,
-            }
-        }
-    }
-
-    impl Card for FakeCard {
-        fn present(&self) -> bool {
-            self.polls.fetch_add(1, Ordering::SeqCst) >= self.present_after
-        }
-        fn request_tap(&self) {
-            self.taps.fetch_add(1, Ordering::SeqCst);
-        }
-        fn transmit(&self, apdu: Vec<u8>) -> Result<Vec<u8>, String> {
-            if self.fail {
-                return Err("card gone".into());
-            }
-            let reply = if apdu[1] == 0xA4 {
-                b"FIDO_2_0\x90\x00".to_vec()
-            } else {
-                vec![0x00, 0xA1, 0x90, 0x00]
-            };
-            self.apdus.lock().unwrap().push(apdu);
-            Ok(reply)
-        }
-    }
+    use tapbridge_core::wire::auth;
+    use tapbridge_host::ctap_pin::fake::{Authenticator, Platform};
+    use tapbridge_host::ctap_pin::protocol::Protocol;
 
     /// Live check: creates the real virtual device and finds it in the IO
     /// registry. Needs the entitlement (sign the test binary with
@@ -441,10 +559,11 @@ mod tests {
         info.extend_from_slice(&[0x05, 0x19, 0x04, 0x00]); // maxMsgSize 1024
         struct InfoCard(Vec<u8>);
         impl Card for InfoCard {
-            fn present(&self) -> bool {
-                true
+            fn generation(&self) -> Option<u64> {
+                Some(1)
             }
             fn request_tap(&self) {}
+            fn auth_state(&self, _: u8) {}
             fn transmit(&self, apdu: Vec<u8>) -> Result<Vec<u8>, String> {
                 let mut reply = if apdu[1] == 0xA4 {
                     b"FIDO_2_0".to_vec()
@@ -486,69 +605,339 @@ print("max_msg_size", info.max_msg_size)
         assert!(stdout.contains("max_msg_size 1024"));
     }
 
-    #[test]
-    fn card_already_present_relays_without_asking_for_a_tap() {
-        let card = FakeCard::new(0);
-        let mut waited = false;
+    /// The phone around the software authenticator, at the APDU level.
+    /// Taps power-cycle the card and bump the generation; `lose_at` makes
+    /// the n-th APDU fail (the card left mid-request) and leaves the
+    /// phone without a card until the next `request_tap`.
+    struct SimCard {
+        inner: Mutex<Sim>,
+    }
+
+    struct Sim {
+        card: Authenticator,
+        generation: u64,
+        present: bool,
+        apdus: usize,
+        lose_at: Vec<usize>,
+        /// Whether a requested tap actually happens (the user taps).
+        user_taps: bool,
+        /// Silent re-tap right after the n-th APDU was answered.
+        retap_after: Vec<usize>,
+        /// A lost card keeps showing as present (same generation) until
+        /// the next real tap: the stale flag of the live failure.
+        stale_presence: bool,
+        stale_presence_on_loss: bool,
+        taps: usize,
+        states: Vec<u8>,
+    }
+
+    impl SimCard {
+        fn new(card: Authenticator) -> Self {
+            Self {
+                inner: Mutex::new(Sim {
+                    card,
+                    generation: 1,
+                    present: true,
+                    apdus: 0,
+                    lose_at: Vec::new(),
+                    user_taps: true,
+                    retap_after: Vec::new(),
+                    stale_presence: false,
+                    stale_presence_on_loss: false,
+                    taps: 0,
+                    states: Vec::new(),
+                }),
+            }
+        }
+
+        fn sim(&self) -> std::sync::MutexGuard<'_, Sim> {
+            self.inner.lock().unwrap()
+        }
+
+        /// The user lifts the card and taps it again.
+        fn retap(&self) {
+            let mut sim = self.sim();
+            sim.card.power_cycle();
+            sim.generation += 1;
+            sim.present = true;
+        }
+    }
+
+    impl Card for SimCard {
+        fn generation(&self) -> Option<u64> {
+            let sim = self.sim();
+            sim.present.then_some(sim.generation)
+        }
+        fn request_tap(&self) {
+            let mut sim = self.sim();
+            sim.taps += 1;
+            if sim.user_taps && (!sim.present || sim.stale_presence) {
+                sim.stale_presence = false;
+                sim.card.power_cycle();
+                sim.generation += 1;
+                sim.present = true;
+            }
+        }
+        fn transmit(&self, apdu: Vec<u8>) -> Result<Vec<u8>, String> {
+            let mut sim = self.sim();
+            sim.apdus += 1;
+            let n = sim.apdus;
+            if !sim.present || sim.stale_presence {
+                return Err("no card".into());
+            }
+            if sim.lose_at.contains(&n) {
+                sim.card.apdu(&apdu);
+                sim.card.power_cycle();
+                sim.present = false;
+                if sim.stale_presence_on_loss {
+                    sim.present = true;
+                    sim.stale_presence = true;
+                }
+                return Err("card gone".into());
+            }
+            let reply = sim.card.apdu(&apdu);
+            if sim.retap_after.contains(&n) {
+                sim.card.power_cycle();
+                sim.generation += 1;
+            }
+            Ok(reply)
+        }
+        fn auth_state(&self, state: u8) {
+            self.sim().states.push(state);
+        }
+    }
+
+    /// Runs one request against `card` with a fresh status log.
+    fn run(proxy: &mut PinProxy, card: &SimCard, request: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let mut statuses = Vec::new();
         let reply = run_request(
-            &[0x04],
-            &card,
+            request,
+            7,
+            proxy,
+            card,
             &AtomicBool::new(false),
-            || waited = true,
+            |status| statuses.push(status),
             TAP_TIMEOUT,
         );
-        assert_eq!(reply, [0x00, 0xA1]);
-        assert_eq!(card.taps.load(Ordering::SeqCst), 0);
-        assert!(!waited);
-        assert_eq!(card.apdus.lock().unwrap().len(), 2, "SELECT + MSG");
+        (reply, statuses)
+    }
+
+    const PIN: &str = "1234";
+
+    #[test]
+    fn card_already_present_relays_without_asking_for_a_tap() {
+        let card = SimCard::new(Authenticator::new(None, &[2]));
+        let (reply, statuses) = run(&mut PinProxy::new(), &card, &[0x04]);
+        assert_eq!(reply[0], 0x00);
+        assert_eq!(card.sim().taps, 0);
+        assert!(statuses.is_empty());
+        assert_eq!(card.sim().apdus, 2, "SELECT + MSG");
     }
 
     #[test]
     fn no_card_asks_for_one_tap_then_relays_when_it_arrives() {
-        let card = FakeCard::new(3);
-        let mut waited = 0;
-        let reply = run_request(
-            &[0x04],
-            &card,
-            &AtomicBool::new(false),
-            || waited += 1,
-            TAP_TIMEOUT,
+        let card = SimCard::new(Authenticator::new(None, &[2]));
+        card.sim().present = false;
+        let (reply, statuses) = run(&mut PinProxy::new(), &card, &[0x04]);
+        assert_eq!(reply[0], 0x00);
+        assert_eq!(card.sim().taps, 1);
+        assert_eq!(
+            statuses,
+            [ctaphid::STATUS_UPNEEDED, ctaphid::STATUS_PROCESSING]
         );
-        assert_eq!(reply, [0x00, 0xA1]);
-        assert_eq!(card.taps.load(Ordering::SeqCst), 1);
-        assert_eq!(waited, 1);
     }
 
     #[test]
     fn waiting_times_out_with_user_action_timeout() {
-        let card = FakeCard::new(usize::MAX);
+        let card = SimCard::new(Authenticator::new(None, &[2]));
+        card.sim().present = false;
+        card.sim().user_taps = false;
         let reply = run_request(
             &[0x04],
+            7,
+            &mut PinProxy::new(),
             &card,
             &AtomicBool::new(false),
-            || {},
+            |_| {},
             Duration::from_millis(250),
         );
         assert_eq!(reply, [CTAP2_ERR_USER_ACTION_TIMEOUT]);
+        assert_eq!(card.sim().states.last(), Some(&auth::FAILED));
     }
 
     #[test]
     fn cancel_while_waiting_returns_keepalive_cancel() {
-        let card = FakeCard::new(usize::MAX);
-        let cancelled = AtomicBool::new(true);
+        let card = SimCard::new(Authenticator::new(None, &[2]));
+        card.sim().present = false;
+        card.sim().user_taps = false;
+        let reply = run_request(
+            &[0x04],
+            7,
+            &mut PinProxy::new(),
+            &card,
+            &AtomicBool::new(true),
+            |_| {},
+            TAP_TIMEOUT,
+        );
+        assert_eq!(reply, [CTAP2_ERR_KEEPALIVE_CANCEL]);
+    }
+
+    #[test]
+    fn a_card_without_the_fido_applet_is_ctap_other() {
+        struct NoApplet;
+        impl Card for NoApplet {
+            fn generation(&self) -> Option<u64> {
+                Some(1)
+            }
+            fn request_tap(&self) {}
+            fn transmit(&self, _: Vec<u8>) -> Result<Vec<u8>, String> {
+                Ok(vec![0x6A, 0x82])
+            }
+            fn auth_state(&self, _: u8) {}
+        }
+        let reply = run_request(
+            &[0x04],
+            7,
+            &mut PinProxy::new(),
+            &NoApplet,
+            &AtomicBool::new(false),
+            |_| {},
+            TAP_TIMEOUT,
+        );
+        assert_eq!(reply, [CTAP1_ERR_OTHER]);
+    }
+
+    /// The live failure, end to end at the APDU level: GetInfo, the
+    /// probe, getRetries, getKeyAgreement, the user types the PIN while
+    /// the card leaves and comes back, getPinToken, another re-tap,
+    /// makeCredential.
+    #[test]
+    fn safari_pin_sequence_survives_retaps_through_the_relay() {
+        let card = SimCard::new(Authenticator::new(Some(PIN), &[1, 2]));
+        let mut proxy = PinProxy::new();
+        let platform = Platform::new(Protocol::Two);
+        let cdh = [0x42u8; 32];
+        assert_eq!(run(&mut proxy, &card, &[0x04]).0[0], 0x00);
+        let probe = platform.make_credential(&cdh, "webauthn.io", Some(vec![]));
+        assert_eq!(run(&mut proxy, &card, &probe).0, [0x31]);
         assert_eq!(
-            run_request(&[0x04], &card, &cancelled, || {}, TAP_TIMEOUT),
-            [CTAP2_ERR_KEEPALIVE_CANCEL]
+            run(&mut proxy, &card, &platform.client_pin(0x01, vec![])).0[0],
+            0x00
+        );
+        let mut send = |request: &[u8]| run(&mut proxy, &card, request).0;
+        let (shared, cose) = platform.agree(&mut send).unwrap();
+        card.retap();
+        let request = platform.token_request(&shared, cose, PIN, None);
+        let token = platform
+            .open_token(&shared, &run(&mut proxy, &card, &request).0)
+            .unwrap();
+        card.retap();
+        let param = Protocol::Two.authenticate(&token, &cdh);
+        let request = platform.make_credential(&cdh, "webauthn.io", Some(param));
+        assert_eq!(run(&mut proxy, &card, &request).0[0], 0x00);
+        let sim = card.sim();
+        assert_eq!(sim.card.counters.wrong_pin, 0);
+        assert_eq!(sim.card.counters.signatures, 1);
+        assert_eq!(sim.states.last(), Some(&auth::SUCCESS));
+        assert!(!sim.states.contains(&auth::FAILED));
+    }
+
+    #[test]
+    fn a_card_lost_mid_request_is_retried_after_a_new_tap() {
+        let card = SimCard::new(Authenticator::new(None, &[2]));
+        card.sim().lose_at = vec![2]; // the makeCredential APDU
+        let platform = Platform::new(Protocol::Two);
+        let request = platform.make_credential(&[1; 32], "example.com", None);
+        let (reply, statuses) = run(&mut PinProxy::new(), &card, &request);
+        assert_eq!(reply[0], 0x00);
+        let sim = card.sim();
+        assert_eq!(sim.taps, 1, "the phone was asked for a tap");
+        assert_eq!(
+            sim.states,
+            [auth::WORKING, auth::REMOVED, auth::WORKING, auth::SUCCESS]
+        );
+        assert_eq!(
+            statuses,
+            [ctaphid::STATUS_UPNEEDED, ctaphid::STATUS_PROCESSING]
         );
     }
 
     #[test]
-    fn relay_failures_become_ctap_other() {
-        let mut card = FakeCard::new(0);
-        card.fail = true;
-        assert_eq!(
-            run_request(&[0x04], &card, &AtomicBool::new(false), || {}, TAP_TIMEOUT),
-            [CTAP1_ERR_OTHER]
+    fn a_generation_change_mid_sequence_counts_as_a_lost_card() {
+        let card = SimCard::new(Authenticator::new(None, &[2]));
+        // The card is re-tapped between SELECT and the command: the new
+        // tap was never SELECTed, so the proxy must reopen it.
+        card.sim().retap_after = vec![1];
+        let (reply, _) = run(&mut PinProxy::new(), &card, &[0x04]);
+        assert_eq!(reply[0], 0x00);
+        assert!(card.sim().states.contains(&auth::REMOVED));
+    }
+
+    /// A re-tap between the card's getKeyAgreement and its getPinToken,
+    /// on a card that needs no SELECT after power-up: the pinHash must
+    /// not go out encrypted to the old tap's key (the card would count a
+    /// wrong PIN). Caught before sending, so it is retried safely.
+    #[test]
+    fn a_retap_before_get_pin_token_never_sends_a_stale_pin_hash() {
+        let mut authenticator = Authenticator::new(Some(PIN), &[2]);
+        authenticator.auto_select = true;
+        let card = SimCard::new(authenticator);
+        let mut proxy = PinProxy::new();
+        assert_eq!(run(&mut proxy, &card, &[0x04]).0[0], 0x00); // APDUs 1-2
+        // getPinToken: SELECT (3), card getKeyAgreement (4), re-tap,
+        // getPinToken (5).
+        card.sim().retap_after = vec![4];
+        let platform = Platform::new(Protocol::Two);
+        let mut send = |request: &[u8]| run(&mut proxy, &card, request).0;
+        let token = platform.token(&mut send, PIN, None);
+        assert!(token.is_ok(), "{token:?}");
+        assert_eq!(card.sim().card.counters.wrong_pin, 0);
+    }
+
+    /// The live failure: the transport says the card is gone but the
+    /// presence flag still shows the old tap. The relay must not reuse
+    /// that tap; it asks the phone for a new one.
+    #[test]
+    fn a_stale_presence_flag_after_a_loss_waits_for_a_real_retap() {
+        let card = SimCard::new(Authenticator::new(None, &[2]));
+        card.sim().lose_at = vec![2];
+        card.sim().stale_presence_on_loss = true;
+        let (reply, _) = run(&mut PinProxy::new(), &card, &[0x04]);
+        assert_eq!(reply[0], 0x00);
+        assert_eq!(card.sim().taps, 1);
+    }
+
+    #[test]
+    fn a_lost_card_that_never_comes_back_times_out() {
+        let card = SimCard::new(Authenticator::new(None, &[2]));
+        card.sim().lose_at = vec![2];
+        card.sim().user_taps = false;
+        let reply = run_request(
+            &[0x04],
+            7,
+            &mut PinProxy::new(),
+            &card,
+            &AtomicBool::new(false),
+            |_| {},
+            Duration::from_millis(300),
         );
+        assert_eq!(reply, [CTAP2_ERR_USER_ACTION_TIMEOUT]);
+        assert_eq!(card.sim().states.last(), Some(&auth::FAILED));
+    }
+
+    #[test]
+    fn pending_resyncs_reach_the_proxy() {
+        let card = SimCard::new(Authenticator::new(Some(PIN), &[2]));
+        let shared = Shared::default();
+        let platform = Platform::new(Protocol::Two);
+        {
+            let mut proxy = shared.proxy.lock().unwrap();
+            let mut send = |request: &[u8]| run(&mut proxy, &card, request).0;
+            platform.token(&mut send, PIN, None).unwrap();
+            assert!(proxy.has_session());
+        }
+        shared.resync(7);
+        shared.tick(Instant::now());
+        assert!(!shared.proxy.lock().unwrap().has_session());
     }
 }
