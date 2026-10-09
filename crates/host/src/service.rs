@@ -88,6 +88,9 @@ enum Command {
     MintInvitation(std::sync::mpsc::SyncSender<Invitation>),
     ForgetPhone(std::sync::mpsc::SyncSender<()>),
     RequestTap(std::sync::mpsc::SyncSender<TapOutcome>),
+    /// Tell the connected phone where the current sign-in stands
+    /// ([`wire::auth`]); dropped silently when no session is live.
+    AuthState(u8),
     Status(std::sync::mpsc::SyncSender<Status>),
     EndpointAddr(std::sync::mpsc::SyncSender<iroh::EndpointAddr>),
     /// macOS PIV path: relay one APDU to the phone card and reply with the
@@ -170,6 +173,17 @@ impl ServiceHandle {
         self.reply(Command::RequestTap)
     }
 
+    /// Shows a sign-in state on the phone's tap animation (a
+    /// [`tapbridge_core::wire::auth`] constant). Fire-and-forget: ignored
+    /// when no phone is connected.
+    pub fn send_auth_state(&self, state: u8) {
+        if let Ok(commands) = self.commands.lock()
+            && let Some(sender) = commands.as_ref()
+        {
+            let _ = sender.send(Command::AuthState(state));
+        }
+    }
+
     /// macOS PIV path: relays one APDU to the phone card, blocking until the
     /// R-APDU (or error) arrives; the deadline matches the usbip reader.
     #[cfg(target_os = "macos")]
@@ -188,8 +202,12 @@ impl ServiceHandle {
 
     #[cfg(target_os = "macos")]
     fn transmit(&self, apdu: Vec<u8>, deadline: Duration) -> PivResult {
-        self.reply_option(|reply| Command::PivTransmit { apdu, deadline, reply })
-            .unwrap_or(Err(crate::ifd::TransmitError::Other))
+        self.reply_option(|reply| Command::PivTransmit {
+            apdu,
+            deadline,
+            reply,
+        })
+        .unwrap_or(Err(crate::ifd::TransmitError::Other))
     }
 
     /// Requests graceful shutdown and waits for the workers to finish.
@@ -389,6 +407,14 @@ async fn run_inner(
                                 disconnect(&mut active, &mut received, &to_reader, &events, &mut card_present).await?;
                             }
                             let _ = reply.send(());
+                        },
+                        Command::AuthState(state) => {
+                            if active.is_some() {
+                                let _ = send_frame(
+                                    &mut active, &mut received, &to_reader, &events,
+                                    &mut card_present, Frame::Auth { state }, tracer.as_mut(),
+                                ).await?;
+                            }
                         },
                         Command::RequestTap(reply) => {
                             let outcome = if active.is_some() {
@@ -869,6 +895,28 @@ mod tests {
             .await;
         assert_eq!(handle.request_tap(), TapOutcome::NoPush);
         handle.shutdown();
+        drop(phone.endpoint);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auth_state_reaches_the_connected_phone() {
+        let dir = tempfile::tempdir().unwrap();
+        let _session = crate::keychain::TestSession::begin();
+        let (handle, _collector, phone) = paired_service(dir.path(), "Pixel", Some("tok")).await;
+        let mut phone = phone;
+        handle.send_auth_state(wire::auth::SUCCESS);
+        let frame = tokio::time::timeout(Duration::from_secs(5), wire::read_frame(&mut phone.recv))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            frame,
+            Frame::Auth {
+                state: wire::auth::SUCCESS
+            }
+        );
+        handle.shutdown();
+        transport::close(&phone.conn);
         drop(phone.endpoint);
     }
 
