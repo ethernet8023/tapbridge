@@ -68,6 +68,10 @@ pub struct Status {
     pub push_stored: bool,
     /// Current card ATR when present (macOS IFD path; empty otherwise).
     pub atr: Vec<u8>,
+    /// Generation of the current card tap (macOS; 0 otherwise). Every tap
+    /// powers the card up afresh, which regenerates its CTAP PIN key
+    /// agreement key: the security key uses this to notice a re-tap.
+    pub card_generation: u64,
 }
 
 /// What happened after a [`ServiceHandle::request_tap`].
@@ -442,6 +446,10 @@ async fn run_inner(
                                 atr: if card_present { latest_atr.clone() } else { Vec::new() },
                                 #[cfg(not(target_os = "macos"))]
                                 atr: Vec::new(),
+                                #[cfg(target_os = "macos")]
+                                card_generation,
+                                #[cfg(not(target_os = "macos"))]
+                                card_generation: 0,
                             });
                         },
                         #[cfg(target_os = "macos")]
@@ -915,6 +923,38 @@ mod tests {
                 state: wire::auth::SUCCESS
             }
         );
+        handle.shutdown();
+        transport::close(&phone.conn);
+        drop(phone.endpoint);
+    }
+
+    /// Each tap is a new card generation; the security key compares them
+    /// to tell a re-tap (new PIN key agreement on the card) from the same
+    /// tap.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn status_exposes_the_card_generation_of_each_tap() {
+        let dir = tempfile::tempdir().unwrap();
+        let _session = crate::keychain::TestSession::begin();
+        let (handle, mut collector, phone) = paired_service(dir.path(), "Pixel", None).await;
+        let mut phone = phone;
+        for generation in [7u64, 8] {
+            wire::write_frame(
+                &mut phone.send,
+                &Frame::Card {
+                    generation,
+                    atr: vec![0x3B, 0x80, 0x80, 0x01, 0x01],
+                    max_apdu: 255,
+                },
+            )
+            .await
+            .unwrap();
+            collector
+                .wait(|event| matches!(event, Event::CardPresent { present: true }))
+                .await;
+            let status = handle.status();
+            assert!(status.card_present);
+            assert_eq!(status.card_generation, generation);
+        }
         handle.shutdown();
         transport::close(&phone.conn);
         drop(phone.endpoint);
