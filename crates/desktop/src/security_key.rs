@@ -536,6 +536,18 @@ mod tests {
         drop(device);
     }
 
+    /// HID paths of "tapbridge security key" devices that already exist
+    /// (an installed tapbridge app has one): the live tests skip them and
+    /// talk only to the device they created.
+    fn existing_key_paths(python: &str) -> String {
+        let script = "from fido2.hid import CtapHidDevice\nprint(','.join(str(d.descriptor.path) for d in CtapHidDevice.list_devices() if d.descriptor.product_name == 'tapbridge security key'))";
+        let output = std::process::Command::new(python)
+            .args(["-c", script])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
     /// Live end to end: a real FIDO client (python-fido2, path in
     /// `FIDO_PYTHON`) finds the virtual key over HID and runs GetInfo; the
     /// fake card answers with a 100+ byte reply (multi-packet both ways).
@@ -575,6 +587,7 @@ mod tests {
             }
         }
         let python = std::env::var("FIDO_PYTHON").expect("FIDO_PYTHON=path to python with fido2");
+        let skip = existing_key_paths(&python);
         spawn_with_card(
             Arc::new(InfoCard(info)),
             Arc::new(|line: &str| eprintln!("{line}")),
@@ -584,7 +597,9 @@ mod tests {
         let script = r#"
 from fido2.hid import CtapHidDevice
 from fido2.ctap2 import Ctap2
-dev = next(d for d in CtapHidDevice.list_devices() if d.descriptor.product_name == "tapbridge security key")
+import os
+skip = set(os.environ.get("TAPBRIDGE_SKIP_PATHS", "").split(","))
+dev = next(d for d in CtapHidDevice.list_devices() if d.descriptor.product_name == "tapbridge security key" and str(d.descriptor.path) not in skip)
 info = Ctap2(dev).get_info()
 print("versions", info.versions)
 print("extensions", info.extensions)
@@ -593,6 +608,7 @@ print("max_msg_size", info.max_msg_size)
 "#;
         let output = std::process::Command::new(python)
             .args(["-c", script])
+            .env("TAPBRIDGE_SKIP_PATHS", &skip)
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -628,6 +644,7 @@ print("max_msg_size", info.max_msg_size)
         stale_presence: bool,
         stale_presence_on_loss: bool,
         taps: usize,
+        retaps: usize,
         states: Vec<u8>,
     }
 
@@ -645,6 +662,7 @@ print("max_msg_size", info.max_msg_size)
                     stale_presence: false,
                     stale_presence_on_loss: false,
                     taps: 0,
+                    retaps: 0,
                     states: Vec::new(),
                 }),
             }
@@ -723,6 +741,99 @@ print("max_msg_size", info.max_msg_size)
     }
 
     const PIN: &str = "1234";
+
+    /// Live PIN flow: python-fido2 (`FIDO_PYTHON`) runs ClientPin over the
+    /// virtual key against the software card, which is re-tapped (power
+    /// cycled, new generation) before every card session, then a wrong
+    /// PIN. Needs the entitlement like the tests above.
+    #[test]
+    #[ignore = "needs the HID virtual device entitlement and FIDO_PYTHON"]
+    fn real_fido_client_pin_flow_survives_retaps() {
+        /// Re-taps (power cycle, new generation) whenever the card sat
+        /// idle for a while: the user lifting and re-tapping between the
+        /// client's requests (the script sleeps between steps).
+        struct RetapWhenIdle(SimCard, Mutex<Instant>);
+        impl RetapWhenIdle {
+            fn maybe_retap(&self) {
+                let mut last = self.1.lock().unwrap();
+                if last.elapsed() > Duration::from_millis(150) {
+                    self.0.retap();
+                    self.0.sim().retaps += 1;
+                }
+                *last = Instant::now();
+            }
+        }
+        impl Card for RetapWhenIdle {
+            fn generation(&self) -> Option<u64> {
+                self.maybe_retap();
+                self.0.generation()
+            }
+            fn request_tap(&self) {
+                self.0.request_tap();
+            }
+            fn transmit(&self, apdu: Vec<u8>) -> Result<Vec<u8>, String> {
+                *self.1.lock().unwrap() = Instant::now();
+                self.0.transmit(apdu)
+            }
+            fn auth_state(&self, state: u8) {
+                self.0.auth_state(state);
+            }
+        }
+        let card = Arc::new(RetapWhenIdle(
+            SimCard::new(Authenticator::new(Some(PIN), &[1, 2])),
+            Mutex::new(Instant::now()),
+        ));
+        let python = std::env::var("FIDO_PYTHON").expect("FIDO_PYTHON=path to python with fido2");
+        let skip = existing_key_paths(&python);
+        spawn_with_card(card.clone(), Arc::new(|line: &str| eprintln!("{line}")))
+            .expect("device created (entitlement present?)");
+        std::thread::sleep(Duration::from_millis(500));
+        let script = r#"
+from fido2.hid import CtapHidDevice
+from fido2.ctap import CtapError
+from fido2.ctap2 import Ctap2, ClientPin
+import time
+import os
+skip = set(os.environ.get("TAPBRIDGE_SKIP_PATHS", "").split(","))
+dev = next(d for d in CtapHidDevice.list_devices() if d.descriptor.product_name == "tapbridge security key" and str(d.descriptor.path) not in skip)
+ctap = Ctap2(dev)
+print("protocols", ctap.info.pin_uv_protocols)
+time.sleep(0.3)
+pin = ClientPin(ctap)
+print("retries", pin.get_pin_retries()[0])
+time.sleep(0.3)
+token = pin.get_pin_token("1234", ClientPin.PERMISSION.MAKE_CREDENTIAL, "example.com")
+cdh = b"\x01" * 32
+time.sleep(0.3)
+att = ctap.make_credential(cdh, {"id": "example.com", "name": "x"}, {"id": b"u", "name": "u"},
+    [{"type": "public-key", "alg": -7}], pin_uv_param=pin.protocol.authenticate(token, cdh),
+    pin_uv_protocol=pin.protocol.VERSION)
+print("make_credential", att.fmt)
+time.sleep(0.3)
+try:
+    pin.get_pin_token("0000")
+except CtapError as e:
+    print("wrong pin", e.code.name)
+print("retries after", pin.get_pin_retries()[0])
+"#;
+        let output = std::process::Command::new(python)
+            .args(["-c", script])
+            .env("TAPBRIDGE_SKIP_PATHS", &skip)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("{stdout}{stderr}");
+        assert!(output.status.success());
+        assert!(stdout.contains("protocols [2, 1]"));
+        assert!(stdout.contains("make_credential none"));
+        assert!(stdout.contains("wrong pin PIN_INVALID"));
+        assert!(stdout.contains("retries after 7"));
+        let sim = card.0.sim();
+        assert_eq!(sim.card.counters.wrong_pin, 1);
+        assert_eq!(sim.card.counters.signatures, 1);
+        assert!(sim.retaps >= 4, "re-tapped between steps: {}", sim.retaps);
+    }
 
     #[test]
     fn card_already_present_relays_without_asking_for_a_tap() {
