@@ -7,6 +7,8 @@
 //! flows only — WebAuthn is Track B.
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod security_key;
 
 mod app_state;
 mod assets;

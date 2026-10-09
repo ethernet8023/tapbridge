@@ -252,6 +252,8 @@ fn spawn_service(state_dir: PathBuf, trace: bool, events: mpsc::Sender<UiEvent>)
             Ok(handle) => {
                 #[cfg(target_os = "macos")]
                 spawn_ifd_server(&handle, &events);
+                #[cfg(target_os = "macos")]
+                spawn_security_key(&handle, &events);
                 let _ = events.send(UiEvent::ServiceStarted(handle));
                 // The service tasks live on this runtime until the process exits.
                 runtime.block_on(std::future::pending::<()>());
@@ -280,6 +282,24 @@ fn spawn_ifd_server(handle: &ServiceHandle, events: &mpsc::Sender<UiEvent>) {
             logging::log("ifd: PC/SC reader socket listening");
         }
         Err(error) => logging::log(&format!("ifd socket unavailable: {error}")),
+    }
+}
+
+/// macOS: the virtual FIDO security key browsers talk to. A request with
+/// no card on the phone asks for a tap the same way PC/SC does.
+#[cfg(target_os = "macos")]
+fn spawn_security_key(handle: &ServiceHandle, events: &mpsc::Sender<UiEvent>) {
+    let events = events.clone();
+    let started = crate::security_key::spawn(
+        handle.clone(),
+        move || {
+            let _ = events.send(UiEvent::WakeRequested);
+        },
+        logging::log,
+    );
+    match started {
+        Ok(()) => logging::log("security key: virtual FIDO device active"),
+        Err(error) => logging::log(&format!("security key unavailable: {error}")),
     }
 }
 

@@ -8,13 +8,20 @@
 # /usr/local/bin/tapbridge is NOT installed: the .app's inner binary is the
 # daemon; the tray's "start at login" writes a LaunchAgent pointing at it.
 #
-# Usage: scripts/build-pkg.sh [--sign <SIGNER_IDENTITY>]
+# Usage: scripts/build-pkg.sh [--sign <SIGNER_IDENTITY>] [--app-sign <ID>]
+#                             [--profile <embedded.provisionprofile>]
 # Requirements: Xcode 26+ tools (clang, pkgbuild, productbuild, actool,
 #   Icon Composer) and a prior
 #   cargo build --release -p tapbridge-desktop
 # Output: dist/tapbridge-<version>-macos.pkg
 #   --sign: Developer ID Installer identity for a signed product pkg
 #           (e.g. "Developer ID Installer: Your Name (TEAMID)").
+#   --app-sign: codesign identity for tapbridge.app (default "-", ad hoc).
+#   --profile: provisioning profile granting the HID virtual device
+#           entitlement (the virtual security key). Without one, macOS only
+#           runs the entitled app with AMFI disabled; see
+#           spikes/fido-hid/README.md. --no-entitlements drops it instead
+#           (no security key, runs everywhere).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -22,10 +29,16 @@ VERSION="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -1)"
 PKG_ID="computer.ethernet.tapbridge"
 OUT="dist"
 SIGN_IDENTITY=""
+APP_SIGN="-"
+PROFILE=""
+ENTITLEMENTS="packaging/macos/tapbridge.entitlements"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --sign) SIGN_IDENTITY="$2"; shift 2 ;;
+        --app-sign) APP_SIGN="$2"; shift 2 ;;
+        --profile) PROFILE="$2"; shift 2 ;;
+        --no-entitlements) ENTITLEMENTS=""; shift ;;
         *) echo "unknown arg: $1" >&2; exit 1 ;;
     esac
 done
@@ -78,6 +91,15 @@ PLIST
 # flat AppIcon.icns fallback, both from assets/brand/macos/tapbridge.icon.
 scripts/build-macos-icon.sh "$APP/Contents/Resources"
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
+if [[ -n "$PROFILE" ]]; then
+    cp "$PROFILE" "$APP/Contents/embedded.provisionprofile"
+fi
+# Sign last (after every file is in place).
+if [[ -n "$ENTITLEMENTS" ]]; then
+    codesign --force --options runtime --sign "$APP_SIGN" --entitlements "$ENTITLEMENTS" "$APP"
+else
+    codesign --force --options runtime --sign "$APP_SIGN" "$APP"
+fi
 
 # --- IFD shim bundle ------------------------------------------------------
 cp -R "$BUNDLE" "$STAGE/usr/local/libexec/SmartCardServices/drivers/tapbridge.bundle"

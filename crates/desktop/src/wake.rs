@@ -1,8 +1,7 @@
 //! Wake client: POST /v1/wake to the relay. Tokens are never logged.
 //!
-//! Relay base URL: built in at compile time from `TAPBRIDGE_RELAY_URL`,
-//! overridden at runtime by `<state_dir>/relay.txt`. Unset -> the feature
-//! reports "relay not configured" instead of inventing a URL.
+//! Relay base URL: `<state_dir>/relay.txt` at runtime, else
+//! `TAPBRIDGE_RELAY_URL` at compile time, else the project's hosted relay.
 use crate::app_log;
 use std::{path::Path, time::Duration};
 
@@ -17,9 +16,16 @@ pub enum WakeResult {
     Network(&'static str),
 }
 
-/// Relay base URL baked in at build time (`TAPBRIDGE_RELAY_URL` in the build
-/// environment; cargo rebuilds when it changes).
-const BUILT_IN_RELAY: Option<&str> = option_env!("TAPBRIDGE_RELAY_URL");
+/// The hosted relay (relay/wrangler.toml custom domain).
+const DEFAULT_RELAY: &str = "https://tapbridge-relay.ethernet.computer";
+
+/// Relay base URL baked in at build time: `TAPBRIDGE_RELAY_URL` in the build
+/// environment (cargo rebuilds when it changes), else [`DEFAULT_RELAY`], so
+/// a build that forgets the variable still wakes the phone.
+const BUILT_IN_RELAY: Option<&str> = match option_env!("TAPBRIDGE_RELAY_URL") {
+    Some(url) => Some(url),
+    None => Some(DEFAULT_RELAY),
+};
 
 /// Relay base URL: `<state_dir>/relay.txt` when present (self-hosted relay),
 /// otherwise the built-in URL. `None` when neither is set.
@@ -191,6 +197,13 @@ mod tests {
             Some("https://relay.example")
         );
         assert_eq!(choose_relay(None, None), None);
+    }
+
+    #[test]
+    fn builds_without_the_env_var_use_the_hosted_relay() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = option_env!("TAPBRIDGE_RELAY_URL").unwrap_or(DEFAULT_RELAY);
+        assert_eq!(relay_url(dir.path()).as_deref(), Some(expected.trim_end_matches('/')));
     }
 
     #[test]

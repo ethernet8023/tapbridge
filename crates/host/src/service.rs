@@ -16,6 +16,8 @@ use std::{io, net::SocketAddr, path::PathBuf, sync::mpsc, thread, time::Duration
 /// `APDU_DEADLINE` (2 s) plus its allowed extensions bound.
 #[cfg(target_os = "macos")]
 const PIV_DEADLINE: Duration = Duration::from_secs(2);
+#[cfg(target_os = "macos")]
+const CTAP_DEADLINE: Duration = Duration::from_secs(15);
 use tapbridge_core::{
     pairing::{Invitation, PairingGate},
     transport,
@@ -93,6 +95,7 @@ enum Command {
     #[cfg(target_os = "macos")]
     PivTransmit {
         apdu: Vec<u8>,
+        deadline: Duration,
         reply: std::sync::mpsc::SyncSender<PivResult>,
     },
     /// macOS PIV path: deadline watchdog fired for `apdu_id`.
@@ -171,7 +174,21 @@ impl ServiceHandle {
     /// R-APDU (or error) arrives; the deadline matches the usbip reader.
     #[cfg(target_os = "macos")]
     pub fn piv_transmit(&self, apdu: Vec<u8>) -> PivResult {
-        self.reply_option(|reply| Command::PivTransmit { apdu, reply })
+        self.transmit(apdu, PIV_DEADLINE)
+    }
+
+    /// macOS virtual security key path: like [`Self::piv_transmit`] with a
+    /// longer deadline, since CTAP operations (key generation, PIN
+    /// protocol) can take seconds on a card. Matches the phone's 15 s
+    /// IsoDep timeout.
+    #[cfg(target_os = "macos")]
+    pub fn ctap_transmit(&self, apdu: Vec<u8>) -> PivResult {
+        self.transmit(apdu, CTAP_DEADLINE)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn transmit(&self, apdu: Vec<u8>, deadline: Duration) -> PivResult {
+        self.reply_option(|reply| Command::PivTransmit { apdu, deadline, reply })
             .unwrap_or(Err(crate::ifd::TransmitError::Other))
     }
 
@@ -402,7 +419,7 @@ async fn run_inner(
                             });
                         },
                         #[cfg(target_os = "macos")]
-                        Command::PivTransmit { apdu, reply } => {
+                        Command::PivTransmit { apdu, deadline, reply } => {
                             // Mirrors the usbip reader's XfrBlock guards: one
                             // in flight, card present + valid ATR, session
                             // live, APDU within wire bounds.
@@ -441,7 +458,7 @@ async fn run_inner(
                                         // after firing.
                                         let watchdog = piv_timeout_tx.clone();
                                         tokio::spawn(async move {
-                                            tokio::time::sleep(PIV_DEADLINE + Duration::from_millis(100)).await;
+                                            tokio::time::sleep(deadline + Duration::from_millis(100)).await;
                                             let _ = watchdog.send(Command::PivTimeout { apdu_id }).await;
                                         });
                                     } else {

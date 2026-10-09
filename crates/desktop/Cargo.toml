@@ -42,6 +42,8 @@ objc2-app-kit = { version = "0.3", features = [
 ] }
 objc2-foundation = { version = "0.3", features = ["NSProcessInfo", "NSString"] }
 system-configuration-sys = "0.6"
+block2 = "0.6"
+dispatch2 = "0.3"
 core-foundation = "0.10"
 
 [dev-dependencies]
