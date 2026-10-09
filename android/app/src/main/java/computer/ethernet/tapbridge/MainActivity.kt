@@ -47,10 +47,13 @@ import computer.ethernet.tapbridge.ui.HomeScreen
 import computer.ethernet.tapbridge.ui.KeysScreen
 import computer.ethernet.tapbridge.ui.AddKeyDialogs
 import computer.ethernet.tapbridge.ui.PairScreen
+import computer.ethernet.tapbridge.ui.PivPrompt
+import computer.ethernet.tapbridge.ui.PivSetupDialogs
 import computer.ethernet.tapbridge.ui.SettingsScreen
 import computer.ethernet.tapbridge.ui.theme.LocalReducedMotion
 import computer.ethernet.tapbridge.ui.theme.TapBridgeTheme
 import java.util.UUID
+import java.util.concurrent.Executors
 
 /**
  * Single-activity Compose app. Screens: home (status + tap hero), pair (QR),
@@ -80,7 +83,13 @@ class MainActivity : ComponentActivity() {
         var addKeyMode by mutableStateOf(false)
         var addKeyError by mutableStateOf<String?>(null)
         var pendingRecord by mutableStateOf<RegisteredKeys.KeyRecord?>(null)
+        /** Phone-side PIV setup offer/flow; null when none is showing. */
+        var pivPrompt by mutableStateOf<PivPrompt?>(null)
     }
+
+    /** Keys whose PIV offer was turned down this run (stable UID hex). */
+    private val pivDeclined = HashSet<String>()
+    private val pivWorker = Executors.newSingleThreadExecutor { r -> Thread(r, "piv").apply { isDaemon = true } }
 
     private var state: UiState? = null
 
@@ -129,11 +138,101 @@ class MainActivity : ComponentActivity() {
     }
 
     private val readerCallback = NfcAdapter.ReaderCallback { tag ->
-        if (state?.addKeyMode == true) {
-            runOnUiThread { handleRegistrationTag(tag) }
-        } else {
-            service?.onTagDiscovered(tag)
+        val ui = state
+        when {
+            ui?.pivPrompt is PivPrompt.Waiting -> pivWorker.execute { runPivSetup(tag) }
+            ui?.addKeyMode == true -> runOnUiThread { handleRegistrationTag(tag) }
+            // No PC is using the key: look for an unconfigured PIV applet
+            // before handing the tag on. Never during a PC request, where
+            // extra SELECTs would disturb the PC's session with the card.
+            ui != null && ui.pivPrompt == null && !ui.tapRequested &&
+                ui.status != TapBridgeService.Status.CONNECTED -> pivWorker.execute {
+                    probePiv(tag)
+                    service?.onTagDiscovered(tag)
+                }
+            else -> service?.onTagDiscovered(tag)
         }
+    }
+
+    /** Offers PIV setup when the tapped key has PIV with empty login slots. */
+    private fun probePiv(tag: Tag) {
+        val uid = tag.id?.takeIf { RegisteredKeys.uidStable(it) }?.let { RegisteredKeys.hex(it) }
+        if (uid != null && uid in pivDeclined) return
+        val iso = android.nfc.tech.IsoDep.get(tag) ?: return
+        val status = try {
+            iso.connect()
+            iso.timeout = 5000
+            Piv.probe { iso.transceive(it) }
+        } catch (_: Exception) {
+            null
+        } finally {
+            runCatching { iso.close() }
+        }
+        if (status?.needsSetup == true) {
+            runOnUiThread {
+                state?.let { if (it.pivPrompt == null) it.pivPrompt = PivPrompt.Offer(status) }
+                pivOfferedUid = uid
+            }
+        }
+    }
+
+    private var pivOfferedUid: String? = null
+
+    internal fun declinePiv() {
+        pivOfferedUid?.let { pivDeclined.add(it) }
+        endPiv()
+    }
+
+    internal fun endPiv() {
+        state?.pivPrompt = null
+    }
+
+    /** The PIN only lives in the prompt state, so ending the flow drops it. */
+    internal fun submitPiv(form: PivPrompt.Form) {
+        if (state?.pivPrompt !is PivPrompt.Form) return
+        state?.pivPrompt = PivPrompt.Waiting(form)
+    }
+
+    /**
+     * Runs on [pivWorker] once the key is held to the phone again. One
+     * attempt per tap, never retried on its own: a wrong PIN goes back to
+     * the form with the new count, and Piv.setUp itself refuses to send a
+     * PIN at MIN_PIN_RETRIES or fewer tries.
+     */
+    private fun runPivSetup(tag: Tag) {
+        val form = (state?.pivPrompt as? PivPrompt.Waiting)?.form ?: return
+        val pin = form.pin
+        val key = Piv.parseManagementKey(form.managementKey) ?: return
+        runOnUiThread { state?.pivPrompt = PivPrompt.Working }
+        val iso = android.nfc.tech.IsoDep.get(tag)
+        val next: PivPrompt = if (iso == null) {
+            PivPrompt.Failed("That isn't a smart card.")
+        } else try {
+            iso.connect()
+            // On-card key generation over NFC takes a few seconds.
+            iso.timeout = 20000
+            // slots = null: fill whatever is empty on the key actually held
+            // now, which may not be the one that got the offer.
+            val result = Piv.setUp({ iso.transceive(it) }, pin, form.name ?: "", managementKey = key)
+            if (result.slots.isEmpty()) PivPrompt.Failed("This key already has its certificates.")
+            else PivPrompt.Done(result.slots)
+        } catch (wrong: Piv.WrongPin) {
+            val status = form.status.copy(pinRetries = wrong.retries)
+            if (wrong.retries == 0) PivPrompt.Failed("The PIN is blocked. Unblock it with the PUK in yubico-piv-tool.")
+            else form.copy(status = status, pin = "", pinError = wrong.message)
+        } catch (_: Piv.WrongManagementKey) {
+            // Safe to retry: the management key has no retry counter.
+            form.copy(keyError = "That management key didn't work. Check it and try again.")
+        } catch (low: Piv.PinRetriesTooLow) {
+            PivPrompt.Failed(low.message!!)
+        } catch (e: android.nfc.TagLostException) {
+            PivPrompt.Failed("The key moved away before setup finished. Some slots may be half set up; tap the key again to retry.")
+        } catch (e: Exception) {
+            PivPrompt.Failed(e.message ?: "Card error")
+        } finally {
+            runCatching { iso?.close() }
+        }
+        runOnUiThread { state?.pivPrompt = next }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -238,6 +337,10 @@ class MainActivity : ComponentActivity() {
                         aaguid = Ctap2.aaguidFromInfo(info)
                     }
                 }
+                // Offered once the key is named (the dialog waits for that).
+                runCatching { Piv.probe { iso.transceive(it) } }.getOrNull()
+                    ?.takeIf { it.needsSetup }
+                    ?.let { state?.pivPrompt = PivPrompt.Offer(it) }
             } catch (e: Exception) {
                 state?.let { it.addKeyError = "Could not read the key: ${e.message ?: "card error"}" }
             } finally {
@@ -302,6 +405,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        pivWorker.shutdownNow()
         if (bound) {
             service?.listener = null
             unbindService(conn)
@@ -430,4 +534,18 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
         },
         onDiscard = { ui.pendingRecord = null; ui.addKeyMode = false },
     )
+    // After the add-key dialogs, so a newly registered key is named first.
+    if (ui.pendingRecord == null && !ui.addKeyMode) {
+        PivSetupDialogs(
+            prompt = ui.pivPrompt,
+            defaultName = IdentityStore.phoneName(context).let { "$it PIV" },
+            onStart = {
+                (ui.pivPrompt as? PivPrompt.Offer)?.let { ui.pivPrompt = PivPrompt.Form(it.status) }
+            },
+            onSubmit = { form -> activity.submitPiv(form) },
+            onDismiss = {
+                if (ui.pivPrompt is PivPrompt.Offer) activity.declinePiv() else activity.endPiv()
+            },
+        )
+    }
 }
