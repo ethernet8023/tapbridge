@@ -151,7 +151,7 @@ impl Session {
         let frame = self.runtime.block_on(wire::read_frame(&mut *reader))?;
         if !matches!(
             frame,
-            Frame::Apdu { .. } | Frame::Cancel { .. } | Frame::ReadCard
+            Frame::Apdu { .. } | Frame::Cancel { .. } | Frame::ReadCard | Frame::Auth { .. }
         ) {
             self.close();
             return Err(io::Error::new(

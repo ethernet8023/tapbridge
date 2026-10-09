@@ -180,6 +180,14 @@ pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_read(
             Frame::ReadCard => {
                 env.call_method(&callbacks, "readCard", "()V", &[])?;
             }
+            Frame::Auth { state } => {
+                env.call_method(
+                    &callbacks,
+                    "authState",
+                    "(I)V",
+                    &[JValue::Int(state.into())],
+                )?;
+            }
             _ => return Err("invalid host frame".into()),
         }
         Ok(())

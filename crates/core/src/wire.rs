@@ -47,6 +47,28 @@ pub enum Frame {
         id: u64,
     },
     ReadCard,
+    /// Host -> phone: where the current sign-in stands, for the phone's
+    /// tap animation. One of the [`auth`] constants.
+    Auth {
+        state: u8,
+    },
+}
+
+/// [`Frame::Auth`] states.
+pub mod auth {
+    /// Nothing in progress.
+    pub const IDLE: u8 = 0;
+    /// The card is being used: keep holding it.
+    pub const WORKING: u8 = 1;
+    /// The sign-in (or registration) succeeded.
+    pub const SUCCESS: u8 = 2;
+    /// The card left mid-operation; the host retries after the next tap.
+    pub const REMOVED: u8 = 3;
+    /// The PC is asking the user for the card's PIN.
+    pub const PIN: u8 = 4;
+    /// The operation failed (wrong PIN, timeout, card error).
+    pub const FAILED: u8 = 5;
+    pub const MAX: u8 = FAILED;
 }
 
 impl std::fmt::Debug for Frame {
@@ -61,6 +83,7 @@ impl std::fmt::Debug for Frame {
             Self::Failed { .. } => "Failed",
             Self::Cancel { .. } => "Cancel",
             Self::ReadCard => "ReadCard",
+            Self::Auth { .. } => "Auth",
         })
     }
 }
@@ -101,6 +124,7 @@ fn validate(frame: &Frame) -> io::Result<()> {
                     .is_none_or(|push| (1..=MAX_PUSH).contains(&push.len()))
         }
         Frame::Accepted { name } => (1..=MAX_NAME).contains(&name.len()),
+        Frame::Auth { state } => *state <= auth::MAX,
         _ => true,
     };
     if valid { Ok(()) } else { Err(invalid()) }
@@ -167,6 +191,7 @@ fn decode(body: &[u8]) -> io::Result<Frame> {
         }),
         7 if data.len() == 8 => Ok(Frame::Cancel { id: number(0) }),
         8 if data.is_empty() => Ok(Frame::ReadCard),
+        9 if data.len() == 1 => Ok(Frame::Auth { state: data[0] }),
         _ => Err(invalid()),
     }
 }
@@ -238,6 +263,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -
             body.extend_from_slice(&id.to_be_bytes());
         }
         Frame::ReadCard => body.push(8),
+        Frame::Auth { state } => body.extend_from_slice(&[9, *state]),
     }
     writer.write_u32(body.len() as u32).await?;
     writer.write_all(&body).await

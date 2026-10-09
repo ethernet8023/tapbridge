@@ -42,6 +42,7 @@ async fn carries_pairing_presence_and_cancellation_in_order() {
         },
         Frame::Cancel { id: 10 },
         Frame::ReadCard,
+        Frame::Auth { state: 2 },
     ];
     let mut bytes = Vec::new();
     for frame in &frames {
@@ -224,4 +225,22 @@ async fn transports_card_bytes_without_changing_status_words() {
     let mut bytes = Vec::new();
     write_frame(&mut bytes, &frame).await.unwrap();
     assert_eq!(read_frame(&mut bytes.as_slice()).await.unwrap(), frame);
+}
+
+#[tokio::test]
+async fn auth_states_outside_the_known_range_are_rejected() {
+    let mut bytes = Vec::new();
+    assert!(
+        write_frame(
+            &mut bytes,
+            &Frame::Auth {
+                state: tapbridge_core::wire::auth::MAX + 1
+            }
+        )
+        .await
+        .is_err()
+    );
+    // Hand-built frame with an unknown state: length 3, version, kind 9, state 0x7f.
+    let raw = [0, 0, 0, 3, tapbridge_core::wire::VERSION, 9, 0x7f];
+    assert!(read_frame(&mut raw.as_slice()).await.is_err());
 }

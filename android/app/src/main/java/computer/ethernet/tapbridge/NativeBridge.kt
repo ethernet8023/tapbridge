@@ -68,5 +68,8 @@ object NativeBridge {
         fun request(id: Long, generation: Long, data: ByteArray)
         fun cancel(id: Long)
         fun readCard()
+        /** Host's sign-in state (wire `auth` constants: 0 idle, 1 working,
+         *  2 success, 3 card removed mid-auth, 4 PIN entry, 5 failed). */
+        fun authState(state: Int)
     }
 }

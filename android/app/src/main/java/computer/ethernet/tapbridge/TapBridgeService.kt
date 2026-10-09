@@ -387,6 +387,7 @@ class TapBridgeService : Service() {
                 } catch (_: RejectedExecutionException) { gate.closeIfActive() }
             }
             override fun cancel(id: Long) { session.onCancel(id) }
+            override fun authState(state: Int) { /* phone UI states: wired up next */ }
             override fun readCard() {
                 bumpActivity()
                 main.post {
