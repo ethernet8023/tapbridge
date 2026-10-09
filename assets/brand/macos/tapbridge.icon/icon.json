@@ -59,9 +59,10 @@
       "name": "Waves",
       "layers": [
         {
-          "name": "waves",
-          "image-name": "waves.svg",
+          "name": "wave 3",
+          "image-name": "wave3.svg",
           "glass": true,
+          "opacity": 0.8,
           "fill-specializations": [
             {
               "value": "automatic"
@@ -69,7 +70,41 @@
             {
               "appearance": "dark",
               "value": {
-                "solid": "display-p3:0.80000,0.74000,1.00000,1.00000"
+                "solid": "display-p3:0.64000,0.54000,1.00000,1.00000"
+              }
+            }
+          ]
+        },
+        {
+          "name": "wave 2",
+          "image-name": "wave2.svg",
+          "glass": true,
+          "opacity": 0.9,
+          "fill-specializations": [
+            {
+              "value": "automatic"
+            },
+            {
+              "appearance": "dark",
+              "value": {
+                "solid": "display-p3:0.76000,0.68000,1.00000,1.00000"
+              }
+            }
+          ]
+        },
+        {
+          "name": "wave 1",
+          "image-name": "wave1.svg",
+          "glass": true,
+          "opacity": 1.0,
+          "fill-specializations": [
+            {
+              "value": "automatic"
+            },
+            {
+              "appearance": "dark",
+              "value": {
+                "solid": "display-p3:0.86000,0.82000,1.00000,1.00000"
               }
             }
           ]

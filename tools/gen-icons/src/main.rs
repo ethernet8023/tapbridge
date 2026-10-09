@@ -43,14 +43,39 @@ fn main() {
         // tray-icon embeds the 32px variant.
         fs::write(icons.join(format!("{name}.png")), render(&svg, 32)).unwrap();
     }
-    // macOS menu bar template glyphs: 22pt tall, rendered @2x (44px). tray-icon
-    // caps the NSImage at 22pt, so the 44px bitmap draws retina-sharp.
+    // macOS menu bar template glyphs: 22pt tall, rendered @2x. tray-icon caps
+    // the NSImage at 22pt, so a 44px-tall bitmap draws retina-sharp. The SVGs
+    // set a zoomed-out viewBox so the glyph matches native ~16pt items.
     let menubar = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/brand/macos/menubar");
-    for state in ["idle", "phone", "card", "error"] {
+    for state in [
+        "disconnected",
+        "connected",
+        "tap1",
+        "tap2",
+        "tap3",
+        "card",
+        "error",
+    ] {
         let svg = fs::read_to_string(menubar.join(format!("menubar-{state}.svg"))).unwrap();
-        fs::write(icons.join(format!("menubar-{state}.png")), render(&svg, 44)).unwrap();
+        fs::write(
+            icons.join(format!("menubar-{state}.png")),
+            render_at(&svg, 2.0),
+        )
+        .unwrap();
     }
     println!("icons written to {OUT}");
+}
+
+/// Renders at the SVG's own width/height times `scale` (non-square safe).
+fn render_at(svg: &str, scale: f32) -> Vec<u8> {
+    let tree = resvg::usvg::Tree::from_str(svg, &resvg::usvg::Options::default()).unwrap();
+    let size = tree.size();
+    let width = (size.width() * scale).round() as u32;
+    let height = (size.height() * scale).round() as u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height).unwrap();
+    let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    pixmap.encode_png().unwrap()
 }
 
 fn render(svg: &str, size: u32) -> Vec<u8> {

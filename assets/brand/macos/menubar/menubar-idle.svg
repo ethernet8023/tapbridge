@@ -1,4 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" width="22" height="22">
-<!-- menu bar template glyph: only alpha matters; macOS tints it -->
-<g transform="translate(0.1 0) rotate(-12 6.5 11)"><rect x="2.25" y="3.75" width="8.5" height="14.5" rx="2" fill="none" stroke="#000" stroke-width="1.5"/><rect x="4" y="6" width="3.5" height="2.75" rx="0.75" fill="#000"/></g><path d="M13.009 8.325A3.6 3.6 0 0 1 13.009 13.675" fill="none" stroke="#000" stroke-width="1.6" stroke-linecap="round" opacity="0.4"/><path d="M15.016 6.095A6.6 6.6 0 0 1 15.016 15.905" fill="none" stroke="#000" stroke-width="1.6" stroke-linecap="round" opacity="0.4"/><path d="M17.024 3.866A9.6 9.6 0 0 1 17.024 18.134" fill="none" stroke="#000" stroke-width="1.6" stroke-linecap="round" opacity="0.4"/>
-</svg>

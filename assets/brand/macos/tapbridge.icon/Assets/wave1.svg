@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- filled outline, not a stroke: Icon Composer seams stroked arcs -->
+  <path fill="#FFFFFF" d="M669.76 398.34 A158.0 158.0 0 0 1 669.76 625.66 A38.0 38.0 0 0 1 616.96 570.99 A82.0 82.0 0 0 0 616.96 453.01 A38.0 38.0 0 0 1 669.76 398.34 Z"/>
+</svg>
