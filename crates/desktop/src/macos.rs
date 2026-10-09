@@ -37,19 +37,34 @@ const WAKE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 /// transition. All calls must come from the gpui main thread (AppKit).
 #[cfg(target_os = "macos")]
 pub mod dock {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicU8, Ordering};
 
-    static SHOWING: AtomicBool = AtomicBool::new(false);
+    const UNKNOWN: u8 = 0;
+    const HIDDEN: u8 = 1;
+    const SHOWN: u8 = 2;
+
+    /// Starts UNKNOWN, not HIDDEN: gpui's `applicationDidFinishLaunching`
+    /// forces the Regular policy (a Dock icon) over `LSUIElement`, so the
+    /// first sync must always apply the policy, even with zero windows.
+    static STATE: AtomicU8 = AtomicU8::new(UNKNOWN);
 
     /// Reports how many visible windows are open; shows/hides the Dock icon
     /// on transitions. The anchor window is excluded (it is never visible).
     pub fn sync(visible_windows: usize) {
-        let should_show = visible_windows > 0;
-        let was_showing = SHOWING.swap(should_show, Ordering::SeqCst);
-        if should_show == was_showing {
+        let want = if visible_windows > 0 { SHOWN } else { HIDDEN };
+        if STATE.swap(want, Ordering::SeqCst) == want {
             return;
         }
-        set_policy(should_show);
+        set_policy(want == SHOWN);
+    }
+
+    /// Shows the Dock icon and makes tapbridge the active app, so the window
+    /// about to be opened or refreshed lands in front. Call before every
+    /// open/refresh: a tray click does not activate the app, and a window
+    /// already open behind other apps gets no policy transition to ride on.
+    pub fn bring_to_front() {
+        STATE.store(SHOWN, Ordering::SeqCst);
+        set_policy(true);
     }
 
     fn set_policy(visible: bool) {
@@ -65,10 +80,11 @@ pub mod dock {
             NSApplicationActivationPolicy::Accessory
         });
         if visible {
-            // An accessory app gaining a Dock icon is not made active by
-            // the policy change; bring tapbridge forward so the new window
-            // lands in front instead of behind the current app.
-            app.activate();
+            // Cooperative `activate()` is ignored when the request comes from
+            // a status-item menu (no app yields to us); the forcing variant
+            // is deprecated but is what actually raises a menu bar app.
+            #[allow(deprecated)]
+            app.activateIgnoringOtherApps(true);
         }
     }
 }

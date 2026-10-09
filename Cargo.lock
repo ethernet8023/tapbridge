@@ -7344,12 +7344,15 @@ dependencies = [
 name = "tapbridge-desktop"
 version = "0.1.0"
 dependencies = [
+ "core-foundation 0.10.1",
  "gpui",
  "iroh",
  "objc2",
  "objc2-app-kit",
+ "objc2-foundation",
  "png 0.18.1",
  "qrcode",
+ "system-configuration-sys",
  "tapbridge-core",
  "tapbridge-host",
  "tempfile",
@@ -7365,9 +7368,11 @@ name = "tapbridge-host"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "core-foundation 0.10.1",
  "iroh",
  "qrcode",
  "security-framework",
+ "security-framework-sys",
  "tapbridge-core",
  "tempfile",
  "tokio",

@@ -1,11 +1,13 @@
-//! gpui windows: the pairing QR window and the status window. Only these two
+//! gpui windows: the pairing QR window and the Settings window. Only these
 //! surfaces use gpui; the tray and all orchestration live beside them.
 #[cfg(windows)]
 use crate::passkeys;
 use gpui::{
-    Animation, AnimationExt, App, Bounds, Context, Task, Window, WindowBounds, WindowHandle,
-    WindowOptions, canvas, div, fill, point, prelude::*, px, rgb, size,
+    Animation, AnimationExt, App, Bounds, Context, FocusHandle, Task, Window, WindowBounds,
+    WindowHandle, WindowOptions, canvas, div, fill, point, prelude::*, px, rgb, size,
 };
+#[cfg(windows)]
+use gpui::{Entity, Pixels};
 use std::{
     rc::Rc,
     time::{Duration, Instant},
@@ -268,7 +270,9 @@ pub fn open_pairing_window(
             move |_window, cx| cx.new(|cx| PairingView::new(&invitation, cx)),
         )
         .expect("pairing window");
-    window.update(cx, |_, window, _| window.activate_window()).ok();
+    window
+        .update(cx, |_, window, _| window.activate_window())
+        .ok();
     window
 }
 
@@ -535,7 +539,6 @@ fn ease_out_back(t: f32) -> f32 {
     1.0 + C3 * (t - 1.0).powi(3) + C1 * (t - 1.0).powi(2)
 }
 
-#[cfg(windows)]
 fn checkbox(checked: bool, enabled: bool) -> impl IntoElement {
     let color = if enabled { ACCENT } else { 0x5A5070 };
     div()
@@ -565,7 +568,6 @@ fn checkbox(checked: bool, enabled: bool) -> impl IntoElement {
         })
 }
 
-#[cfg(windows)]
 fn option_row(
     id: &'static str,
     checked: bool,
@@ -647,14 +649,7 @@ impl Render for PasskeyView {
             .flex()
             .flex_col()
             .gap(px(10.0))
-            .p(px(22.0))
-            .size_full()
-            .child(
-                div()
-                    .text_size(px(20.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child("Passkey options"),
-            )
+            .child(section_title("Passkeys"))
             .child(
                 div()
                     .text_size(px(13.0))
@@ -708,11 +703,9 @@ impl Render for PasskeyView {
                     row.on_click(|_, _, _| passkeys::open_windows_passkey_settings())
                 }),
             );
+        // Embedded in Settings: the dialog overlay covers this section only.
         div()
             .relative()
-            .size_full()
-            .bg(rgb(PANEL))
-            .text_color(rgb(TEXT))
             .child(column)
             .when_some(self.dialog.as_ref(), |root, dialog| {
                 root.child(self.render_dialog(dialog, cx))
@@ -720,98 +713,331 @@ impl Render for PasskeyView {
     }
 }
 
-#[cfg(windows)]
-pub fn open_passkey_window(
-    existing: Option<WindowHandle<PasskeyView>>,
-    cx: &mut App,
-) -> WindowHandle<PasskeyView> {
-    if let Some(handle) = existing {
-        let refreshed = handle.update(cx, |view, window, cx| {
-            if view.dialog.is_none() {
-                view.options = passkeys::read();
-            }
-            window.activate_window();
-            cx.notify();
-        });
-        if refreshed.is_ok() {
-            return handle;
+/// What the Settings window asks the shell to do. Runs deferred, after the
+/// view's own update, so the shell may refresh or open windows freely.
+pub enum SettingsAction {
+    Pair,
+    Forget,
+    SetAutostart(bool),
+}
+
+/// The overall state shown at the top of Settings (mirrors the tray icon).
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum Health {
+    Good,
+    #[default]
+    Idle,
+    Problem,
+}
+
+/// Everything Settings displays; rebuilt by the shell every tick while the
+/// window is open and pushed in only when it changed.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct SettingsSnapshot {
+    pub summary: String,
+    pub health: Health,
+    /// Display name of the paired phone.
+    pub phone: Option<String>,
+    pub phone_connected: bool,
+    pub autostart: bool,
+    /// Diagnostic lines (host, reader, relay...).
+    pub details: Vec<String>,
+}
+
+type OnSettingsAction = Rc<dyn Fn(SettingsAction, &mut App)>;
+
+pub struct SettingsView {
+    snapshot: SettingsSnapshot,
+    on_action: OnSettingsAction,
+    /// "Forget phone" asks once more before revoking the pairing.
+    confirm_forget: bool,
+    focus: FocusHandle,
+    #[cfg(windows)]
+    passkeys: Entity<PasskeyView>,
+}
+
+impl SettingsView {
+    fn new(
+        snapshot: SettingsSnapshot,
+        on_action: OnSettingsAction,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            snapshot,
+            on_action,
+            confirm_forget: false,
+            focus: cx.focus_handle(),
+            #[cfg(windows)]
+            passkeys: cx.new(|_| PasskeyView::new()),
         }
     }
-    let bounds = Bounds::centered(None, size(px(520.0), px(540.0)), cx);
-    cx.open_window(
-        WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(gpui::TitlebarOptions {
-                title: Some("Passkey options".into()),
-                ..Default::default()
-            }),
-            is_resizable: false,
-            ..Default::default()
-        },
-        |_, cx| cx.new(|_| PasskeyView::new()),
-    )
-    .expect("passkey options window")
-}
 
-pub struct StatusView {
-    lines: Vec<String>,
-}
+    pub fn set_snapshot(&mut self, snapshot: SettingsSnapshot, cx: &mut Context<Self>) {
+        if self.snapshot != snapshot {
+            if snapshot.phone.is_none() {
+                self.confirm_forget = false;
+            }
+            self.snapshot = snapshot;
+            cx.notify();
+        }
+    }
 
-impl StatusView {
-    pub fn new(lines: Vec<String>) -> Self {
-        Self { lines }
+    fn act(&mut self, action: SettingsAction, cx: &mut Context<Self>) {
+        let on_action = self.on_action.clone();
+        cx.defer(move |cx| on_action(action, cx));
     }
 }
 
-impl Render for StatusView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let mut column = div()
+fn section_title(title: &str) -> impl IntoElement {
+    div()
+        .text_size(px(12.0))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(rgb(ACCENT_SOFT))
+        .child(title.to_uppercase())
+}
+
+fn button(
+    id: &'static str,
+    label: impl Into<gpui::SharedString>,
+    color: u32,
+    hover: u32,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .px(px(14.0))
+        .py(px(7.0))
+        .rounded(px(9.0))
+        .bg(rgb(color))
+        .cursor_pointer()
+        .hover(move |style| style.bg(rgb(hover)))
+        .text_size(px(13.0))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .child(label.into())
+}
+
+impl Render for SettingsView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let snapshot = &self.snapshot;
+        let dot = match snapshot.health {
+            Health::Good => GOOD,
+            Health::Idle => ACCENT_SOFT,
+            Health::Problem => WARN,
+        };
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.0))
+            .child(div().size(px(10.0)).flex_none().rounded_full().bg(rgb(dot)))
+            .child(
+                div()
+                    .text_size(px(17.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(snapshot.summary.clone()),
+            );
+
+        let (phone_title, phone_detail) = match &snapshot.phone {
+            Some(name) if snapshot.phone_connected => {
+                (name.clone(), "Paired, connected now".to_owned())
+            }
+            Some(name) => (
+                name.clone(),
+                "Paired. Connects when you need your key.".to_owned(),
+            ),
+            None => (
+                "No phone paired".to_owned(),
+                "Pair your Android phone to use it as this computer's key reader.".to_owned(),
+            ),
+        };
+        let phone_button = if snapshot.phone.is_some() {
+            let label = if self.confirm_forget {
+                "Click again to forget"
+            } else {
+                "Forget phone"
+            };
+            button(
+                "forget",
+                label,
+                if self.confirm_forget {
+                    0x8A2E3B
+                } else {
+                    0x2C2340
+                },
+                0x9C3646,
+            )
+            .on_click(cx.listener(|view, _: &gpui::ClickEvent, _, cx| {
+                if view.confirm_forget {
+                    view.confirm_forget = false;
+                    view.act(SettingsAction::Forget, cx);
+                } else {
+                    view.confirm_forget = true;
+                }
+                cx.notify();
+            }))
+        } else {
+            button("pair", "Pair phone\u{2026}", ACCENT, 0x6A4BEB).on_click(
+                cx.listener(|view, _: &gpui::ClickEvent, _, cx| view.act(SettingsAction::Pair, cx)),
+            )
+        };
+        let phone = div()
             .flex()
             .flex_col()
-            .size_full()
-            .gap(px(6.0))
-            .p(px(18.0))
-            .bg(rgb(PANEL_2))
-            .text_color(rgb(TEXT))
-            .text_size(px(13.0));
-        for line in &self.lines {
-            column = column.child(div().child(line.clone()));
+            .gap(px(10.0))
+            .child(section_title("Phone"))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(14.0))
+                    .p(px(14.0))
+                    .rounded(px(12.0))
+                    .bg(rgb(PANEL_2))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .text_size(px(15.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .child(phone_title),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .text_color(rgb(ACCENT_SOFT))
+                                    .child(phone_detail),
+                            ),
+                    )
+                    .child(phone_button),
+            );
+
+        let login_detail = if cfg!(target_os = "macos") {
+            "Open tapbridge in the menu bar when you log in."
+        } else {
+            "Open tapbridge in the notification area when you sign in."
+        };
+        let autostart = snapshot.autostart;
+        let general = div()
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .child(section_title("General"))
+            .child(
+                option_row(
+                    "opt-login",
+                    autostart,
+                    true,
+                    "Start at login",
+                    login_detail.to_owned(),
+                )
+                .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
+                    // Optimistic; the shell's next snapshot has the real state.
+                    view.snapshot.autostart = !autostart;
+                    view.act(SettingsAction::SetAutostart(!autostart), cx);
+                    cx.notify();
+                })),
+            );
+
+        let mut details = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(section_title("Details"))
+            .child(div().h(px(4.0)));
+        for line in &snapshot.details {
+            details = details.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(0xA79FBA))
+                    .child(line.clone()),
+            );
         }
-        div().size_full().bg(rgb(PANEL_2)).child(column)
+
+        let column = div()
+            .flex()
+            .flex_col()
+            .gap(px(22.0))
+            .p(px(22.0))
+            .child(header)
+            .child(phone)
+            .child(general);
+        #[cfg(windows)]
+        let column = column.child(self.passkeys.clone());
+        let column = column.child(details);
+        div()
+            .id("settings")
+            .track_focus(&self.focus)
+            .size_full()
+            .overflow_y_scroll()
+            .bg(rgb(PANEL))
+            .text_color(rgb(TEXT))
+            .child(column)
     }
 }
 
-pub fn open_status_window(
-    lines: Vec<String>,
-    existing: Option<WindowHandle<StatusView>>,
+/// Opens Settings, or refreshes and raises it while it is already open. A
+/// handle to a window the user closed fails to update, so a new one opens.
+pub fn open_settings_window(
+    snapshot: SettingsSnapshot,
+    existing: Option<WindowHandle<SettingsView>>,
+    on_action: impl Fn(SettingsAction, &mut App) + 'static,
     cx: &mut App,
-) -> WindowHandle<StatusView> {
+) -> WindowHandle<SettingsView> {
     if let Some(handle) = existing {
-        let fresh = lines.clone();
+        let fresh = snapshot.clone();
         let refreshed = handle.update(cx, |view, window, cx| {
-            view.lines = fresh;
+            view.set_snapshot(fresh, cx);
+            #[cfg(windows)]
+            view.passkeys.update(cx, |passkeys, cx| {
+                if passkeys.dialog.is_none() {
+                    passkeys.options = passkeys::read();
+                    cx.notify();
+                }
+            });
             window.activate_window();
-            cx.notify();
         });
         if refreshed.is_ok() {
             return handle;
         }
     }
-    let bounds = Bounds::centered(None, size(px(420.0), px(260.0)), cx);
+    let on_action: OnSettingsAction = Rc::new(on_action);
+    let height = if cfg!(windows) { 720.0 } else { 520.0 };
+    let bounds = Bounds::centered(None, size(px(480.0), px(height)), cx);
     let window = cx
         .open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("tapbridge".into()),
+                    title: Some(
+                        if cfg!(target_os = "macos") {
+                            "tapbridge Preferences"
+                        } else {
+                            "tapbridge Settings"
+                        }
+                        .into(),
+                    ),
                     ..Default::default()
                 }),
                 ..Default::default()
             },
-            move |_window, cx| cx.new(|_| StatusView::new(lines)),
+            move |window, cx| {
+                cx.new(|cx| {
+                    let view = SettingsView::new(snapshot, on_action, cx);
+                    view.focus.focus(window);
+                    view
+                })
+            },
         )
-        .expect("status window");
-    window.update(cx, |_, window, _| window.activate_window()).ok();
+        .expect("settings window");
+    window
+        .update(cx, |_, window, _| window.activate_window())
+        .ok();
     window
 }
 

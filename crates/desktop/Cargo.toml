@@ -35,8 +35,14 @@ iroh.workspace = true
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication",
+    "NSImage",
+    "NSMenu",
+    "NSMenuItem",
     "NSResponder",
 ] }
+objc2-foundation = { version = "0.3", features = ["NSProcessInfo", "NSString"] }
+system-configuration-sys = "0.6"
+core-foundation = "0.10"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

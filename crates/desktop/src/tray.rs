@@ -1,125 +1,152 @@
 //! Tray icon + menu via tray-icon. The tray is created on the gpui main
 //! thread so its hidden window is pumped by gpui's message loop.
+//!
+//! The menu stays small: a status line, Settings… and Quit. Everything
+//! configurable lives in the Settings window.
 use crate::assets;
 use tray_icon::{
     TrayIcon, TrayIconBuilder,
-    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+    menu::{
+        IconMenuItem, Menu, MenuEvent, MenuItem, NativeIcon, PredefinedMenuItem,
+        accelerator::{Accelerator, Code, Modifiers},
+    },
 };
 
 pub enum MenuAction {
-    RequestTap,
+    /// The status line, clicked while it offers pairing ("Pair a phone").
     Pair,
-    Forget,
-    OpenStatus,
-    PasskeyOptions,
-    ToggleAutostart(bool),
+    OpenSettings,
     Quit,
 }
 
 /// Tray visual states, in priority order.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrayState {
     Error,
+    /// A card is on the phone.
     Card,
-    Phone,
-    Idle,
+    /// A tap was requested and no card is present yet (animated on macOS).
+    Waiting,
+    /// The phone session is live.
+    Connected,
+    /// No phone connected (paired or not).
+    Disconnected,
     MissingUsbip,
 }
+
+/// Menu titles. macOS matches the item by title to swap in an SF Symbol.
+/// macOS keeps the classic "Preferences…" wording; Windows says "Settings…".
+const SETTINGS_TITLE: &str = if cfg!(target_os = "macos") {
+    "Preferences\u{2026}"
+} else {
+    "Settings\u{2026}"
+};
+const QUIT_TITLE: &str = "Quit tapbridge";
+
+/// ⌘ on macOS, Ctrl elsewhere: the platform's command modifier.
+const COMMAND: Modifiers = if cfg!(target_os = "macos") {
+    Modifiers::META
+} else {
+    Modifiers::CONTROL
+};
 
 pub struct Tray {
     tray: TrayIcon,
     status_item: MenuItem,
-    autostart_item: CheckMenuItem,
     icons: assets::Icons,
+    /// What is drawn now: icon swaps (and the template flag) only happen on
+    /// a change, so the animation tick costs nothing between frames.
+    shown: Option<(TrayState, usize)>,
+    /// Status line and tooltip as last set.
+    text: (String, String),
+    /// Whether the status line is a clickable "pair" action right now.
+    pair_action: bool,
 }
 
 impl Tray {
     pub fn new(icons: assets::Icons) -> Result<Self, String> {
         let status_item = MenuItem::with_id("status", "tapbridge starting", false, None);
-        let statuswin_item = MenuItem::with_id("statuswin", "Open status", true, None);
-        let request_item = MenuItem::with_id("request", "Request tap", true, None);
-        let pair_item = MenuItem::with_id("pair", "Pair phone...", true, None);
-        let forget_item = MenuItem::with_id("forget", "Forget phone", true, None);
-        let passkeys_item = MenuItem::with_id("passkeys", "Passkey options...", true, None);
-        let autostart_item =
-            CheckMenuItem::with_id("autostart", "Start at login", true, false, None);
-        let quit_item = MenuItem::with_id("quit", "Quit", true, None);
-        let separator = PredefinedMenuItem::separator();
-        let separator2 = PredefinedMenuItem::separator();
-        let separator3 = PredefinedMenuItem::separator();
+        // macOS gets an SF Symbol gear below; the native icon is the Windows
+        // Settings stock icon (and the AppKit fallback).
+        let settings_item = IconMenuItem::with_id_and_native_icon(
+            "settings",
+            SETTINGS_TITLE,
+            true,
+            Some(NativeIcon::PreferencesGeneral),
+            Some(Accelerator::new(COMMAND, Code::Comma)),
+        );
+        let quit_item = MenuItem::with_id(
+            "quit",
+            QUIT_TITLE,
+            true,
+            Some(Accelerator::new(COMMAND, Code::KeyQ)),
+        );
         let menu = Menu::new();
-        if cfg!(windows) {
-            menu.append_items(&[
-                &status_item,
-                &statuswin_item,
-                &separator,
-                &request_item,
-                &pair_item,
-                &forget_item,
-                &passkeys_item,
-                &separator2,
-                &autostart_item,
-                &separator3,
-                &quit_item,
-            ])
-            .map_err(|e| e.to_string())?;
-        } else {
-            // macOS: WebAuthn/passkeys are Track B, not this reader.
-            menu.append_items(&[
-                &status_item,
-                &statuswin_item,
-                &separator,
-                &request_item,
-                &pair_item,
-                &forget_item,
-                &separator2,
-                &autostart_item,
-                &separator3,
-                &quit_item,
-            ])
-            .map_err(|e| e.to_string())?;
-        }
+        menu.append_items(&[
+            &status_item,
+            &PredefinedMenuItem::separator(),
+            &settings_item,
+            &PredefinedMenuItem::separator(),
+            &quit_item,
+        ])
+        .map_err(|e| e.to_string())?;
+        #[cfg(target_os = "macos")]
+        use_sf_symbol(&menu, SETTINGS_TITLE, "gearshape");
         let builder = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("tapbridge");
         let builder = if assets::Icons::TEMPLATE {
-            builder.with_icon_templated(icons.idle.clone())
+            builder.with_icon_templated(icons.for_state(TrayState::Disconnected, 0))
         } else {
-            builder.with_icon(icons.idle.clone())
+            builder.with_icon(icons.for_state(TrayState::Disconnected, 0))
         };
         let tray = builder.build().map_err(|e| e.to_string())?;
         Ok(Self {
             tray,
             status_item,
-            autostart_item,
             icons,
+            shown: Some((TrayState::Disconnected, 0)),
+            text: ("tapbridge starting".to_owned(), "tapbridge".to_owned()),
+            pair_action: false,
         })
     }
 
-    pub fn set_status(&mut self, text: &str, state: TrayState) {
-        self.status_item.set_text(text);
-        let icon = match state {
-            TrayState::Error | TrayState::MissingUsbip => self.icons.error.clone(),
-            TrayState::Card => self.icons.card.clone(),
-            TrayState::Phone => self.icons.phone.clone(),
-            TrayState::Idle => self.icons.idle.clone(),
-        };
-        let _ = if assets::Icons::TEMPLATE {
-            self.tray.set_icon_templated(Some(icon))
-        } else {
-            self.tray.set_icon(Some(icon))
-        };
-        if state == TrayState::MissingUsbip {
-            let _ = self
-                .tray
-                .set_tooltip(Some("Install USB/IP driver".to_owned()));
-        } else {
-            let _ = self.tray.set_tooltip(Some(text.to_owned()));
+    /// Shows `text` and the icon for `state`; `frame` is the waiting-for-tap
+    /// animation frame (ignored for every other state). With `pair_action`
+    /// the status line is enabled and clicking it starts pairing; otherwise
+    /// it is a plain, disabled label.
+    pub fn set_status(&mut self, text: &str, state: TrayState, frame: usize, pair_action: bool) {
+        if self.pair_action != pair_action {
+            self.status_item.set_enabled(pair_action);
+            self.pair_action = pair_action;
         }
-    }
-
-    pub fn set_autostart_checked(&mut self, checked: bool) {
-        self.autostart_item.set_checked(checked);
+        let frame = if state == TrayState::Waiting {
+            frame
+        } else {
+            0
+        };
+        if self.shown != Some((state, frame)) {
+            self.shown = Some((state, frame));
+            let icon = self.icons.for_state(state, frame);
+            let _ = if assets::Icons::TEMPLATE {
+                self.tray.set_icon_templated(Some(icon))
+            } else {
+                self.tray.set_icon(Some(icon))
+            };
+        }
+        let tooltip = if state == TrayState::MissingUsbip {
+            "Install USB/IP driver"
+        } else {
+            text
+        };
+        if self.text.0 != text {
+            self.status_item.set_text(text);
+            self.text.0 = text.to_owned();
+        }
+        if self.text.1 != tooltip {
+            let _ = self.tray.set_tooltip(Some(tooltip.to_owned()));
+            self.text.1 = tooltip.to_owned();
+        }
     }
 
     /// Drains pending menu actions (call from the UI tick).
@@ -127,19 +154,33 @@ impl Tray {
         let receiver = MenuEvent::receiver();
         let mut actions = Vec::new();
         while let Ok(event) = receiver.try_recv() {
-            let id = event.id().0.clone();
-            actions.push(match id.as_str() {
-                "request" => MenuAction::RequestTap,
-                "pair" => MenuAction::Pair,
-                "forget" => MenuAction::Forget,
-                "statuswin" => MenuAction::OpenStatus,
-                "passkeys" => MenuAction::PasskeyOptions,
-                // The check item flips itself on click; its new state is the request.
-                "autostart" => MenuAction::ToggleAutostart(self.autostart_item.is_checked()),
+            actions.push(match event.id().0.as_str() {
+                "status" if self.pair_action => MenuAction::Pair,
+                "settings" => MenuAction::OpenSettings,
                 "quit" => MenuAction::Quit,
                 _ => continue,
             });
         }
         actions
+    }
+}
+
+/// Replaces a menu item's image with an SF Symbol (template, so it follows
+/// the menu's light/dark appearance). muda only knows `NSImageName`s, whose
+/// gear is the old full-colour System Preferences icon.
+#[cfg(target_os = "macos")]
+fn use_sf_symbol(menu: &Menu, title: &str, symbol: &str) {
+    use objc2_app_kit::{NSImage, NSMenu};
+    use objc2_foundation::NSString;
+    use tray_icon::menu::ContextMenu;
+    // SAFETY: the NSMenu lives as long as `menu` (and the tray retains it);
+    // the tray is built on the main thread, where AppKit calls belong.
+    let ns_menu = unsafe { &*(menu.ns_menu() as *const NSMenu) };
+    if let Some(item) = ns_menu.itemWithTitle(&NSString::from_str(title)) {
+        let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            &NSString::from_str(symbol),
+            None,
+        );
+        item.setImage(image.as_deref());
     }
 }

@@ -4,11 +4,22 @@
 //! tints them for light/dark menu bars and the highlighted state); Windows
 //! keeps the full-colour brand icon with a state badge.
 
+use crate::tray::TrayState;
+
 pub struct Icons {
-    pub idle: tray_icon::Icon,
-    pub phone: tray_icon::Icon,
-    pub card: tray_icon::Icon,
-    pub error: tray_icon::Icon,
+    #[cfg(target_os = "macos")]
+    disconnected: tray_icon::Icon,
+    #[cfg(target_os = "macos")]
+    connected: tray_icon::Icon,
+    /// Waiting for a tap: one wave filled at a time, inner to outer.
+    #[cfg(target_os = "macos")]
+    tap: [tray_icon::Icon; 3],
+    #[cfg(not(target_os = "macos"))]
+    idle: tray_icon::Icon,
+    #[cfg(not(target_os = "macos"))]
+    phone: tray_icon::Icon,
+    card: tray_icon::Icon,
+    error: tray_icon::Icon,
 }
 
 fn load(embedded: &[u8]) -> tray_icon::Icon {
@@ -27,8 +38,13 @@ impl Icons {
     #[cfg(target_os = "macos")]
     pub fn load() -> Self {
         Self {
-            idle: load(include_bytes!("../assets/icons/menubar-idle.png")),
-            phone: load(include_bytes!("../assets/icons/menubar-phone.png")),
+            disconnected: load(include_bytes!("../assets/icons/menubar-disconnected.png")),
+            connected: load(include_bytes!("../assets/icons/menubar-connected.png")),
+            tap: [
+                load(include_bytes!("../assets/icons/menubar-tap1.png")),
+                load(include_bytes!("../assets/icons/menubar-tap2.png")),
+                load(include_bytes!("../assets/icons/menubar-tap3.png")),
+            ],
             card: load(include_bytes!("../assets/icons/menubar-card.png")),
             error: load(include_bytes!("../assets/icons/menubar-error.png")),
         }
@@ -41,6 +57,28 @@ impl Icons {
             phone: load(include_bytes!("../assets/icons/tray-phone.png")),
             card: load(include_bytes!("../assets/icons/tray-card.png")),
             error: load(include_bytes!("../assets/icons/tray-error.png")),
+        }
+    }
+
+    /// The icon for `state`; `frame` picks the waiting-for-tap animation
+    /// frame (macOS only; Windows has no animation).
+    pub fn for_state(&self, state: TrayState, frame: usize) -> tray_icon::Icon {
+        match state {
+            TrayState::Error | TrayState::MissingUsbip => self.error.clone(),
+            TrayState::Card => self.card.clone(),
+            #[cfg(target_os = "macos")]
+            TrayState::Disconnected => self.disconnected.clone(),
+            #[cfg(target_os = "macos")]
+            TrayState::Connected => self.connected.clone(),
+            #[cfg(target_os = "macos")]
+            TrayState::Waiting => self.tap[frame % self.tap.len()].clone(),
+            #[cfg(not(target_os = "macos"))]
+            TrayState::Disconnected => {
+                let _ = frame;
+                self.idle.clone()
+            }
+            #[cfg(not(target_os = "macos"))]
+            TrayState::Connected | TrayState::Waiting => self.phone.clone(),
         }
     }
 }

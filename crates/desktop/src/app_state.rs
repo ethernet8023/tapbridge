@@ -12,12 +12,25 @@ use crate::{
 };
 #[cfg(windows)]
 use crate::{prompt_watch, single, usbip};
-use gpui::{App, Application, AsyncApp, BorrowAppContext, Global, WindowHandle};
-use std::{path::PathBuf, sync::mpsc, time::Duration};
+use gpui::{App, Application, AsyncApp, BorrowAppContext, Global, KeyBinding, WindowHandle};
+use std::{
+    path::PathBuf,
+    sync::mpsc,
+    time::{Duration, Instant},
+};
 use tapbridge_host::service::{self, ServiceHandle, TapOutcome};
 
 const USBIP_ADDR: &str = "127.0.0.1:3240";
+
+// App-wide commands: bound to ⌘, / ⌘Q (Ctrl on Windows) and, on macOS, the
+// app menu that owns those shortcuts while a tapbridge window is focused.
+gpui::actions!(tapbridge, [OpenSettings, Quit]);
 const TICK: Duration = Duration::from_millis(100);
+/// How long the tray shows "waiting for a tap" after a wake: the phone keeps
+/// its tap gate open this long (DESIGN.md, wake step 4).
+const TAP_WAIT: Duration = Duration::from_secs(120);
+/// One wave of the waiting-for-tap animation is lit this long.
+const TAP_FRAME: Duration = Duration::from_millis(400);
 
 /// macOS placeholder for the Windows single-instance guard: the LaunchAgent
 /// RunAtLoad path plus manual launches may still race; host.lock is the real
@@ -61,11 +74,16 @@ struct Shell {
     #[cfg(windows)]
     usbip: Usbip,
     pairing: Option<WindowHandle<ui::PairingView>>,
-    status: Option<WindowHandle<ui::StatusView>>,
-    #[cfg(windows)]
-    passkey_options: Option<WindowHandle<ui::PasskeyView>>,
+    settings: Option<WindowHandle<ui::SettingsView>>,
+    /// Start-at-login state, cached: Settings re-renders from it every tick.
+    autostart: bool,
     /// Shown in the tray until the next state change (e.g. relay problems).
     notice: Option<String>,
+    /// Why the host service failed to start, shown in Settings → Details.
+    service_error: Option<String>,
+    /// Set when a tap was requested (wake sent or phone reminded); cleared by
+    /// a card, an error or [`TAP_WAIT`]. Drives the animated tray icon.
+    waiting_since: Option<Instant>,
     // Held for their Drop / process-lifetime handles.
     _anchor: WindowHandle<ui::Anchor>,
     #[cfg(windows)]
@@ -151,6 +169,10 @@ fn shell_setup(
         .inspect_err(|error| logging::log(&format!("tray unavailable: {error}")))
         .ok();
     let anchor = ui::open_anchor_window(cx);
+    // gpui forces a Dock icon at launch; drop it now rather than on the first
+    // tick so it never flashes up.
+    #[cfg(target_os = "macos")]
+    macos::dock::sync(0);
     cx.set_global(Shell {
         _anchor: anchor,
         events: events.clone(),
@@ -165,21 +187,17 @@ fn shell_setup(
             Usbip::Missing
         },
         pairing: None,
-        status: None,
-        #[cfg(windows)]
-        passkey_options: None,
+        settings: None,
+        autostart: autostart::is_enabled(),
         notice: None,
+        service_error: None,
+        waiting_since: None,
         #[cfg(windows)]
         watcher,
         _instance: Shell::instance_guard(instance),
     });
-    cx.update_global::<Shell, _>(|shell, _| {
-        let enabled = autostart::is_enabled();
-        if let Some(tray) = shell.tray.as_mut() {
-            tray.set_autostart_checked(enabled);
-        }
-        shell.refresh_tray();
-    });
+    cx.update_global::<Shell, _>(|shell, _| shell.refresh_tray());
+    install_commands(cx);
     cx.spawn(async move |cx: &mut AsyncApp| {
         loop {
             cx.background_executor().timer(TICK).await;
@@ -299,18 +317,26 @@ fn tick(inbox: &mpsc::Receiver<UiEvent>, cx: &mut App) {
             None => cx.update_global::<Shell, _>(|shell, _| shell.pairing = None),
         }
     }
-    // Prune a closed status window (a failed update means it is gone).
-    if let Some(window) = cx.global::<Shell>().status
-        && window.update(cx, |_, _, _| ()).is_err()
-    {
-        cx.update_global::<Shell, _>(|shell, _| shell.status = None);
+    // Animate (and expire) the waiting-for-tap icon.
+    if cx.global::<Shell>().waiting_since.is_some() {
+        cx.update_global::<Shell, _>(|shell, _| shell.refresh_tray());
+    }
+    // Keep an open Settings window live; prune it once closed (a failed
+    // update means the window is gone).
+    if let Some(window) = cx.global::<Shell>().settings {
+        let snapshot = cx.global::<Shell>().settings_snapshot();
+        if window
+            .update(cx, |view, _, cx| view.set_snapshot(snapshot, cx))
+            .is_err()
+        {
+            cx.update_global::<Shell, _>(|shell, _| shell.settings = None);
+        }
     }
     // macOS: show the Dock icon only while a visible window is open.
     #[cfg(target_os = "macos")]
     {
         let shell = cx.global::<Shell>();
-        let visible =
-            shell.pairing.is_some() as usize + shell.status.is_some() as usize;
+        let visible = shell.pairing.is_some() as usize + shell.settings.is_some() as usize;
         macos::dock::sync(visible);
     }
     let actions = cx
@@ -345,6 +371,7 @@ fn handle_event(event: UiEvent, cx: &mut App) {
         UiEvent::ServiceFailed(error) => {
             logging::log(&format!("service failed: {error}"));
             cx.update_global::<Shell, _>(|shell, _| {
+                shell.service_error = Some(error);
                 shell.notice = Some("tapbridge failed to start".into());
                 shell.refresh_tray();
             });
@@ -377,7 +404,7 @@ fn handle_event(event: UiEvent, cx: &mut App) {
         #[cfg(windows)]
         UiEvent::Open(single::Request::Pairing) => open_pairing(cx),
         #[cfg(windows)]
-        UiEvent::Open(single::Request::PasskeyOptions) => open_passkey_options(cx),
+        UiEvent::Open(single::Request::PasskeyOptions) => open_settings(cx),
         UiEvent::Woke(result) => {
             let notice = match result {
                 wake::WakeResult::Sent => {
@@ -394,6 +421,9 @@ fn handle_event(event: UiEvent, cx: &mut App) {
                 }
             };
             cx.update_global::<Shell, _>(|shell, _| {
+                if notice.is_some() {
+                    shell.waiting_since = None;
+                }
                 shell.notice = notice;
                 shell.refresh_tray();
             });
@@ -403,9 +433,49 @@ fn handle_event(event: UiEvent, cx: &mut App) {
 
 fn handle_action(action: MenuAction, cx: &mut App) {
     match action {
-        MenuAction::RequestTap => request_tap(cx),
         MenuAction::Pair => open_pairing(cx),
-        MenuAction::Forget => {
+        MenuAction::OpenSettings => open_settings(cx),
+        MenuAction::Quit => quit(cx),
+    }
+}
+
+/// Registers the app-wide commands, their shortcuts and (macOS) the app menu.
+fn install_commands(cx: &mut App) {
+    cx.on_action(|_: &OpenSettings, cx| open_settings(cx));
+    cx.on_action(|_: &Quit, cx| quit(cx));
+    // "secondary" is ⌘ on macOS and Ctrl elsewhere.
+    cx.bind_keys([
+        KeyBinding::new("secondary-,", OpenSettings, None),
+        KeyBinding::new("secondary-q", Quit, None),
+    ]);
+    #[cfg(target_os = "macos")]
+    cx.set_menus(vec![gpui::Menu {
+        name: "tapbridge".into(),
+        items: vec![
+            gpui::MenuItem::action("Preferences\u{2026}", OpenSettings),
+            gpui::MenuItem::separator(),
+            gpui::MenuItem::os_submenu("Services", gpui::SystemMenuType::Services),
+            gpui::MenuItem::separator(),
+            gpui::MenuItem::action("Quit tapbridge", Quit),
+        ],
+    }]);
+}
+
+fn open_settings(cx: &mut App) {
+    let (snapshot, existing) = {
+        let shell = cx.global::<Shell>();
+        (shell.settings_snapshot(), shell.settings)
+    };
+    #[cfg(target_os = "macos")]
+    macos::dock::bring_to_front();
+    let window = ui::open_settings_window(snapshot, existing, settings_action, cx);
+    cx.update_global::<Shell, _>(|shell, _| shell.settings = Some(window));
+}
+
+fn settings_action(action: ui::SettingsAction, cx: &mut App) {
+    match action {
+        ui::SettingsAction::Pair => open_pairing(cx),
+        ui::SettingsAction::Forget => {
             logging::log("forget: revoking paired phone");
             cx.update_global::<Shell, _>(|shell, _| {
                 if let Some(service) = shell.service.as_ref() {
@@ -414,32 +484,17 @@ fn handle_action(action: MenuAction, cx: &mut App) {
                 shell.refresh_tray();
             });
         }
-        MenuAction::OpenStatus => {
-            let (lines, existing) = {
-                let shell = cx.global::<Shell>();
-                (shell.status_lines(), shell.status)
-            };
-            let window = ui::open_status_window(lines, existing, cx);
-            cx.update_global::<Shell, _>(|shell, _| shell.status = Some(window));
-        }
-        #[cfg(windows)]
-        MenuAction::PasskeyOptions => open_passkey_options(cx),
-        #[cfg(not(windows))]
-        MenuAction::PasskeyOptions => {} // hidden in the macOS tray menu
-        MenuAction::ToggleAutostart(enabled) => {
+        ui::SettingsAction::SetAutostart(enabled) => {
             let result = autostart::set_enabled(enabled);
             logging::log(&format!("start at login -> {enabled}: {result:?}"));
-            let actual = autostart::is_enabled();
-            cx.update_global::<Shell, _>(|shell, _| {
-                if let Some(tray) = shell.tray.as_mut() {
-                    tray.set_autostart_checked(actual);
-                }
-            });
+            cx.update_global::<Shell, _>(|shell, _| shell.autostart = autostart::is_enabled());
         }
-        MenuAction::Quit => quit(cx),
     }
 }
 
+/// Asks the phone for a tap. Automatic only: Windows runs it when a WebAuthn
+/// ceremony starts, macOS when PC/SC wants the card and no phone is
+/// connected.
 fn request_tap(cx: &mut App) {
     cx.update_global::<Shell, _>(|shell, _| {
         let Some(service) = shell.service.as_ref() else {
@@ -449,6 +504,7 @@ fn request_tap(cx: &mut App) {
         let notice = match service.request_tap() {
             TapOutcome::ReadCardSent => {
                 logging::log("wake: tap reminder sent to the connected phone");
+                shell.waiting_since = Some(Instant::now());
                 None
             }
             TapOutcome::Wake { token, hint } => match wake::relay_url(&shell.state_dir) {
@@ -459,6 +515,7 @@ fn request_tap(cx: &mut App) {
                         let result = wake::send_wake(&relay, &token, &host, &hint.to_string());
                         let _ = events.send(UiEvent::Woke(result));
                     });
+                    shell.waiting_since = Some(Instant::now());
                     None
                 }
                 None => {
@@ -480,13 +537,6 @@ fn request_tap(cx: &mut App) {
     });
 }
 
-#[cfg(windows)]
-fn open_passkey_options(cx: &mut App) {
-    let existing = cx.global::<Shell>().passkey_options;
-    let window = ui::open_passkey_window(existing, cx);
-    cx.update_global::<Shell, _>(|shell| shell.passkey_options = Some(window));
-}
-
 fn open_pairing(cx: &mut App) {
     let (invitation, existing) = {
         let shell = cx.global::<Shell>();
@@ -503,6 +553,8 @@ fn open_pairing(cx: &mut App) {
         return;
     };
     logging::log("pairing: invitation minted");
+    #[cfg(target_os = "macos")]
+    macos::dock::bring_to_front();
     let window = ui::open_pairing_window(&invitation.to_string(), existing, cx);
     cx.update_global::<Shell, _>(|shell, _| shell.pairing = Some(window));
 }
@@ -525,6 +577,27 @@ fn quit(cx: &mut App) {
 impl Shell {
     fn refresh_tray(&mut self) {
         let status = self.service.as_ref().map(ServiceHandle::status);
+        if let Some(since) = self.waiting_since
+            && (since.elapsed() >= TAP_WAIT || status.as_ref().is_some_and(|s| s.card_present))
+        {
+            self.waiting_since = None;
+        }
+        let (text, state) = self.tray_status(status.as_ref());
+        let frame = self.waiting_since.map_or(0, |since| {
+            (since.elapsed().as_millis() / TAP_FRAME.as_millis()) as usize
+        });
+        // Nothing paired and nothing wrong: the status line ("Pair a phone")
+        // doubles as the way to start pairing.
+        let pair_action = self.notice.is_none()
+            && state == TrayState::Disconnected
+            && status.as_ref().is_some_and(|status| !status.paired);
+        if let Some(tray) = self.tray.as_mut() {
+            tray.set_status(&text, state, frame, pair_action);
+        }
+    }
+
+    /// The one-line state and icon state, shared by the tray and Settings.
+    fn tray_status(&self, status: Option<&service::Status>) -> (String, TrayState) {
         #[cfg(windows)]
         let (text, state) = if self.usbip == Usbip::Missing {
             ("Install USB/IP driver".to_owned(), TrayState::MissingUsbip)
@@ -533,33 +606,62 @@ impl Shell {
         } else if self.usbip == Usbip::Failed {
             ("USB/IP attach failed".to_owned(), TrayState::Error)
         } else if let Some(status) = status {
-            Self::status_text(&status)
+            self.status_text(status)
         } else {
-            ("tapbridge starting".to_owned(), TrayState::Idle)
+            ("tapbridge starting".to_owned(), TrayState::Disconnected)
         };
         #[cfg(not(windows))]
         let (text, state) = if let Some(notice) = &self.notice {
             (notice.clone(), TrayState::Error)
         } else if let Some(status) = status {
-            Self::status_text(&status)
+            self.status_text(status)
         } else {
-            ("tapbridge starting".to_owned(), TrayState::Idle)
+            ("tapbridge starting".to_owned(), TrayState::Disconnected)
         };
-        if let Some(tray) = self.tray.as_mut() {
-            tray.set_status(&text, state);
-        }
+        (text, state)
     }
 
-    fn status_text(status: &service::Status) -> (String, TrayState) {
+    fn status_text(&self, status: &service::Status) -> (String, TrayState) {
         let phone = status.phone_name.as_deref().unwrap_or("phone");
         if status.phone_connected && status.card_present {
             (format!("Card present ({phone})"), TrayState::Card)
+        } else if self.waiting_since.is_some() {
+            (format!("Tap your key on {phone}"), TrayState::Waiting)
         } else if status.phone_connected {
-            (format!("{phone} connected"), TrayState::Phone)
+            (format!("{phone} connected"), TrayState::Connected)
         } else if status.paired {
-            (format!("Paired with {phone}"), TrayState::Idle)
+            (format!("Paired with {phone}"), TrayState::Disconnected)
         } else {
-            ("Not paired".to_owned(), TrayState::Idle)
+            let text = if cfg!(target_os = "macos") {
+                "Pair a phone"
+            } else {
+                "Not paired"
+            };
+            (text.to_owned(), TrayState::Disconnected)
+        }
+    }
+
+    fn settings_snapshot(&self) -> ui::SettingsSnapshot {
+        let status = self.service.as_ref().map(ServiceHandle::status);
+        let (summary, state) = self.tray_status(status.as_ref());
+        let health = match state {
+            TrayState::Card | TrayState::Waiting | TrayState::Connected => ui::Health::Good,
+            TrayState::Disconnected => ui::Health::Idle,
+            TrayState::Error | TrayState::MissingUsbip => ui::Health::Problem,
+        };
+        let status = status.unwrap_or_default();
+        ui::SettingsSnapshot {
+            summary,
+            health,
+            phone: status.paired.then(|| {
+                status
+                    .phone_name
+                    .clone()
+                    .unwrap_or_else(|| "Phone".to_owned())
+            }),
+            phone_connected: status.phone_connected,
+            autostart: self.autostart,
+            details: self.status_lines(),
         }
     }
 
@@ -582,24 +684,19 @@ impl Shell {
         ));
         match self.service.as_ref().map(ServiceHandle::status) {
             Some(status) => {
-                let phone = status.phone_name.as_deref().unwrap_or("phone");
-                lines.push(if status.paired {
-                    format!("Paired with {phone}")
-                } else {
-                    "Not paired".to_owned()
-                });
                 lines.push(format!(
-                    "Phone session: {}",
-                    if status.phone_connected {
-                        "connected"
-                    } else {
-                        "idle"
-                    }
+                    "Card present: {}",
+                    if status.card_present { "yes" } else { "no" }
                 ));
-                lines.push(format!("Card present: {}", status.card_present));
-                lines.push(format!("Phone can be woken: {}", status.push_stored));
+                lines.push(format!(
+                    "Phone can be woken: {}",
+                    if status.push_stored { "yes" } else { "no" }
+                ));
             }
-            None => lines.push("Host service: not running".to_owned()),
+            None => lines.push(match &self.service_error {
+                Some(error) => format!("Host service failed: {error}"),
+                None => "Host service: starting".to_owned(),
+            }),
         }
         lines.push(format!(
             "Relay: {}",
