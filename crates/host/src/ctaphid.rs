@@ -65,6 +65,9 @@ pub struct Output {
     /// its channel): stop the card work; its result will be dropped or, for
     /// CANCEL, answered with `CTAP2_ERR_KEEPALIVE_CANCEL` by the driver.
     pub cancel: bool,
+    /// `INIT` resynced this existing channel (busy or not): per-channel
+    /// state above the engine (the PIN proxy's cached token) is dropped.
+    pub resync: Option<u32>,
 }
 
 struct Assembly {
@@ -184,6 +187,7 @@ impl Engine {
             self.allocate_cid()
         } else {
             // Resync on an existing channel: abort whatever it was doing.
+            out.resync = Some(cid);
             if self.assembling.as_ref().is_some_and(|a| a.cid == cid) {
                 self.assembling = None;
             }
@@ -522,6 +526,21 @@ mod tests {
             "same channel"
         );
         assert!(engine.on_response(cid, &[0x00]).is_empty());
+    }
+
+    #[test]
+    fn init_on_an_existing_channel_reports_a_resync_even_when_idle() {
+        // The PIN proxy forgets that channel's cached PIN state.
+        let mut engine = Engine::new();
+        let now = Instant::now();
+        let cid = open(&mut engine, now);
+        let mut init = padded("000000008600080102030405060708");
+        init[..4].copy_from_slice(&cid.to_be_bytes());
+        let out = engine.on_report(&init, now);
+        assert_eq!(out.resync, Some(cid));
+        assert!(!out.cancel, "nothing was in flight");
+        let out = engine.on_report(&padded("ffffffff8600080102030405060708"), now);
+        assert_eq!(out.resync, None, "a broadcast INIT opens a new channel");
     }
 
     #[test]
