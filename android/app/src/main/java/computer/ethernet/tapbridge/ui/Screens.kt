@@ -438,7 +438,7 @@ fun AddKeyDialogs(
 @Composable
 fun KeyReaderOverlay(keyName: String?, modifier: Modifier = Modifier) {
     Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
-        TapHero(TapPhase.WAITING, Modifier.widthIn(max = 220.dp))
+        TapHero(TapPhase.WAITING, cardPresent = false, pcName = "your PC", modifier = Modifier.widthIn(max = 220.dp))
         Text(
             if (keyName == null) "Hold your key against the back of this phone"
             else "Hold again to confirm \u201C$keyName\u201D",

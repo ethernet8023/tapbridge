@@ -78,6 +78,8 @@ class MainActivity : ComponentActivity() {
         var connectedHost by mutableStateOf<String?>(null)
         /** A PC asked for a tap; only then does the home screen animate. */
         var tapRequested by mutableStateOf(false)
+        /** The PC's sign-in state (Auth frames); IDLE without a session. */
+        var authState by mutableStateOf(AuthState.IDLE)
         var notificationsGranted by mutableStateOf(false)
         var dndGranted by mutableStateOf(false)
         var addKeyMode by mutableStateOf(false)
@@ -114,6 +116,9 @@ class MainActivity : ComponentActivity() {
         override fun onTapRequested(requested: Boolean) {
             runOnUiThread { state?.let { it.tapRequested = requested } }
         }
+        override fun onAuthState(state: AuthState) {
+            runOnUiThread { this@MainActivity.state?.let { it.authState = state } }
+        }
     }
 
     private val conn = object : ServiceConnection {
@@ -128,6 +133,7 @@ class MainActivity : ComponentActivity() {
             state?.status = service?.status ?: TapBridgeService.Status.IDLE
             state?.error = service?.lastError
             state?.tapRequested = service?.tapRequested == true
+            state?.authState = service?.authState ?: AuthState.IDLE
             state?.connectedHost = service?.takeIf { it.status == TapBridgeService.Status.CONNECTED }?.targetHost
             deliverForwardedTag()
         }

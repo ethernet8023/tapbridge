@@ -43,16 +43,12 @@ fun HomeScreen(
         ui.status == TapBridgeService.Status.ERROR -> HomeStatus.ERROR
         else -> HomeStatus.CONNECTING
     }
-    val connected = ui.status == TapBridgeService.Status.CONNECTED
-    // The "hold your key here" animation only plays while a PC is actually
-    // asking for a tap; a merely connected phone rests.
-    val phase = when {
-        ui.status == TapBridgeService.Status.ERROR -> TapPhase.ERROR
-        ui.cardPresent && connected -> TapPhase.ACTIVE
-        ui.cardPresent -> TapPhase.DETECTED
-        ui.tapRequested -> TapPhase.WAITING
-        else -> TapPhase.IDLE
-    }
+    // The live session's PC names the sign-in; else the last-used one.
+    val pcName = ui.connectedHost?.let { id -> hosts.firstOrNull { it.hostId == id }?.name }
+        ?: hostName ?: "your PC"
+    // The animation only plays while a PC is asking for the card or has just
+    // reported a result; a merely connected phone rests (see tapPhase).
+    val phase = tapPhase(ui.status, ui.cardPresent, ui.tapRequested, ui.authState)
     Column(
         modifier
             .fillMaxSize()
@@ -90,7 +86,7 @@ fun HomeScreen(
                 transitionSpec = { fadeIn(tween(320)).togetherWith(fadeOut(tween(200))) },
                 label = "hero",
             ) { isPaired ->
-                if (isPaired) TapHero(phase, Modifier.widthIn(max = 380.dp))
+                if (isPaired) TapHero(phase, ui.cardPresent, pcName, Modifier.widthIn(max = 380.dp))
                 else PairHero(Modifier.widthIn(max = 400.dp))
             }
         }
@@ -108,18 +104,12 @@ fun HomeScreen(
         if (paired) {
             Spacer(Modifier.height(12.dp))
             AnimatedContent(
-                targetState = phase,
+                targetState = phase to ui.cardPresent,
                 transitionSpec = { fadeIn(tween(220)).togetherWith(fadeOut(tween(150))) },
                 label = "hint",
-            ) { current ->
+            ) { (current, present) ->
                 Text(
-                    when (current) {
-                        TapPhase.IDLE -> "Your PC will ask for your key when it needs it."
-                        TapPhase.WAITING -> "Hold your key flat against the back of this phone."
-                        TapPhase.DETECTED -> "Key found. Keep holding it."
-                        TapPhase.ACTIVE -> "Signing in on your PC. Keep holding your key."
-                        TapPhase.ERROR -> "Something went wrong. Lift the key and try again."
-                    },
+                    tapHint(current, present, pcName),
                     style = MaterialTheme.typography.titleMedium,
                     textAlign = TextAlign.Center,
                     modifier = Modifier.fillMaxWidth(),
@@ -137,4 +127,17 @@ fun HomeScreen(
         }
         Spacer(Modifier.height(8.dp))
     }
+}
+
+/** The line under the tap hero for [phase]; [pcName] is the paired PC. */
+internal fun tapHint(phase: TapPhase, cardPresent: Boolean, pcName: String): String = when (phase) {
+    TapPhase.IDLE -> "Your PC will ask for your key when it needs it."
+    TapPhase.WAITING -> "Hold your key flat against the back of this phone."
+    TapPhase.DETECTED -> "Key found. Keep holding it."
+    TapPhase.ACTIVE -> "Signing in on $pcName. Keep holding your key."
+    TapPhase.SUCCESS -> "Signed in on $pcName"
+    TapPhase.REMOVED -> "Card removed before sign-in finished. Tap your key again."
+    TapPhase.PIN -> "Enter your key's PIN on $pcName" + if (cardPresent) ". Keep holding your key." else ""
+    TapPhase.FAILED -> "Sign-in didn't finish. Try again on $pcName."
+    TapPhase.ERROR -> "Something went wrong. Lift the key and try again."
 }

@@ -10,4 +10,7 @@
     <string name="channel_session">Bridge session</string>
     <string name="channel_session_desc">Shown while the app is open and connected to your PC</string>
     <string name="wake_body_named">%1$s is waiting — tap your key on this phone</string>
+    <string name="removed_title">Card removed</string>
+    <string name="removed_body">Tap again to finish signing in on your PC</string>
+    <string name="removed_body_named">Tap again to finish signing in on %1$s</string>
 </resources>
