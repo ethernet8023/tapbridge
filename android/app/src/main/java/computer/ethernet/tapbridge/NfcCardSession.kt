@@ -5,6 +5,7 @@ import android.nfc.tech.IsoDep
 import android.nfc.tech.NfcA
 import java.io.IOException
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
@@ -18,12 +19,20 @@ import java.util.concurrent.TimeUnit
  * is bounded: when the host stops draining, further reports are dropped
  * rather than accumulating forever (the host times the exchange out).
  *
- * Removal reporting limitation: Android gives us no push notification that a
- * card left the field while we hold it. We report removal only when an actual
- * I/O fails (IOException in transceive), a cancel arrives, or the app leaves
- * the foreground (retireTag). We never invent an immediate removal signal.
+ * Removal: Android gives no push notification that a card left the field
+ * while we hold it. Removal is reported when an I/O fails (IOException in
+ * transceive), a cancel arrives, the app leaves the foreground (retireTag),
+ * or [presence] sees `IsoDep.isConnected()` turn false. That last one is not
+ * invented: isConnected asks the NFC service's isPresent, i.e. the NFC
+ * controller's own presence check, and sends no APDU. It runs every
+ * [PRESENCE_INTERVAL_MS] only while a tag is held and no transceive is in
+ * flight, so it never interleaves with the PC's APDUs (a stray SELECT
+ * mid-PIN-protocol would reset the applet state).
  */
 class NfcCardSession(private val gate: NativeGate) {
+    companion object {
+        const val PRESENCE_INTERVAL_MS = 250L
+    }
     private val lock = Any()
     private var generation = 0L
     private var tag: IsoDep? = null
@@ -35,6 +44,40 @@ class NfcCardSession(private val gate: NativeGate) {
 
     /** Set while the app is paused; tag discovery is refused. Cleared on resume. */
     @Volatile var paused: Boolean = true
+
+    /**
+     * Called (on whichever thread closed it) after a held tag was dropped for
+     * any reason: transceive failure, cancel, presence loss, pause. The host
+     * already got the absent Card report; this is for the UI and the
+     * service's notification. Must not block.
+     */
+    @Volatile var onTagLost: (() -> Unit)? = null
+
+    private val presenceTimer = ScheduledThreadPoolExecutor(1) { r ->
+        Thread(r, "nfc-presence").apply { isDaemon = true }
+    }.apply { removeOnCancelPolicy = true }
+
+    private val presence = PresencePoller(
+        PRESENCE_INTERVAL_MS,
+        { delay, task ->
+            val future = runCatching { presenceTimer.schedule(task, delay, TimeUnit.MILLISECONDS) }.getOrNull()
+            PresencePoller.Cancellable { future?.cancel(false) }
+        },
+        object : PresencePoller.Target<IsoDep> {
+            override fun snapshot() = synchronized(lock) {
+                tag?.takeIf { !paused }?.let { PresencePoller.Snapshot(it, busy = pending != null) }
+            }
+            // A binder call, no APDU. A dead NFC service counts as gone.
+            override fun isPresent(token: IsoDep) = runCatching { token.isConnected }.getOrDefault(false)
+            override fun onLost(token: IsoDep): Boolean {
+                // Close only the tag that was checked, and never under a
+                // transceive that started after the check.
+                if (synchronized(lock) { tag !== token || pending != null }) return false
+                close()
+                return true
+            }
+        },
+    )
 
     private val writer = ThreadPoolExecutor(
         1, 1, 0L, TimeUnit.MILLISECONDS,
@@ -69,6 +112,7 @@ class NfcCardSession(private val gate: NativeGate) {
                 tag = iso
                 reportCard(epoch, atr, maximum)
             }
+            presence.start()
         } catch (error: Exception) { runCatching { iso.close() }; throw error }
     }
 
@@ -140,12 +184,16 @@ class NfcCardSession(private val gate: NativeGate) {
             generation++
             epoch = generation
         }
+        presence.stop()
         runCatching { old?.close() }
         reportCard(epoch, byteArrayOf(), 0)
+        if (old != null) onTagLost?.invoke()
     }
 
     /** Flush pending writes and stop the writer (service teardown only). */
     fun shutdownWriter() {
+        presence.stop()
+        presenceTimer.shutdownNow()
         writer.shutdown()
         writer.awaitTermination(2, TimeUnit.SECONDS)
     }
