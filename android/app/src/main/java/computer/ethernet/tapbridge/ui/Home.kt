@@ -67,6 +67,10 @@ private val BrandLight = Color(0xFF7C5CFF)
 private val BrandDeep = Color(0xFF2B1A80)
 private val ChipLight = Color(0xFFF3DC9B)
 private val ChipDeep = Color(0xFFC9A253)
+/** Sign-in outcome colours: the presence dot's green, and an amber for
+ *  "waiting on you" that reads apart from the error red. */
+private val SuccessGreen = Color(0xFF2FBF71)
+private val WarningAmber = Color(0xFFF2A93B)
 
 enum class HomeStatus { UNPAIRED, CONNECTING, CONNECTED, ERROR }
 
@@ -153,38 +157,31 @@ internal fun PresenceDot(status: HomeStatus) {
     }
 }
 
-/** Phases of the tap hero. Only states the phone can actually observe:
- *  the phone never learns whether the PC's sign-in succeeded. */
-enum class TapPhase {
-    /** Paired, not connected: art at rest. */
-    IDLE,
-    /** A PC asked for a tap and no card is on the phone yet: the key drifts
-     *  toward the phone, inviting a tap. Only during an active request. */
-    WAITING,
-    /** Card on the phone but the session is not up yet. */
-    DETECTED,
-    /** Card on the phone and the PC is talking to it. */
-    ACTIVE,
-    ERROR,
-}
-
 /**
  * The tap hero: a phone seen from above with NFC waves from its antenna
  * spot, and a brand security card that drifts in, docks with a spring, shows
- * orbiting activity while the PC talks to it, and shakes on errors. Static
- * under reduced motion.
+ * orbiting activity while the PC talks to it, and shakes on errors.
+ *
+ * The card sits on the phone only while [cardPresent] says a card really is
+ * there ([TapPhase.docks]); sign-in states never fake a dock. Motion runs
+ * only while [TapPhase.animates] (an active request or a fresh result);
+ * under reduced motion every phase is a static frame. [pcName] names the
+ * PC in the accessibility text.
  */
 @Composable
-fun TapHero(phase: TapPhase, modifier: Modifier = Modifier) {
+fun TapHero(phase: TapPhase, cardPresent: Boolean, pcName: String, modifier: Modifier = Modifier) {
     val reducedMotion = LocalReducedMotion.current
     val haptics = LocalHapticFeedback.current
     val scheme = MaterialTheme.colorScheme
+    val moving = phase.animates && !reducedMotion
+    val docked = phase.docks(cardPresent)
 
-    val infinite = rememberInfiniteTransition(label = "hero")
-    val clock by infinite.animateFloat(
+    // The infinite clocks exist only while something moves, so a resting
+    // home screen schedules no frames at all.
+    val clock = if (!moving) 0.25f else rememberInfiniteTransition(label = "hero").animateFloat(
         0f, 1f, infiniteRepeatable(tween(2600, easing = LinearEasing)), label = "clock",
-    )
-    val drift by infinite.animateFloat(
+    ).value
+    val drift = if (!moving || phase != TapPhase.WAITING) 0f else rememberInfiniteTransition(label = "hero-drift").animateFloat(
         0f, 1f,
         infiniteRepeatable(
             keyframes {
@@ -197,32 +194,59 @@ fun TapHero(phase: TapPhase, modifier: Modifier = Modifier) {
             },
         ),
         label = "drift",
-    )
-    val dock = remember { Animatable(0f) }
+    ).value
+    val dock = remember { Animatable(if (docked) 1f else 0f) }
     val shake = remember { Animatable(1f) }
+    // 0..1 strength of the success / warning tint on the card.
+    val tint = remember { Animatable(0f) }
+    LaunchedEffect(docked) {
+        if (docked) {
+            if (dock.value < 0.5f) haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+            dock.animateTo(1f, spring(dampingRatio = 0.55f, stiffness = Spring.StiffnessMediumLow))
+        } else {
+            dock.animateTo(0f, spring(dampingRatio = 0.8f, stiffness = Spring.StiffnessLow))
+        }
+    }
     LaunchedEffect(phase) {
+        val tinted = phase == TapPhase.SUCCESS || phase == TapPhase.REMOVED
+        launch { if (reducedMotion) tint.snapTo(if (tinted) 1f else 0f) else tint.animateTo(if (tinted) 1f else 0f, tween(320)) }
         when (phase) {
-            TapPhase.DETECTED, TapPhase.ACTIVE -> {
-                if (dock.value < 0.5f) haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                dock.animateTo(1f, spring(dampingRatio = 0.55f, stiffness = Spring.StiffnessMediumLow))
-            }
-            TapPhase.ERROR -> {
-                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                launch { dock.animateTo(0f, spring(stiffness = Spring.StiffnessLow)) }
+            TapPhase.SUCCESS -> haptics.performHapticFeedback(HapticFeedbackType.Confirm)
+            // A PC asking for the card while the app is open: a short tick
+            // instead of the notification's vibration.
+            TapPhase.WAITING, TapPhase.REMOVED -> haptics.performHapticFeedback(HapticFeedbackType.SegmentTick)
+            TapPhase.ERROR, TapPhase.FAILED -> {
+                haptics.performHapticFeedback(
+                    if (phase == TapPhase.FAILED) HapticFeedbackType.Reject else HapticFeedbackType.LongPress,
+                )
                 shake.snapTo(0f)
                 shake.animateTo(1f, tween(650, easing = LinearEasing))
             }
-            else -> dock.animateTo(0f, spring(dampingRatio = 0.8f, stiffness = Spring.StiffnessLow))
+            else -> {}
         }
     }
 
-    val waveColor = if (phase == TapPhase.ERROR) scheme.error else scheme.primary
+    val waveColor = when (phase) {
+        TapPhase.ERROR, TapPhase.FAILED -> scheme.error
+        TapPhase.SUCCESS -> SuccessGreen
+        TapPhase.REMOVED -> WarningAmber
+        else -> scheme.primary
+    }
     val waveStrength = when (phase) {
         TapPhase.IDLE -> 0.25f
         TapPhase.WAITING -> 0.4f + 0.6f * drift
+        TapPhase.REMOVED -> 0.7f
         TapPhase.DETECTED -> 0.55f
         TapPhase.ACTIVE -> 1f
-        TapPhase.ERROR -> 0.7f
+        TapPhase.PIN -> 0.35f
+        TapPhase.SUCCESS -> 0.6f
+        TapPhase.FAILED, TapPhase.ERROR -> 0.7f
+    }
+    val badge = when (phase) {
+        TapPhase.SUCCESS -> CardBadge.CHECK
+        TapPhase.REMOVED -> CardBadge.WARNING
+        TapPhase.PIN -> CardBadge.PIN
+        else -> CardBadge.NONE
     }
 
     Canvas(
@@ -235,7 +259,12 @@ fun TapHero(phase: TapPhase, modifier: Modifier = Modifier) {
                     TapPhase.WAITING -> "Hold your key against the back of this phone"
                     TapPhase.DETECTED -> "Key detected"
                     TapPhase.ACTIVE -> "Your PC is talking to the key. Keep holding it."
-                    TapPhase.ERROR -> "Key error. Try again."
+                    TapPhase.SUCCESS -> "Signed in on $pcName"
+                    TapPhase.REMOVED -> "Card removed before sign-in finished. Tap your key again."
+                    TapPhase.PIN -> "Enter your key's PIN on $pcName" +
+                        if (cardPresent) ". Keep holding your key." else ""
+                    TapPhase.FAILED -> "Sign-in didn't finish"
+                    TapPhase.ERROR -> "Connection error. Try again."
                 }
             },
     ) {
@@ -245,14 +274,21 @@ fun TapHero(phase: TapPhase, modifier: Modifier = Modifier) {
         val phoneTopLeft = Offset(center.x - phoneW / 2, center.y - phoneH / 2 + s * 0.08f)
         val antenna = Offset(center.x, phoneTopLeft.y + phoneH * 0.40f)
 
-        // Approach: 0 = hovering away, 1 = docked on the antenna.
+        // Approach: 0 = hovering away, 1 = docked on the antenna. REMOVED
+        // holds the card high: it left and has not come back.
+        val away = when (phase) {
+            TapPhase.WAITING -> drift
+            TapPhase.REMOVED -> 0f
+            else -> 0.15f
+        }
         val approach = when {
-            reducedMotion -> if (phase == TapPhase.DETECTED || phase == TapPhase.ACTIVE) 1f else 0.45f
-            else -> lerp(if (phase == TapPhase.WAITING) drift else 0.15f, 1f, dock.value)
+            reducedMotion -> if (docked) 1f else if (phase == TapPhase.REMOVED) 0f else 0.45f
+            else -> lerp(away, 1f, dock.value)
         }
 
-        // 1. Waves from the antenna spot (behind everything else).
-        if (!reducedMotion) {
+        // 1. Waves from the antenna spot (behind everything else), only
+        // while something is happening.
+        if (moving) {
             for (i in 0 until 3) {
                 val t = (clock * (if (phase == TapPhase.ACTIVE) 1.6f else 1f) + i / 3f) % 1f
                 drawCircle(
@@ -307,8 +343,8 @@ fun TapHero(phase: TapPhase, modifier: Modifier = Modifier) {
         val cardH = cardW * 0.63f
         val far = antenna + Offset(s * 0.13f, -s * 0.33f)
         val cardCenter = Offset(lerp(far.x, antenna.x, approach), lerp(far.y, antenna.y, approach))
-        val bob = if (reducedMotion || approach > 0.95f) 0f else sin(clock * 2 * PI.toFloat()) * s * 0.008f
-        val shakeX = if (phase == TapPhase.ERROR && !reducedMotion) {
+        val bob = if (!moving || approach > 0.95f) 0f else sin(clock * 2 * PI.toFloat()) * s * 0.008f
+        val shakeX = if ((phase == TapPhase.ERROR || phase == TapPhase.FAILED) && !reducedMotion) {
             sin(shake.value * PI.toFloat() * 7f) * (1f - shake.value) * s * 0.045f
         } else 0f
         val lift = 1f - approach // 1 = high above the phone
@@ -326,13 +362,21 @@ fun TapHero(phase: TapPhase, modifier: Modifier = Modifier) {
         translate(at.x, at.y) {
             rotate(tilt, pivot = Offset.Zero) {
                 scale(cardScale, cardScale, pivot = Offset.Zero) {
-                    drawKeyCard(cardW, cardH, error = phase == TapPhase.ERROR, errorColor = scheme.error)
+                    drawKeyCard(
+                        cardW, cardH,
+                        error = phase == TapPhase.ERROR || phase == TapPhase.FAILED,
+                        errorColor = scheme.error,
+                        tint = if (phase == TapPhase.REMOVED) WarningAmber else SuccessGreen,
+                        tintAmount = tint.value,
+                    )
                 }
             }
+            // The badge stays upright so the check / warning reads at a glance.
+            drawCardBadge(badge, Offset(cardW * 0.42f, -cardH * 0.48f) * cardScale, cardW * 0.16f, scheme.primary)
         }
 
         // 4. Activity: two arcs orbit the docked card while the PC talks to it.
-        if (phase == TapPhase.ACTIVE || phase == TapPhase.DETECTED) {
+        if ((phase == TapPhase.ACTIVE || phase == TapPhase.DETECTED) && docked) {
             val radius = s * 0.33f
             val spin = if (reducedMotion) 0f else clock * 360f * 1.5f
             val alpha = if (phase == TapPhase.ACTIVE) 0.95f else 0.35f
@@ -364,9 +408,54 @@ private fun DrawScope.drawSoftShadow(topLeft: Offset, size: Size, corner: Float,
     }
 }
 
+/** Status badge drawn at the card's top-right corner. */
+private enum class CardBadge { NONE, CHECK, WARNING, PIN }
+
+/** A round badge centred on [at]: a check (success), an exclamation mark
+ *  (card removed) or three PIN dots (enter the PIN on the PC). */
+private fun DrawScope.drawCardBadge(badge: CardBadge, at: Offset, radius: Float, pinColor: Color) {
+    if (badge == CardBadge.NONE) return
+    val fill = when (badge) {
+        CardBadge.CHECK -> SuccessGreen
+        CardBadge.WARNING -> WarningAmber
+        else -> pinColor
+    }
+    drawCircle(Color.Black.copy(alpha = 0.12f), radius * 1.08f, at + Offset(0f, radius * 0.12f))
+    drawCircle(fill, radius, at)
+    drawCircle(Color.White, radius, at, style = Stroke(width = radius * 0.14f))
+    val stroke = radius * 0.22f
+    when (badge) {
+        CardBadge.CHECK -> {
+            val path = androidx.compose.ui.graphics.Path().apply {
+                moveTo(at.x - radius * 0.45f, at.y + radius * 0.02f)
+                lineTo(at.x - radius * 0.12f, at.y + radius * 0.36f)
+                lineTo(at.x + radius * 0.48f, at.y - radius * 0.32f)
+            }
+            drawPath(
+                path, Color.White,
+                style = Stroke(width = stroke, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round),
+            )
+        }
+        CardBadge.WARNING -> {
+            drawLine(Color.White, at - Offset(0f, radius * 0.48f), at + Offset(0f, radius * 0.12f), stroke, StrokeCap.Round)
+            drawCircle(Color.White, stroke * 0.6f, at + Offset(0f, radius * 0.45f))
+        }
+        CardBadge.PIN -> for (k in -1..1) drawCircle(Color.White, radius * 0.13f, at + Offset(k * radius * 0.38f, 0f))
+        CardBadge.NONE -> {}
+    }
+}
+
 /** The brand FIDO card, centered on the origin: gradient body, contact chip,
- *  the icon's wave glyph and two embossed lines. */
-private fun DrawScope.drawKeyCard(w: Float, h: Float, error: Boolean, errorColor: Color) {
+ *  the icon's wave glyph and two embossed lines. [tintAmount] washes the
+ *  body with [tint] (success green, removed amber). */
+private fun DrawScope.drawKeyCard(
+    w: Float,
+    h: Float,
+    error: Boolean,
+    errorColor: Color,
+    tint: Color = SuccessGreen,
+    tintAmount: Float = 0f,
+) {
     val topLeft = Offset(-w / 2, -h / 2)
     val corner = CornerRadius(w * 0.075f)
     drawRoundRect(
@@ -424,6 +513,9 @@ private fun DrawScope.drawKeyCard(w: Float, h: Float, error: Boolean, errorColor
             strokeWidth = h * 0.045f,
             cap = StrokeCap.Round,
         )
+    }
+    if (tintAmount > 0f) {
+        drawRoundRect(color = tint.copy(alpha = 0.45f * tintAmount), topLeft = topLeft, size = Size(w, h), cornerRadius = corner)
     }
     if (error) {
         drawRoundRect(color = errorColor.copy(alpha = 0.35f), topLeft = topLeft, size = Size(w, h), cornerRadius = corner)
