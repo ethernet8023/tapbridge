@@ -211,10 +211,12 @@ fun SettingsScreen(
     dndGranted: Boolean,
     onRequestDnd: () -> Unit,
     hosts: List<computer.ethernet.tapbridge.PairedHosts.Record>,
+    connectedHost: String?,
     onPhoneName: (String) -> Unit,
     onRequestNotifications: () -> Unit,
     onRenameHost: (hostId: String, name: String) -> Unit,
     onForgetHost: (hostId: String) -> Unit,
+    onPairAnother: () -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -272,13 +274,14 @@ fun SettingsScreen(
         }
         hosts.forEach { host ->
             ListItem(
-                headlineContent = { Text(host.name, fontWeight = FontWeight.Medium) },
-                supportingContent = {
-                    Text(
-                        host.hostId.take(8) + "…" +
-                            (host.cachedHint?.let { " · cached" } ?: "")
-                    )
+                // "Online" = this phone has a live session with the PC right
+                // now. The phone connects on demand, so an idle PC that is
+                // running fine still reads "Offline".
+                leadingContent = {
+                    PresenceDot(if (host.hostId == connectedHost) HomeStatus.CONNECTED else HomeStatus.UNPAIRED)
                 },
+                headlineContent = { Text(host.name, fontWeight = FontWeight.Medium) },
+                supportingContent = { Text(if (host.hostId == connectedHost) "Online" else "Offline") },
                 trailingContent = {
                     Row {
                         IconButton(onClick = {
@@ -293,6 +296,14 @@ fun SettingsScreen(
                     }
                 },
             )
+        }
+        TextButton(
+            onClick = onPairAnother,
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+        ) {
+            Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(6.dp))
+            Text(if (hosts.isEmpty()) "Pair a PC" else "Pair another PC")
         }
         HorizontalDivider(Modifier.padding(vertical = 16.dp))
         Text(

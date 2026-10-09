@@ -114,7 +114,7 @@ fun StatusCard(status: HomeStatus, hostName: String?, error: String?, modifier: 
                         text = when (state) {
                             HomeStatus.UNPAIRED -> "Scan the code your PC shows to get started."
                             HomeStatus.CONNECTING -> if (name.isEmpty()) "Reaching your PC" else "Reaching $name"
-                            HomeStatus.CONNECTED -> "Ready for your key"
+                            HomeStatus.CONNECTED -> "Online"
                             HomeStatus.ERROR -> error ?: "Check that tapbridge is running on the PC."
                         },
                         style = MaterialTheme.typography.bodyMedium,
@@ -127,7 +127,7 @@ fun StatusCard(status: HomeStatus, hostName: String?, error: String?, modifier: 
 }
 
 @Composable
-private fun PresenceDot(status: HomeStatus) {
+internal fun PresenceDot(status: HomeStatus) {
     val reducedMotion = LocalReducedMotion.current
     val color = when (status) {
         HomeStatus.CONNECTED -> Color(0xFF2FBF71)
@@ -158,7 +158,8 @@ private fun PresenceDot(status: HomeStatus) {
 enum class TapPhase {
     /** Paired, not connected: art at rest. */
     IDLE,
-    /** Connected, no card: the key drifts toward the phone, inviting a tap. */
+    /** A PC asked for a tap and no card is on the phone yet: the key drifts
+     *  toward the phone, inviting a tap. Only during an active request. */
     WAITING,
     /** Card on the phone but the session is not up yet. */
     DETECTED,

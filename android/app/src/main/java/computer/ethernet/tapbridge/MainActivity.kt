@@ -71,6 +71,10 @@ class MainActivity : ComponentActivity() {
         var status by mutableStateOf(TapBridgeService.Status.IDLE)
         var error by mutableStateOf<String?>(null)
         var cardPresent by mutableStateOf(false)
+        /** Host id of the PC with a live session right now, else null. */
+        var connectedHost by mutableStateOf<String?>(null)
+        /** A PC asked for a tap; only then does the home screen animate. */
+        var tapRequested by mutableStateOf(false)
         var notificationsGranted by mutableStateOf(false)
         var dndGranted by mutableStateOf(false)
         var addKeyMode by mutableStateOf(false)
@@ -87,11 +91,19 @@ class MainActivity : ComponentActivity() {
     private val serviceListener = object : TapBridgeService.Listener {
         override fun onStatusChanged(status: TapBridgeService.Status, error: String?) {
             runOnUiThread {
-                state?.let { it.status = status; it.error = error }
+                state?.let {
+                    it.status = status
+                    it.error = error
+                    it.connectedHost =
+                        if (status == TapBridgeService.Status.CONNECTED) service?.targetHost else null
+                }
             }
         }
         override fun onCardPresent(present: Boolean) {
             runOnUiThread { state?.let { it.cardPresent = present } }
+        }
+        override fun onTapRequested(requested: Boolean) {
+            runOnUiThread { state?.let { it.tapRequested = requested } }
         }
     }
 
@@ -106,6 +118,8 @@ class MainActivity : ComponentActivity() {
             service?.onAppVisibility(resumed)
             state?.status = service?.status ?: TapBridgeService.Status.IDLE
             state?.error = service?.lastError
+            state?.tapRequested = service?.tapRequested == true
+            state?.connectedHost = service?.takeIf { it.status == TapBridgeService.Status.CONNECTED }?.targetHost
             deliverForwardedTag()
         }
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -328,7 +342,6 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
                     onPaired = {
                         PairingState.setPendingInvitation(it)
                         activity.startTapService()
-                        hosts = IdentityStore.pairedHosts(context)
                         // Wake alerts need notifications; ask while the user
                         // is setting the app up.
                         if (!ui.notificationsGranted && Build.VERSION.SDK_INT >= 33) {
@@ -365,6 +378,7 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
                         )
                     },
                     hosts = hosts,
+                    connectedHost = ui.connectedHost,
                     onPhoneName = { name ->
                         runCatching { IdentityStore.setPhoneName(context, name) }
                     },
@@ -385,6 +399,7 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
                         IdentityStore.forgetHost(context, hostId)
                         hosts = IdentityStore.pairedHosts(context)
                     },
+                    onPairAnother = { screen = "pair" },
                     onBack = { screen = "home" },
                     Modifier.fillMaxSize(),
                 )
@@ -392,7 +407,9 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
                     ui = ui,
                     onStartPair = { screen = "pair" },
                     onKeys = { keys = RegisteredKeys.list(context); screen = "keys" },
-                    onSettings = { screen = "settings" },
+                    // Pairing completes in the background after the scan,
+                    // so read the list fresh each time Settings opens.
+                    onSettings = { hosts = IdentityStore.pairedHosts(context); screen = "settings" },
                     Modifier.fillMaxSize(),
                 )
             }

@@ -44,11 +44,13 @@ fun HomeScreen(
         else -> HomeStatus.CONNECTING
     }
     val connected = ui.status == TapBridgeService.Status.CONNECTED
+    // The "hold your key here" animation only plays while a PC is actually
+    // asking for a tap; a merely connected phone rests.
     val phase = when {
         ui.status == TapBridgeService.Status.ERROR -> TapPhase.ERROR
         ui.cardPresent && connected -> TapPhase.ACTIVE
         ui.cardPresent -> TapPhase.DETECTED
-        connected -> TapPhase.WAITING
+        ui.tapRequested -> TapPhase.WAITING
         else -> TapPhase.IDLE
     }
     Column(
@@ -92,19 +94,19 @@ fun HomeScreen(
                 else PairHero(Modifier.widthIn(max = 400.dp))
             }
         }
-        Button(
-            onClick = onStartPair,
-            contentPadding = PaddingValues(vertical = if (paired) 10.dp else 16.dp),
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Icon(Icons.Filled.QrCodeScanner, contentDescription = null)
-            Spacer(Modifier.width(10.dp))
-            Text(
-                if (paired) "Pair another PC" else "Scan pairing code",
-                style = MaterialTheme.typography.titleMedium,
-            )
+        if (!paired) {
+            Button(
+                onClick = onStartPair,
+                contentPadding = PaddingValues(vertical = 16.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Icon(Icons.Filled.QrCodeScanner, contentDescription = null)
+                Spacer(Modifier.width(10.dp))
+                Text("Scan pairing code", style = MaterialTheme.typography.titleMedium)
+            }
         }
         if (paired) {
+            Spacer(Modifier.height(12.dp))
             AnimatedContent(
                 targetState = phase,
                 transitionSpec = { fadeIn(tween(220)).togetherWith(fadeOut(tween(150))) },
@@ -112,7 +114,7 @@ fun HomeScreen(
             ) { current ->
                 Text(
                     when (current) {
-                        TapPhase.IDLE -> "Your PC will wake this phone when it needs your key."
+                        TapPhase.IDLE -> "Your PC will ask for your key when it needs it."
                         TapPhase.WAITING -> "Hold your key flat against the back of this phone."
                         TapPhase.DETECTED -> "Key found. Keep holding it."
                         TapPhase.ACTIVE -> "Signing in on your PC. Keep holding your key."

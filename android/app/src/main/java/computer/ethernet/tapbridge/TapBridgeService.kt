@@ -81,6 +81,8 @@ class TapBridgeService : Service() {
     interface Listener {
         fun onStatusChanged(status: Status, error: String?)
         fun onCardPresent(present: Boolean)
+        /** A PC is asking for a tap (wake or ReadCard), or stopped asking. */
+        fun onTapRequested(requested: Boolean) {}
     }
     inner class LocalBinder : Binder() { val service get() = this@TapBridgeService }
     private val binder = LocalBinder()
@@ -103,6 +105,12 @@ class TapBridgeService : Service() {
     /** The app UI is on screen; idle timeout never stops a visible session. */
     @Volatile private var visible = false
     private val closeWakeWindowRunnable = Runnable { closeWakeWindow() }
+    private val endTapRequestRunnable = Runnable { setTapRequested(false) }
+    /** A PC asked for a tap and no card has answered it yet. Drives the home
+     *  screen's tap animation; cleared by a card, the session ending or
+     *  [WAKE_WINDOW_MS]. */
+    @Volatile var tapRequested = false
+        private set
     @Volatile private var wantsConnection = false
     @Volatile private var destroyed = false
     @Volatile private var reader: Thread? = null
@@ -381,7 +389,11 @@ class TapBridgeService : Service() {
             override fun cancel(id: Long) { session.onCancel(id) }
             override fun readCard() {
                 bumpActivity()
-                main.post { listener?.onCardPresent(session.hasTagPublic()) }
+                main.post {
+                    val present = session.hasTagPublic()
+                    listener?.onCardPresent(present)
+                    if (!present) beginTapRequest()
+                }
             }
         }
         var error: String? = null
@@ -428,7 +440,11 @@ class TapBridgeService : Service() {
             nfcWorker.execute {
                 runCatching { session.onDiscover(tag) }
                 bumpActivity()
-                main.post { listener?.onCardPresent(session.hasTagPublic()) }
+                main.post {
+                    val present = session.hasTagPublic()
+                    listener?.onCardPresent(present)
+                    if (present) setTapRequested(false)
+                }
             }
         } catch (_: RejectedExecutionException) { session.close() }
     }
@@ -443,6 +459,7 @@ class TapBridgeService : Service() {
         requested.incrementAndGet()
         gate.closeIfActive(); session.close(); nfcWorker.queue.clear()
         closeWakeWindow()
+        setTapRequested(false)
         unregisterNetworkRetry()
         main.removeCallbacks(idleRunnable)
         show(Status.IDLE)
@@ -459,8 +476,23 @@ class TapBridgeService : Service() {
         gate.releaseIfActive(); session.unbindHandle()
     }
 
+    /** Marks a tap request for [WAKE_WINDOW_MS]; main thread. */
+    private fun beginTapRequest() {
+        main.removeCallbacks(endTapRequestRunnable)
+        main.postDelayed(endTapRequestRunnable, WAKE_WINDOW_MS)
+        setTapRequested(true)
+    }
+
+    private fun setTapRequested(value: Boolean) {
+        if (!value) main.removeCallbacks(endTapRequestRunnable)
+        if (tapRequested == value) return
+        tapRequested = value
+        main.post { listener?.onTapRequested(value) }
+    }
+
     /** Wake window: tap gate enabled for 120 s, disabled on session stop. */
     private fun openWakeWindow() {
+        beginTapRequest()
         TapGateActivity.setGateEnabled(this, true)
         // A newer wake restarts the window instead of an older timer closing it.
         main.removeCallbacks(closeWakeWindowRunnable)
