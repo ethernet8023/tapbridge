@@ -23,12 +23,19 @@ class PivTest {
         val chunkReplies: Boolean = true,
         val selectsEverything: Boolean = false,
         val hasPiv: Boolean = true,
+        /** GET METADATA support (YubiKey 5.3+, PivApplet). */
+        val metadata: Boolean = true,
+        /** Answer empty VERIFY with 63Cx (SP 800-73-4). */
+        val emptyVerify: Boolean = true,
+        val managementKey: ByteArray = Piv.DEFAULT_MANAGEMENT_KEY,
+        var retries: Int = 5,
     ) : Piv.Transport {
         val objects = HashMap<Int, ByteArray>()
         val keys = HashMap<Int, KeyPair>()
         var pinOk = false
         var mgmtOk = false
-        var retries = 3
+        /** VERIFY commands that carried a PIN (each can cost a try). */
+        var pinAttempts = 0
         private var witness: ByteArray? = null
         private var pending = ByteArray(0)
         private var chain = ByteArrayOutputStream()
@@ -41,7 +48,7 @@ class PivTest {
         }
 
         private fun mgmtCipher(mode: Int, block: ByteArray): ByteArray {
-            val key = Piv.DEFAULT_MANAGEMENT_KEY
+            val key = managementKey
             val c = if (aes) Cipher.getInstance("AES/ECB/NoPadding").apply { init(mode, SecretKeySpec(key, "AES")) }
             else Cipher.getInstance("DESede/ECB/NoPadding").apply { init(mode, SecretKeySpec(key, "DESede")) }
             return c.doFinal(block)
@@ -84,12 +91,26 @@ class PivTest {
                     reply(ByteArray(0))
                 }
                 0x20 -> {
+                    if (data.isEmpty()) {
+                        if (!emptyVerify) return reply(ByteArray(0), 0x6A80)
+                        if (pinOk) return reply(ByteArray(0))
+                        return reply(ByteArray(0), if (retries == 0) 0x6983 else 0x63C0 or retries)
+                    }
+                    pinAttempts++
                     if (retries == 0) return reply(ByteArray(0), 0x6983)
                     val pin = data.takeWhile { it != 0xFF.toByte() }.toByteArray().toString(Charsets.US_ASCII)
-                    if (pin == "123456") { pinOk = true; retries = 3; reply(ByteArray(0)) }
+                    if (pin == "123456") { pinOk = true; retries = 5; reply(ByteArray(0)) }
                     else { retries--; reply(ByteArray(0), 0x63C0 or retries) }
                 }
-                0xF7 -> if (aes) reply(Der.tlv(0x01, byteArrayOf(0x0A))) else reply(ByteArray(0), 0x6D00)
+                0xF7 -> when {
+                    !metadata -> reply(ByteArray(0), 0x6D00)
+                    p2 == 0x80 -> reply(Der.tlv(0x05, byteArrayOf(1)) + Der.tlv(0x06, byteArrayOf(5, retries.toByte())))
+                    p2 == 0x9B -> reply(
+                        Der.tlv(0x01, byteArrayOf(if (aes) 0x0A else 0x03)) +
+                            Der.tlv(0x05, byteArrayOf(if (managementKey.contentEquals(Piv.DEFAULT_MANAGEMENT_KEY)) 1 else 0)),
+                    )
+                    else -> reply(ByteArray(0), 0x6A86)
+                }
                 0x47 -> {
                     if (!mgmtOk) return reply(ByteArray(0), 0x6982)
                     val kp = KeyPairGenerator.getInstance("EC").apply { initialize(ECGenParameterSpec("secp256r1")) }.generateKeyPair()
@@ -183,8 +204,74 @@ class PivTest {
     @Test fun wrongPinReportsRetries() {
         val card = FakeCard()
         val error = assertThrows(Piv.WrongPin::class.java) { Piv.setUp(card, "654321", "a") }
-        assertEquals(2, error.retries)
+        assertEquals(4, error.retries)
+        assertEquals(1, card.pinAttempts)
         assertTrue(card.keys.isEmpty())
+    }
+
+    @Test fun probeReadsRetriesAndDefaultKeyWithoutSpendingTries() {
+        val card = FakeCard(retries = 4)
+        val status = Piv.probe(card)!!
+        assertEquals(4, status.pinRetries)
+        assertEquals(true, status.defaultManagementKey)
+        assertEquals(0, card.pinAttempts)
+        // Without GET METADATA: empty VERIFY gives the count, still free.
+        val old = FakeCard(metadata = false, retries = 3)
+        assertEquals(3, Piv.probe(old)!!.pinRetries)
+        assertNull(Piv.probe(old)!!.defaultManagementKey)
+        assertEquals(0, old.pinAttempts)
+        assertEquals(3, old.retries)
+    }
+
+    @Test fun neverSendsPinAtTwoOrFewerTries() {
+        for (left in 0..2) {
+            val card = FakeCard(retries = left)
+            val error = assertThrows(Piv.PinRetriesTooLow::class.java) { Piv.setUp(card, "123456", "a") }
+            assertEquals(left, error.retries)
+            assertEquals(0, card.pinAttempts)
+            assertEquals(left, card.retries)
+            assertTrue(card.keys.isEmpty())
+        }
+    }
+
+    @Test fun threeTriesLeftIsAllowed() {
+        val card = FakeCard(retries = 3)
+        Piv.setUp(card, "123456", "a")
+        assertEquals(1, card.pinAttempts)
+    }
+
+    @Test fun unknownRetryCountRefusesPin() {
+        val card = FakeCard(metadata = false, emptyVerify = false)
+        val error = assertThrows(Piv.PinRetriesTooLow::class.java) { Piv.setUp(card, "123456", "a") }
+        assertNull(error.retries)
+        assertEquals(0, card.pinAttempts)
+    }
+
+    @Test fun wrongManagementKeyIsRetryableAndSpendsNoPin() {
+        val custom = ByteArray(24) { (0x40 + it).toByte() }
+        val card = FakeCard(managementKey = custom)
+        assertEquals(false, Piv.probe(card)!!.defaultManagementKey)
+        repeat(5) {
+            assertThrows(Piv.WrongManagementKey::class.java) { Piv.setUp(card, "123456", "a") }
+        }
+        assertEquals(0, card.pinAttempts)
+        Piv.setUp(card, "123456", "a", managementKey = custom)
+        assertTrue(Piv.probe(card)!!.missing.isEmpty())
+    }
+
+    @Test fun managementKeyLengthMismatchIsWrongKey() {
+        val card = FakeCard(aes = true) // AES-192 needs 24 bytes
+        assertThrows(Piv.WrongManagementKey::class.java) {
+            Piv.setUp(card, "123456", "a", managementKey = ByteArray(16))
+        }
+        assertEquals(0, card.pinAttempts)
+    }
+
+    @Test fun parsesManagementKeyHex() {
+        assertArrayEquals(Piv.DEFAULT_MANAGEMENT_KEY, Piv.parseManagementKey(Piv.DEFAULT_MANAGEMENT_KEY_HEX))
+        assertArrayEquals(Piv.DEFAULT_MANAGEMENT_KEY, Piv.parseManagementKey("01 02 03 04 05 06 07 08:0102030405060708 0102030405060708"))
+        assertNull(Piv.parseManagementKey("0102"))
+        assertNull(Piv.parseManagementKey("zz".repeat(24)))
     }
 
     @Test fun pinLengthChecked() {

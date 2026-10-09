@@ -87,9 +87,6 @@ class MainActivity : ComponentActivity() {
         var pivPrompt by mutableStateOf<PivPrompt?>(null)
     }
 
-    /** PIN and certificate name for the pending PIV setup (never persisted). */
-    private var pivPin: String? = null
-    private var pivName: String = ""
     /** Keys whose PIV offer was turned down this run (stable UID hex). */
     private val pivDeclined = HashSet<String>()
     private val pivWorker = Executors.newSingleThreadExecutor { r -> Thread(r, "piv").apply { isDaemon = true } }
@@ -173,7 +170,7 @@ class MainActivity : ComponentActivity() {
         }
         if (status?.needsSetup == true) {
             runOnUiThread {
-                state?.let { if (it.pivPrompt == null) it.pivPrompt = PivPrompt.Offer(status.missing) }
+                state?.let { if (it.pivPrompt == null) it.pivPrompt = PivPrompt.Offer(status) }
                 pivOfferedUid = uid
             }
         }
@@ -187,21 +184,25 @@ class MainActivity : ComponentActivity() {
     }
 
     internal fun endPiv() {
-        pivPin = null
         state?.pivPrompt = null
     }
 
-    internal fun submitPiv(pin: String, name: String) {
-        val missing = (state?.pivPrompt as? PivPrompt.Form)?.missing ?: return
-        pivPin = pin
-        pivName = name
-        state?.pivPrompt = PivPrompt.Waiting(missing)
+    /** The PIN only lives in the prompt state, so ending the flow drops it. */
+    internal fun submitPiv(form: PivPrompt.Form) {
+        if (state?.pivPrompt !is PivPrompt.Form) return
+        state?.pivPrompt = PivPrompt.Waiting(form)
     }
 
-    /** Runs on [pivWorker] once the key is held to the phone again. */
+    /**
+     * Runs on [pivWorker] once the key is held to the phone again. One
+     * attempt per tap, never retried on its own: a wrong PIN goes back to
+     * the form with the new count, and Piv.setUp itself refuses to send a
+     * PIN at MIN_PIN_RETRIES or fewer tries.
+     */
     private fun runPivSetup(tag: Tag) {
-        val pin = pivPin ?: return
-        val missing = (state?.pivPrompt as? PivPrompt.Waiting)?.missing ?: return
+        val form = (state?.pivPrompt as? PivPrompt.Waiting)?.form ?: return
+        val pin = form.pin
+        val key = Piv.parseManagementKey(form.managementKey) ?: return
         runOnUiThread { state?.pivPrompt = PivPrompt.Working }
         val iso = android.nfc.tech.IsoDep.get(tag)
         val next: PivPrompt = if (iso == null) {
@@ -212,12 +213,18 @@ class MainActivity : ComponentActivity() {
             iso.timeout = 20000
             // slots = null: fill whatever is empty on the key actually held
             // now, which may not be the one that got the offer.
-            val result = Piv.setUp({ iso.transceive(it) }, pin, pivName)
+            val result = Piv.setUp({ iso.transceive(it) }, pin, form.name ?: "", managementKey = key)
             if (result.slots.isEmpty()) PivPrompt.Failed("This key already has its certificates.")
             else PivPrompt.Done(result.slots)
         } catch (wrong: Piv.WrongPin) {
-            if (wrong.retries == 0) PivPrompt.Failed("The PIN is blocked. Unblock it with the PUK in yubico-piv-tool or Yubico Authenticator.")
-            else PivPrompt.Form(missing, wrong.message)
+            val status = form.status.copy(pinRetries = wrong.retries)
+            if (wrong.retries == 0) PivPrompt.Failed("The PIN is blocked. Unblock it with the PUK in yubico-piv-tool.")
+            else form.copy(status = status, pin = "", pinError = wrong.message)
+        } catch (_: Piv.WrongManagementKey) {
+            // Safe to retry: the management key has no retry counter.
+            form.copy(keyError = "That management key didn't work. Check it and try again.")
+        } catch (low: Piv.PinRetriesTooLow) {
+            PivPrompt.Failed(low.message!!)
         } catch (e: android.nfc.TagLostException) {
             PivPrompt.Failed("The key moved away before setup finished. Some slots may be half set up; tap the key again to retry.")
         } catch (e: Exception) {
@@ -225,10 +232,7 @@ class MainActivity : ComponentActivity() {
         } finally {
             runCatching { iso?.close() }
         }
-        runOnUiThread {
-            if (next !is PivPrompt.Form) pivPin = null
-            state?.pivPrompt = next
-        }
+        runOnUiThread { state?.pivPrompt = next }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -336,7 +340,7 @@ class MainActivity : ComponentActivity() {
                 // Offered once the key is named (the dialog waits for that).
                 runCatching { Piv.probe { iso.transceive(it) } }.getOrNull()
                     ?.takeIf { it.needsSetup }
-                    ?.let { state?.pivPrompt = PivPrompt.Offer(it.missing) }
+                    ?.let { state?.pivPrompt = PivPrompt.Offer(it) }
             } catch (e: Exception) {
                 state?.let { it.addKeyError = "Could not read the key: ${e.message ?: "card error"}" }
             } finally {
@@ -536,9 +540,9 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
             prompt = ui.pivPrompt,
             defaultName = IdentityStore.phoneName(context).let { "$it PIV" },
             onStart = {
-                (ui.pivPrompt as? PivPrompt.Offer)?.let { ui.pivPrompt = PivPrompt.Form(it.missing) }
+                (ui.pivPrompt as? PivPrompt.Offer)?.let { ui.pivPrompt = PivPrompt.Form(it.status) }
             },
-            onSubmit = { pin, name -> activity.submitPiv(pin, name) },
+            onSubmit = { form -> activity.submitPiv(form) },
             onDismiss = {
                 if (ui.pivPrompt is PivPrompt.Offer) activity.declinePiv() else activity.endPiv()
             },

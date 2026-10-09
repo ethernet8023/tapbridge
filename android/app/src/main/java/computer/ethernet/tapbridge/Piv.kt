@@ -43,8 +43,36 @@ object Piv {
         if (retries == 0) "PIN is blocked" else "Wrong PIN ($retries tries left)",
     )
 
-    /** What a tap found: null from [probe] means no usable PIV applet. */
-    data class Status(val missing: List<Slot>) {
+    /**
+     * The PIN was NOT sent: [retries] tries left (null = the card won't
+     * say) is at or below [MIN_PIN_RETRIES]. PivApplet wipes every private
+     * key once PIN and PUK are both blocked, so the app never spends those
+     * last tries.
+     */
+    class PinRetriesTooLow(val retries: Int?) : IOException(
+        if (retries == null) "The key won't report how many PIN tries are left, so tapbridge won't risk a PIN attempt"
+        else "Only $retries PIN ${if (retries == 1) "try" else "tries"} left; tapbridge won't use them. Reset the PIN with the PUK first.",
+    )
+
+    /**
+     * The management key was refused. Safe to retry: the 9B key has no
+     * retry counter on PivApplet or YubiKey.
+     */
+    class WrongManagementKey : IOException("That management key didn't work")
+
+    /** PIN attempts are only made while more than this many tries remain. */
+    const val MIN_PIN_RETRIES = 2
+
+    /**
+     * What a tap found: null from [probe] means no usable PIV applet.
+     * [defaultManagementKey] is null when the card doesn't report it
+     * (no GET METADATA); [pinRetries] null when it doesn't report that.
+     */
+    data class Status(
+        val missing: List<Slot>,
+        val defaultManagementKey: Boolean? = null,
+        val pinRetries: Int? = null,
+    ) {
         val needsSetup get() = missing.isNotEmpty()
     }
 
@@ -56,6 +84,7 @@ object Piv {
     private const val ALG_AES256 = 0x0C
     private const val ALG_ECCP256 = 0x11
     private const val SLOT_MANAGEMENT = 0x9B
+    private const val PIN_REFERENCE = 0x80
 
     /** Factory management key of every YubiKey (3DES before 5.7, AES-192 after). */
     val DEFAULT_MANAGEMENT_KEY = byteArrayOf(
@@ -72,7 +101,35 @@ object Piv {
     fun probe(card: Transport): Status? {
         if (!select(card)) return null
         val missing = SETUP_SLOTS.filter { readObject(card, it.objectId)?.let(::holdsCertificate) != true }
-        return Status(missing)
+        val management = metadata(card, SLOT_MANAGEMENT)
+        return Status(
+            missing,
+            defaultManagementKey = management?.let { Tlv.find(it, 0x05) }?.firstOrNull()?.let { it.toInt() == 1 },
+            pinRetries = pinRetries(card),
+        )
+    }
+
+    /** GET METADATA (YubiKey 5.3+, PivApplet); null when unsupported. */
+    private fun metadata(card: Transport, key: Int): ByteArray? {
+        val (data, sw) = send(card, apdu(0x00, 0xF7, 0x00, key, null, le = true))
+        return if (sw == 0x9000) data else null
+    }
+
+    /**
+     * PIN tries left, read without spending one: GET METADATA tag 06
+     * [total, remaining], else an empty VERIFY (SP 800-73-4), which answers
+     * 63Cx. Null when the card says neither (or the PIN is already verified
+     * this session, which hides the count).
+     */
+    fun pinRetries(card: Transport): Int? {
+        metadata(card, PIN_REFERENCE)?.let { Tlv.find(it, 0x06) }?.takeIf { it.size == 2 }
+            ?.let { return it[1].toInt() and 0xff }
+        val (_, sw) = send(card, apdu(0x00, 0x20, 0x00, PIN_REFERENCE, null))
+        return when {
+            sw and 0xFFF0 == 0x63C0 -> sw and 0x0F
+            sw == 0x6983 -> 0
+            else -> null
+        }
     }
 
     fun select(card: Transport): Boolean {
@@ -118,6 +175,9 @@ object Piv {
         val targets = slots ?: status.missing
         if (targets.isEmpty()) return Result(emptyList(), emptyMap())
         authenticate(card, managementKey, random)
+        // Checked right before the attempt, on the key actually in the field.
+        val retries = pinRetries(card)
+        if (retries == null || retries <= MIN_PIN_RETRIES) throw PinRetriesTooLow(retries)
         verifyPin(card, pin)
         val certificates = LinkedHashMap<Slot, ByteArray>()
         for (slot in targets) {
@@ -142,7 +202,7 @@ object Piv {
         val bytes = pin.toByteArray(Charsets.US_ASCII)
         if (bytes.size !in 6..8) throw PivException("The PIV PIN is 6 to 8 characters")
         val padded = ByteArray(8) { 0xFF.toByte() }.also { bytes.copyInto(it) }
-        val (_, sw) = send(card, apdu(0x00, 0x20, 0x00, 0x80, padded))
+        val (_, sw) = send(card, apdu(0x00, 0x20, 0x00, PIN_REFERENCE, padded))
         when {
             sw == 0x9000 -> return
             sw and 0xFFF0 == 0x63C0 -> throw WrongPin(sw and 0x0F)
@@ -151,7 +211,11 @@ object Piv {
         }
     }
 
-    /** Mutual authentication with the management key (slot 9B). */
+    /**
+     * Mutual authentication with the management key (slot 9B). A wrong key
+     * throws [WrongManagementKey]; 9B has no retry counter, so callers may
+     * let the user try again.
+     */
     fun authenticate(card: Transport, key: ByteArray, random: SecureRandom = SecureRandom()) {
         val algorithm = managementAlgorithm(card, key)
         val block = if (algorithm == ALG_3DES) 8 else 16
@@ -166,7 +230,7 @@ object Piv {
                 Der.tlv(0x81, challenge),
             )
         } catch (_: PivException) {
-            throw PivException("This key's management key isn't the default; set it up with yubico-piv-tool")
+            throw WrongManagementKey()
         }
         val proof = Tlv.find(step2, 0x82)
         if (proof == null || !MessageDigest.isEqual(proof, crypt(algorithm, key, Cipher.ENCRYPT_MODE, challenge))) {
@@ -179,8 +243,8 @@ object Piv {
      * older firmware and other cards don't, so fall back by key length.
      */
     private fun managementAlgorithm(card: Transport, key: ByteArray): Int {
-        val (data, sw) = send(card, apdu(0x00, 0xF7, 0x00, SLOT_MANAGEMENT, null, le = true))
-        if (sw == 0x9000) Tlv.find(data, 0x01)?.firstOrNull()?.let { return it.toInt() and 0xff }
+        metadata(card, SLOT_MANAGEMENT)?.let { Tlv.find(it, 0x01) }?.firstOrNull()
+            ?.let { return it.toInt() and 0xff }
         return when (key.size) {
             16 -> ALG_AES128
             32 -> ALG_AES256
@@ -188,7 +252,23 @@ object Piv {
         }
     }
 
+    /** Hex management key (spaces/colons allowed); null unless 16, 24 or 32 bytes. */
+    fun parseManagementKey(text: String): ByteArray? {
+        val hex = text.filterNot { it.isWhitespace() || it == ':' }
+        val bytes = RegisteredKeys.hexBytes(hex) ?: return null
+        return bytes.takeIf { it.size in setOf(16, 24, 32) }
+    }
+
+    val DEFAULT_MANAGEMENT_KEY_HEX: String = RegisteredKeys.hex(DEFAULT_MANAGEMENT_KEY)
+
     private fun crypt(algorithm: Int, key: ByteArray, mode: Int, block: ByteArray): ByteArray {
+        val expected = when (algorithm) {
+            ALG_3DES, ALG_AES192 -> 24
+            ALG_AES128 -> 16
+            ALG_AES256 -> 32
+            else -> key.size
+        }
+        if (key.size != expected) throw WrongManagementKey()
         val (transform, spec) = when (algorithm) {
             ALG_3DES -> "DESede/ECB/NoPadding" to SecretKeySpec(key, "DESede")
             ALG_AES128, ALG_AES192, ALG_AES256 -> "AES/ECB/NoPadding" to SecretKeySpec(key, "AES")
