@@ -655,6 +655,7 @@ fn handle_action(action: MenuAction, cx: &mut App) {
 fn install_commands(cx: &mut App) {
     cx.on_action(|_: &OpenSettings, cx| open_settings(cx));
     cx.on_action(|_: &Quit, cx| quit(cx));
+    crate::text_input::bind_keys(cx);
     // "secondary" is ⌘ on macOS and Ctrl elsewhere.
     cx.bind_keys([
         KeyBinding::new("secondary-,", OpenSettings, None),

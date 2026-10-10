@@ -4,6 +4,7 @@ use crate::card_tasks::TestTap;
 use crate::glass;
 #[cfg(windows)]
 use crate::passkeys;
+use crate::text_input::{InputEvent, TextInput};
 use gpui::{
     Animation, AnimationExt, App, Bounds, Context, FocusHandle, Task, Window, WindowBounds,
     WindowHandle, WindowOptions, canvas, div, fill, point, prelude::*, px, rgb, rgba, size,
@@ -888,8 +889,8 @@ pub struct SettingsView {
     confirm_forget: bool,
     /// "Forget" on a card asks once more, too.
     confirm_forget_card: Option<Vec<u8>>,
-    /// Card being renamed and the label typed so far.
-    editing: Option<(Vec<u8>, String)>,
+    /// Card being renamed, its text field, and the field's event subscription.
+    editing: Option<(Vec<u8>, gpui::Entity<TextInput>, gpui::Subscription)>,
     focus: FocusHandle,
     #[cfg(windows)]
     passkeys: Entity<PasskeyView>,
@@ -919,7 +920,7 @@ impl SettingsView {
                 self.confirm_forget = false;
             }
             let known = |uid: &Vec<u8>| snapshot.cards.iter().any(|card| &card.uid == uid);
-            if self.editing.as_ref().is_some_and(|(uid, _)| !known(uid)) {
+            if self.editing.as_ref().is_some_and(|(uid, ..)| !known(uid)) {
                 self.editing = None;
             }
             if self
@@ -939,34 +940,36 @@ impl SettingsView {
         cx.defer(move |cx| on_action(action, cx));
     }
 
-    /// Typing into the rename field: Return saves, Escape cancels.
-    fn edit_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
-        let Some((uid, text)) = self.editing.as_mut() else {
-            return;
-        };
-        let keystroke = &event.keystroke;
-        match keystroke.key.as_str() {
-            "enter" => {
-                let (uid, text) = (uid.clone(), text.clone());
-                self.editing = None;
-                if !text.trim().is_empty() {
-                    self.act(SettingsAction::RenameCard(uid, text), cx);
-                }
+    /// Opens the rename field for a card, focused with the name selected.
+    fn start_rename(
+        &mut self,
+        uid: Vec<u8>,
+        label: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| {
+            TextInput::new(label, tapbridge_host::cards::MAX_LABEL, cx).placeholder("Card name")
+        });
+        // Return saves, Escape cancels.
+        let subscription = cx.subscribe(&input, |view, _, event: &InputEvent, cx| match event {
+            InputEvent::Submit(_) => view.finish_rename(true, cx),
+            InputEvent::Cancel => view.finish_rename(false, cx),
+        });
+        let handle = gpui::Focusable::focus_handle(input.read(cx), cx);
+        handle.focus(window, cx);
+        self.editing = Some((uid, input, subscription));
+        self.confirm_forget_card = None;
+        cx.notify();
+    }
+
+    fn finish_rename(&mut self, save: bool, cx: &mut Context<Self>) {
+        if let Some((uid, input, _)) = self.editing.take() {
+            let text = input.read(cx).text();
+            if save && !text.trim().is_empty() {
+                self.act(SettingsAction::RenameCard(uid, text), cx);
             }
-            "escape" => self.editing = None,
-            "backspace" => {
-                text.pop();
-            }
-            _ if !keystroke.modifiers.platform && !keystroke.modifiers.control => {
-                if let Some(typed) = &keystroke.key_char
-                    && text.chars().count() < tapbridge_host::cards::MAX_LABEL
-                {
-                    text.extend(typed.chars().filter(|c| !c.is_control()));
-                }
-            }
-            _ => return,
         }
-        cx.stop_propagation();
         cx.notify();
     }
 
@@ -996,17 +999,10 @@ impl SettingsView {
         let editing = self
             .editing
             .as_ref()
-            .filter(|(uid, _)| *uid == card.uid)
-            .map(|(_, text)| text.clone());
+            .filter(|(uid, ..)| *uid == card.uid)
+            .map(|(_, input, _)| input.clone());
         let title = match &editing {
-            Some(text) => div()
-                .px(px(8.0))
-                .py(px(3.0))
-                .rounded(px(6.0))
-                .border_1()
-                .border_color(rgb(ACCENT))
-                .text_size(px(15.0))
-                .child(format!("{text}|")),
+            Some(input) => div().child(input.clone()),
             None => div()
                 .text_size(px(15.0))
                 .font_weight(gpui::FontWeight::MEDIUM)
@@ -1054,21 +1050,13 @@ impl SettingsView {
             buttons = buttons
                 .child(
                     card_button("card-save", index, "Save", ACCENT, 0.6, cx).on_click(cx.listener(
-                        |view, _: &gpui::ClickEvent, _, cx| {
-                            if let Some((uid, text)) = view.editing.take()
-                                && !text.trim().is_empty()
-                            {
-                                view.act(SettingsAction::RenameCard(uid, text), cx);
-                            }
-                            cx.notify();
-                        },
+                        |view, _: &gpui::ClickEvent, _, cx| view.finish_rename(true, cx),
                     )),
                 )
                 .child(
                     card_button("card-cancel", index, "Cancel", 0xFFFFFF, 0.06, cx).on_click(
                         cx.listener(|view, _: &gpui::ClickEvent, _, cx| {
-                            view.editing = None;
-                            cx.notify();
+                            view.finish_rename(false, cx)
                         }),
                     ),
                 );
@@ -1078,10 +1066,7 @@ impl SettingsView {
             buttons = buttons.child(
                 card_button("card-rename", index, "Rename", 0xFFFFFF, 0.06, cx).on_click(
                     cx.listener(move |view, _: &gpui::ClickEvent, window, cx| {
-                        view.editing = Some((rename_uid.clone(), label.clone()));
-                        view.confirm_forget_card = None;
-                        view.focus.focus(window, cx);
-                        cx.notify();
+                        view.start_rename(rename_uid.clone(), &label, window, cx)
                     }),
                 ),
             );
@@ -1384,9 +1369,6 @@ impl Render for SettingsView {
                 div()
                     .id("settings")
                     .track_focus(&self.focus)
-                    .on_key_down(cx.listener(|view, event: &gpui::KeyDownEvent, _, cx| {
-                        view.edit_key(event, cx)
-                    }))
                     .absolute()
                     .inset_0()
                     .overflow_y_scroll()

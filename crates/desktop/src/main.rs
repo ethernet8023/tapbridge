@@ -25,6 +25,7 @@ mod passkeys;
 mod prompt_watch;
 #[cfg(windows)]
 mod single;
+mod text_input;
 mod tray;
 mod ui;
 #[cfg(windows)]

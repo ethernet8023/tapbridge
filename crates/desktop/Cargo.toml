@@ -10,6 +10,7 @@ name = "tapbridge"
 path = "src/main.rs"
 
 [dependencies]
+unicode-segmentation = "1"
 tapbridge-host = { path = "../host" }
 tapbridge-core = { path = "../core" }
 tokio.workspace = true
