@@ -168,7 +168,7 @@ impl Render for PairingView {
         let header = div()
             .text_size(px(18.0))
             .font_weight(gpui::FontWeight::MEDIUM)
-            .child("Pair your phone");
+            .child("Scan this code with the TapBridge app");
         if self.expired() {
             // The old code no longer pairs: hide it so nobody scans it.
             let blank = glass::panel("pairing-card", 20.0, cx)
