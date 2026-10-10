@@ -30,6 +30,18 @@ sealed class PivPrompt {
     /** A tapped key has a PIV applet with empty login slots. */
     data class Offer(val status: Piv.Status) : PivPrompt()
     /**
+     * Started from Your keys and the tap is read: what the card holds now,
+     * with "create the missing certificates" or "replace certificates".
+     */
+    data class Review(val status: Piv.Status) : PivPrompt()
+    /** "Replace certificates" pressed: the explicit are-you-sure step. */
+    data class ConfirmReplace(val status: Piv.Status) : PivPrompt()
+    /**
+     * The card held at setup is not set up the way the review showed
+     * (another card, or its certificates changed). Nothing was written.
+     */
+    data class Changed(val status: Piv.Status) : PivPrompt()
+    /**
      * Asking for the PIN, management key and certificate name. [pinError]
      * / [keyError] come back from a failed attempt; the typed values are
      * kept in [pin] / [managementKey] so a retry doesn't retype them.
@@ -41,8 +53,10 @@ sealed class PivPrompt {
         val pin: String = "",
         val managementKey: String = Piv.DEFAULT_MANAGEMENT_KEY_HEX,
         val name: String? = null,
-        /** Slots to (re)create; null = whichever are empty on the key. */
+        /** Slots to fill; null = the setup slots. */
         val slots: List<Piv.Slot>? = null,
+        /** Overwrite slots that already hold certificates (confirmed). */
+        val replace: Boolean = false,
     ) : PivPrompt()
     /** Waiting for the key to be held to the phone. */
     data class Waiting(val form: Form) : PivPrompt()
@@ -57,6 +71,26 @@ private fun slotNames(slots: List<Piv.Slot>) = slots.joinToString(" and ") { it.
 /** True when the app must not send a PIN to this key at all. */
 fun pinLocked(retries: Int?) = retries == null || retries <= Piv.MIN_PIN_RETRIES
 
+/** One line per setup slot for the review: present, missing, or blocked. */
+@Composable
+private fun SlotStatus(status: Piv.Status) {
+    Column(Modifier.padding(top = 8.dp)) {
+        for (slot in Piv.SETUP_SLOTS) {
+            val has = slot in status.certificates
+            Text(
+                (if (has) "\u2713 " else "\u25CB ") + "Slot ${slot.label} (${slotPurpose(slot)}): " +
+                    if (has) "certificate" else "empty",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        }
+    }
+}
+
+private fun slotPurpose(slot: Piv.Slot) = when (slot) {
+    Piv.Slot.AUTHENTICATION -> "login"
+    Piv.Slot.KEY_MANAGEMENT -> "encryption"
+}
+
 @Composable
 fun PivSetupDialogs(
     prompt: PivPrompt?,
@@ -64,9 +98,95 @@ fun PivSetupDialogs(
     onStart: () -> Unit,
     onSubmit: (form: PivPrompt.Form) -> Unit,
     onDismiss: () -> Unit,
+    /** Review / Changed: create the missing certificates. */
+    onCreate: (Piv.Status) -> Unit = {},
+    /** Review: "Replace certificates", which asks to confirm first. */
+    onAskReplace: (Piv.Status) -> Unit = {},
+    /** ConfirmReplace: confirmed. */
+    onReplace: (Piv.Status) -> Unit = {},
 ) {
     when (prompt) {
         null -> Unit
+        is PivPrompt.Review -> {
+            val status = prompt.status
+            val blocked = status.contactlessBlocked == true
+            val locked = pinLocked(status.pinRetries)
+            AlertDialog(
+                onDismissRequest = onDismiss,
+                title = { Text(if (status.needsSetup) "Smart-card setup" else "Smart card is set up") },
+                text = {
+                    Column(Modifier.verticalScroll(rememberScrollState())) {
+                        Text(
+                            if (status.needsSetup) {
+                                "tapbridge creates a key and a self-signed certificate in each empty slot. " +
+                                    "Certificates already on the card stay as they are."
+                            } else {
+                                "Both login slots already have certificates. Nothing needs to change."
+                            },
+                        )
+                        SlotStatus(status)
+                        if (blocked) ContactlessWarning()
+                        else if (locked) {
+                            Text(
+                                Piv.PinRetriesTooLow(status.pinRetries).message!!,
+                                color = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.padding(top = 12.dp),
+                            )
+                        }
+                        if (!blocked && !locked && status.certificates.isNotEmpty()) {
+                            TextButton(onClick = { onAskReplace(status) }, modifier = Modifier.padding(top = 8.dp)) {
+                                Text("Replace certificates\u2026", color = MaterialTheme.colorScheme.error)
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    if (status.needsSetup) {
+                        TextButton(enabled = !blocked && !locked, onClick = { onCreate(status) }) {
+                            Text(if (status.certificates.isEmpty()) "Set up" else "Fill empty slots")
+                        }
+                    } else {
+                        TextButton(onClick = onDismiss) { Text("Done") }
+                    }
+                },
+                dismissButton = if (status.needsSetup) {
+                    { TextButton(onClick = onDismiss) { Text("Cancel") } }
+                } else null,
+            )
+        }
+        is PivPrompt.ConfirmReplace -> AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text("Replace smart-card certificates?") },
+            text = {
+                Text(
+                    "This deletes the keys in slot ${slotNames(prompt.status.certificates.keys.toList())} " +
+                        "and makes new ones. Anything that used the old certificates stops working: " +
+                        "a Mac paired for login has to be paired again, and files encrypted to the old " +
+                        "key can't be opened with this card. This can't be undone.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { onReplace(prompt.status) }) {
+                    Text("Replace", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = { TextButton(onClick = onDismiss) { Text("Keep them") } },
+        )
+        is PivPrompt.Changed -> AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text("This card is set up differently") },
+            text = {
+                Column {
+                    Text(
+                        "The card you held isn't set up the way it was when you started: it may be " +
+                            "another card, or its certificates changed. Nothing was changed. Here's " +
+                            "what it holds now.",
+                    )
+                    SlotStatus(prompt.status)
+                }
+            },
+            confirmButton = { TextButton(onClick = onDismiss) { Text("OK") } },
+        )
         is PivPrompt.Offer -> AlertDialog(
             onDismissRequest = onDismiss,
             title = { Text("Set up smart-card login?") },
@@ -112,9 +232,15 @@ fun PivSetupDialogs(
                     Column(Modifier.verticalScroll(rememberScrollState())) {
                         if (prompt.status.contactlessBlocked == true) ContactlessWarning()
                         Text(
-                            "Creates new keys in slot ${slotNames(prompt.status.missing)}. " +
-                                "Anything already in those slots is replaced.",
+                            if (prompt.replace) {
+                                "Replaces the keys and certificates in slot " +
+                                    "${slotNames(prompt.slots ?: Piv.SETUP_SLOTS)}."
+                            } else {
+                                "Creates keys and certificates in slot ${slotNames(prompt.status.missing)}. " +
+                                    "Existing certificates stay as they are."
+                            },
                             style = MaterialTheme.typography.bodyMedium,
+                            color = if (prompt.replace) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
                         )
                         OutlinedTextField(
                             value = pin,
@@ -125,7 +251,9 @@ fun PivSetupDialogs(
                                     when {
                                         locked -> Piv.PinRetriesTooLow(retries).message!!
                                         prompt.pinError != null -> prompt.pinError
-                                        else -> "$retries tries left. The default is 123456."
+                                        prompt.status.pinDefault != false && pin == Piv.DEFAULT_PIN ->
+                                            "Prefilled with the default PIN. $retries tries left."
+                                        else -> "$retries tries left."
                                     },
                                 )
                             },

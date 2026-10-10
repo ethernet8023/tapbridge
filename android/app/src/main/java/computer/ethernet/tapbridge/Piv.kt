@@ -74,6 +74,13 @@ object Piv {
             "If it runs PivApplet, install a build without \"S\" in its name (for example REePAxaD).",
     )
 
+    /**
+     * The card's PIV setup is not what the user reviewed: certificates were
+     * added, replaced or removed (or it is another card) since the tap that
+     * showed the status. Nothing was changed on the card.
+     */
+    class SetupChanged(val status: Status) : PivException("This card's smart-card setup changed")
+
     /** PIN attempts are only made while more than this many tries remain. */
     const val MIN_PIN_RETRIES = 2
 
@@ -91,8 +98,21 @@ object Piv {
          * [ContactlessBlocked]); null when it doesn't say.
          */
         val contactlessBlocked: Boolean? = null,
+        /** GET METADATA says the PIN is still the factory 123456; null when unknown. */
+        val pinDefault: Boolean? = null,
+        /** SHA-256 (hex) of each setup slot's certificate object, for the slots that hold one. */
+        val certificates: Map<Slot, String> = emptyMap(),
     ) {
         val needsSetup get() = missing.isNotEmpty()
+
+        /**
+         * What setup would touch: which slots hold which certificate, and
+         * whether NFC is blocked. Equal summaries mean the card is set up
+         * the same way (PIN tries may differ).
+         */
+        fun summary(): String =
+            SETUP_SLOTS.joinToString(";") { "${it.label}=${certificates[it] ?: "-"}" } +
+                ";nfc=${if (contactlessBlocked == true) "blocked" else "ok"}"
     }
 
     private val AID = byteArrayOf(0xA0.toByte(), 0x00, 0x00, 0x03, 0x08)
@@ -105,6 +125,9 @@ object Piv {
     private const val SLOT_MANAGEMENT = 0x9B
     private const val PIN_REFERENCE = 0x80
     private const val PIN_POLICY_ONCE: Byte = 0x02
+
+    /** Factory PIN of YubiKey and PivApplet. */
+    const val DEFAULT_PIN = "123456"
 
     /** Factory management key of every YubiKey (3DES before 5.7, AES-192 after). */
     val DEFAULT_MANAGEMENT_KEY = byteArrayOf(
@@ -124,10 +147,16 @@ object Piv {
         // over NFC (6982); some builds only refuse the signature, which
         // setUp reports as ContactlessBlocked instead.
         var blocked = false
+        val certificates = LinkedHashMap<Slot, String>()
         val missing = SETUP_SLOTS.filter { slot ->
             val (data, sw) = send(card, apdu(0x00, 0xCB, 0x3F, 0xFF, objectTag(slot.objectId), le = true))
             when (sw) {
-                0x9000 -> !holdsCertificate(data)
+                0x9000 -> if (holdsCertificate(data)) {
+                    certificates[slot] = RegisteredKeys.hex(MessageDigest.getInstance("SHA-256").digest(data))
+                    false
+                } else {
+                    true
+                }
                 0x6A82 -> true
                 0x6982 -> { blocked = true; true }
                 else -> throw PivException("reading object ${"%06X".format(slot.objectId)} failed (SW ${"%04X".format(sw)})")
@@ -139,6 +168,8 @@ object Piv {
             defaultManagementKey = management?.let { Tlv.find(it, 0x05) }?.firstOrNull()?.let { it.toInt() == 1 },
             pinRetries = pinRetries(card),
             contactlessBlocked = blocked.takeIf { it },
+            pinDefault = metadata(card, PIN_REFERENCE)?.let { Tlv.find(it, 0x05) }?.firstOrNull()?.let { it.toInt() == 1 },
+            certificates = certificates,
         )
     }
 
@@ -192,8 +223,15 @@ object Piv {
     data class Result(val slots: List<Slot>, val certificates: Map<Slot, ByteArray>)
 
     /**
-     * Fills [slots] (default: the ones with no certificate). Generates a fresh
-     * P-256 key per slot, so an existing key without a cert is replaced.
+     * Fills [slots] (default: the setup slots). Slots that already hold a
+     * certificate are left alone unless [replace]: replacing destroys the
+     * old key, so only an explicit "replace certificates" choice sets it.
+     * A slot with a key but no certificate counts as empty and gets a fresh
+     * key.
+     *
+     * [expected] is the status the user reviewed; if the card on the phone
+     * now differs (another card, or certificates changed since), nothing
+     * is written and [SetupChanged] carries the new status.
      */
     fun setUp(
         card: Transport,
@@ -203,10 +241,14 @@ object Piv {
         managementKey: ByteArray = DEFAULT_MANAGEMENT_KEY,
         now: Instant = Instant.now(),
         random: SecureRandom = SecureRandom(),
+        replace: Boolean = false,
+        expected: Status? = null,
     ): Result {
         val status = probe(card) ?: throw PivException("This key has no PIV applet")
-        if (status.contactlessBlocked == true) throw ContactlessBlocked(status.missing.first())
-        val targets = slots ?: status.missing
+        if (expected != null && expected.summary() != status.summary()) throw SetupChanged(status)
+        if (status.contactlessBlocked == true) throw ContactlessBlocked(status.missing.firstOrNull() ?: SETUP_SLOTS.first())
+        val wanted = slots ?: SETUP_SLOTS
+        val targets = if (replace) wanted else wanted.filter { it in status.missing }
         if (targets.isEmpty()) return Result(emptyList(), emptyMap())
         authenticate(card, managementKey, random)
         // Checked right before the attempt, on the key actually in the field.

@@ -222,9 +222,9 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Reads the tapped key's PIV state for a manual setup. Both login slots
-     * are (re)created, even ones that already hold a certificate: this is
-     * how a user replaces certificates after the first setup.
+     * Reads the tapped key's PIV state for a manual setup and shows it
+     * (Review). Nothing is written yet: filling empty slots or replacing
+     * certificates are separate, explicit choices from there.
      */
     private fun scanPiv(tag: Tag) {
         val iso = android.nfc.tech.IsoDep.get(tag)
@@ -244,7 +244,10 @@ class MainActivity : ComponentActivity() {
                 PivPrompt.Failed("That's a different card from the one you picked on your computer.")
             iso == null -> PivPrompt.Failed("That isn't a smart card.")
             status == null -> PivPrompt.Failed("This key has no smart-card (PIV) applet, or it moved away too soon.")
-            else -> PivPrompt.Form(status.copy(missing = Piv.SETUP_SLOTS), slots = Piv.SETUP_SLOTS)
+            else -> {
+                tapped?.let { PivCache.save(this, it, status) }
+                PivPrompt.Review(status)
+            }
         }
         runOnUiThread {
             if (state?.pivPrompt == PivPrompt.Scan) {
@@ -306,9 +309,19 @@ class MainActivity : ComponentActivity() {
             iso.timeout = 20000
             // slots = null: fill whatever is empty on the key actually held
             // now, which may not be the one that got the offer.
-            val result = Piv.setUp(transport, pin, form.name ?: "", slots = form.slots, managementKey = key)
+            val result = Piv.setUp(
+                transport, pin, form.name ?: "",
+                slots = form.slots, managementKey = key,
+                replace = form.replace, expected = form.status,
+            )
+            tag.id?.takeIf { RegisteredKeys.uidStable(it) }?.let { uid ->
+                runCatching { Piv.probe(transport) }.getOrNull()?.let { PivCache.save(this, uid, it) }
+            }
             if (result.slots.isEmpty()) PivPrompt.Failed("This key already has its certificates.")
             else PivPrompt.Done(result.slots)
+        } catch (changed: Piv.SetupChanged) {
+            tag.id?.takeIf { RegisteredKeys.uidStable(it) }?.let { PivCache.save(this, it, changed.status) }
+            PivPrompt.Changed(changed.status)
         } catch (wrong: Piv.WrongPin) {
             val status = form.status.copy(pinRetries = wrong.retries)
             if (wrong.retries == 0) PivPrompt.Failed("The PIN is blocked. Unblock it with the PUK in yubico-piv-tool.")
@@ -642,12 +655,28 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
             prompt = ui.pivPrompt,
             defaultName = IdentityStore.phoneName(context).let { "$it PIV" },
             onStart = {
-                (ui.pivPrompt as? PivPrompt.Offer)?.let { ui.pivPrompt = PivPrompt.Form(it.status) }
+                (ui.pivPrompt as? PivPrompt.Offer)?.let {
+                    ui.pivPrompt = PivPrompt.Form(it.status, pin = defaultPin(it.status))
+                }
             },
             onSubmit = { form -> activity.submitPiv(form) },
+            onCreate = { status -> ui.pivPrompt = PivPrompt.Form(status, pin = defaultPin(status)) },
+            onAskReplace = { status -> ui.pivPrompt = PivPrompt.ConfirmReplace(status) },
+            onReplace = { status ->
+                ui.pivPrompt = PivPrompt.Form(
+                    status, pin = defaultPin(status), slots = Piv.SETUP_SLOTS, replace = true,
+                )
+            },
             onDismiss = {
                 if (ui.pivPrompt is PivPrompt.Offer) activity.declinePiv() else activity.endPiv()
             },
         )
     }
 }
+
+/**
+ * The factory PIN, prefilled only while the card says it is still the
+ * default (or doesn't say). A changed PIN is never guessed: a careless
+ * Continue would spend a try.
+ */
+private fun defaultPin(status: Piv.Status) = if (status.pinDefault == false) "" else Piv.DEFAULT_PIN

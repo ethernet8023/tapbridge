@@ -39,6 +39,8 @@ class PivTest {
         val strictSigning: Boolean = false,
         /** ...and their certificates can't even be read. */
         val strictReads: Boolean = false,
+        /** GET METADATA tag 05 for the PIN; null = not reported. */
+        var pinIsDefault: Boolean? = true,
     ) : Piv.Transport {
         private var lastWasVerify = false
         val objects = HashMap<Int, ByteArray>()
@@ -118,7 +120,10 @@ class PivTest {
                 }
                 0xF7 -> when {
                     !metadata -> reply(ByteArray(0), 0x6D00)
-                    p2 == 0x80 -> reply(Der.tlv(0x05, byteArrayOf(1)) + Der.tlv(0x06, byteArrayOf(5, retries.toByte())))
+                    p2 == 0x80 -> reply(
+                        (pinIsDefault?.let { Der.tlv(0x05, byteArrayOf(if (it) 1 else 0)) } ?: ByteArray(0)) +
+                            Der.tlv(0x06, byteArrayOf(5, retries.toByte())),
+                    )
                     p2 == 0x9B -> reply(
                         Der.tlv(0x01, byteArrayOf(if (aes) 0x0A else 0x03)) +
                             Der.tlv(0x05, byteArrayOf(if (managementKey.contentEquals(Piv.DEFAULT_MANAGEMENT_KEY)) 1 else 0)),
@@ -231,6 +236,50 @@ class PivTest {
         Piv.setUp(card, "123456", "x".repeat(60))
         assertTrue(card.log.any { it[0].toInt() and 0x10 != 0 && it[1] == 0xDB.toByte() })
         assertTrue(card.log.all { it.size <= 5 + 255 + 1 })
+    }
+
+    @Test fun existingCertificatesAreKeptUnlessReplacing() {
+        val card = FakeCard()
+        Piv.setUp(card, "123456", "a")
+        val keys = Piv.SETUP_SLOTS.associateWith { card.keys[it.id] }
+        // Asking for every slot without replace touches nothing.
+        val again = Piv.setUp(card, "123456", "b", slots = Piv.SETUP_SLOTS)
+        assertTrue(again.slots.isEmpty())
+        for (slot in Piv.SETUP_SLOTS) assertSame(keys[slot], card.keys[slot.id])
+        // Replace is the explicit, destructive path.
+        val replaced = Piv.setUp(card, "123456", "c", slots = Piv.SETUP_SLOTS, replace = true)
+        assertEquals(Piv.SETUP_SLOTS, replaced.slots)
+        for (slot in Piv.SETUP_SLOTS) assertNotSame(keys[slot], card.keys[slot.id])
+    }
+
+    @Test fun aCardThatChangedSinceTheReviewIsNotTouched() {
+        val card = FakeCard()
+        val reviewed = Piv.probe(card)!!
+        Piv.setUp(card, "123456", "someone else") // changed behind the user's back
+        val keys = Piv.SETUP_SLOTS.associateWith { card.keys[it.id] }
+        val attempts = card.pinAttempts
+        val changed = assertThrows(Piv.SetupChanged::class.java) {
+            Piv.setUp(card, "123456", "mine", replace = true, expected = reviewed)
+        }
+        assertTrue(changed.status.missing.isEmpty())
+        assertEquals(attempts, card.pinAttempts) // no PIN sent
+        for (slot in Piv.SETUP_SLOTS) assertSame(keys[slot], card.keys[slot.id])
+    }
+
+    @Test fun theSameCardMatchesItsReview() {
+        val card = FakeCard()
+        Piv.setUp(card, "123456", "a", slots = listOf(Piv.Slot.AUTHENTICATION))
+        val reviewed = Piv.probe(card)!!
+        assertEquals(reviewed.summary(), Piv.probe(card)!!.summary())
+        val result = Piv.setUp(card, "123456", "b", expected = reviewed)
+        assertEquals(listOf(Piv.Slot.KEY_MANAGEMENT), result.slots)
+    }
+
+    @Test fun pinDefaultIsReadFromMetadata() {
+        assertEquals(true, Piv.probe(FakeCard(pinIsDefault = true))!!.pinDefault)
+        assertEquals(false, Piv.probe(FakeCard(pinIsDefault = false))!!.pinDefault)
+        assertNull(Piv.probe(FakeCard(pinIsDefault = null))!!.pinDefault)
+        assertNull(Piv.probe(FakeCard(metadata = false))!!.pinDefault)
     }
 
     @Test fun onlyMissingSlotsAreFilled() {
