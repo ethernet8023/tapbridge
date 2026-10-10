@@ -358,16 +358,20 @@ impl CapabilityProbe {
     }
 }
 
-/// Short-form APDUs only: every command the probe cares about is short.
+/// Short or extended (`00 Lc1 Lc2`) command data.
 fn classify(apdu: &[u8]) -> Option<Probe> {
-    let [cla, ins, p1, p2, lc, rest @ ..] = apdu else {
+    let [cla, ins, p1, p2, body @ ..] = apdu else {
         return None;
     };
     // Interindustry class only, no chaining; secure messaging bits ignored.
     if cla & 0xF0 != 0x00 {
         return None;
     }
-    let data = rest.get(..*lc as usize)?;
+    let data = match body {
+        [0, high, low, rest @ ..] => rest.get(..usize::from(u16::from_be_bytes([*high, *low])))?,
+        [lc, rest @ ..] if *lc != 0 => rest.get(..usize::from(*lc))?,
+        _ => return None,
+    };
     match (ins, p1, p2) {
         (0xA4, 0x04, _) if data.starts_with(&FIDO_AID) => Some(Probe::SelectFido),
         (0xA4, 0x04, _) if data.starts_with(&PIV_AID) => Some(Probe::SelectPiv),
@@ -601,6 +605,23 @@ mod tests {
         assert!(!probe.response(13, &[0x6A, 0x82]).any());
         probe.request(14, &GET_CERT_9A);
         assert!(!probe.response(14, &[0x90, 0x00]).any());
+    }
+
+    #[test]
+    fn probe_reads_extended_length_commands() {
+        let mut probe = CapabilityProbe::default();
+        let extended = [
+            0x00, 0xCB, 0x3F, 0xFF, 0x00, 0x00, 0x05, 0x5C, 0x03, 0x5F, 0xC1, 0x05, 0x00, 0x00,
+        ];
+        probe.request(1, &extended);
+        assert!(probe.response(1, &[0x53, 0x00, 0x90, 0x00]).piv_certs);
+        let mut select = vec![0x00, 0xA4, 0x04, 0x00, 0x00, 0x00, 0x05];
+        select.extend_from_slice(&PIV_AID);
+        probe.request(2, &select);
+        assert!(probe.response(2, &[0x90, 0x00]).has_piv);
+        // Extended header cut short.
+        probe.request(3, &[0x00, 0xA4, 0x04, 0x00, 0x00, 0x00]);
+        assert!(!probe.response(3, &[0x90, 0x00]).any());
     }
 
     #[test]
