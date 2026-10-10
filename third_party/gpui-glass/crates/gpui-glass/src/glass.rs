@@ -16,6 +16,10 @@ pub struct GlassContour {
     key: u64,
 }
 impl GlassContour {
+    pub(crate) fn points(&self) -> &[[f32; 2]] {
+        &self.points
+    }
+
     pub fn new(points: Vec<[f32; 2]>) -> anyhow::Result<Self> {
         anyhow::ensure!(
             points.len() >= 3
@@ -1485,7 +1489,9 @@ impl WgpuBackdrop for GlassDraw {
         // Later surfaces update conservative scene damage, not a stale snapshot.
         let bleed_crop = [0., 0., c.viewport[0] as f32, c.viewport[1] as f32];
         let mut geometry = Geometry {
-            dynamic: p.dynamic_shape && self.contour.is_none(),
+            // tapbridge patch: custom contours may use the GPU SDF path too
+            // (the CPU atlas costs ~0.5 s per large surface on the main thread).
+            dynamic: p.dynamic_shape,
             width: b.size.width.0.ceil() as u32,
             height: b.size.height.0.ceil() as u32,
             shape: self.shape,
@@ -1650,6 +1656,7 @@ impl WgpuBackdrop for GlassDraw {
                 slot.dynamic.as_mut().unwrap(),
                 c.queue,
                 c.encoder,
+                self.contour.as_deref().map(GlassContour::points),
                 self.shape,
                 p.smoothing,
                 [

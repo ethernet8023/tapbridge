@@ -104,6 +104,8 @@ struct Shell {
     card_task: Option<CardTask>,
     /// Cards the phone set up as smart cards this run: offer Mac login.
     setup_ok: HashSet<Vec<u8>>,
+    /// The first card list has been read (later additions are new cards).
+    cards_loaded: bool,
     // Held for their Drop / process-lifetime handles.
     _anchor: WindowHandle<ui::Anchor>,
     #[cfg(windows)]
@@ -212,8 +214,26 @@ pub fn preview_ui() {
                 "Relay: use1-1.relay.iroh.network".into(),
             ],
         };
-        crate::ui::open_settings_window(snapshot, None, |_, _| {}, cx);
-        crate::ui::open_pairing_window("tapbridge-preview-invitation-0123456789abcdef", None, cx);
+        // Preview: links open; every other action is only logged (no service).
+        let settings = crate::ui::open_settings_window(
+            snapshot,
+            None,
+            |action, cx| match action {
+                crate::ui::SettingsAction::OpenUrl(url) => cx.open_url(&url),
+                other => eprintln!("preview: {}", other.name()),
+            },
+            cx,
+        );
+        // TAPBRIDGE_PREVIEW_DIALOG=new shows the "New card" dialog.
+        if std::env::var("TAPBRIDGE_PREVIEW_DIALOG").as_deref() == Ok("new") {
+            crate::ui::settings_new_card(settings, vec![4, 9, 9, 9, 9, 9, 9], cx);
+        } else {
+            crate::ui::open_pairing_window(
+                "tapbridge-preview-invitation-0123456789abcdef",
+                None,
+                cx,
+            );
+        }
         cx.activate(true);
     });
 }
@@ -265,6 +285,7 @@ fn shell_setup(
         cards: Vec::new(),
         card_task: None,
         setup_ok: HashSet::new(),
+        cards_loaded: false,
         #[cfg(windows)]
         watcher,
         _instance: Shell::instance_guard(instance),
@@ -410,7 +431,28 @@ fn tick(inbox: &mpsc::Receiver<UiEvent>, cx: &mut App) {
         }
         match &event {
             service::Event::CardsChanged => {
-                cx.update_global::<Shell, _>(|shell, _| shell.reload_cards());
+                let fresh = cx.update_global::<Shell, _>(|shell, _| {
+                    let before: Vec<Vec<u8>> = shell.cards.iter().map(|c| c.uid.clone()).collect();
+                    shell.reload_cards();
+                    // Cards loaded at startup are not "new".
+                    if !shell.cards_loaded {
+                        shell.cards_loaded = true;
+                        return Vec::new();
+                    }
+                    shell
+                        .cards
+                        .iter()
+                        .filter(|card| !before.contains(&card.uid))
+                        .map(|card| card.uid.clone())
+                        .collect::<Vec<_>>()
+                });
+                if let Some(uid) = fresh.into_iter().next() {
+                    logging::log("cards: new card, asking for its name");
+                    open_settings(cx);
+                    if let Some(window) = cx.global::<Shell>().settings {
+                        ui::settings_new_card(window, uid, cx);
+                    }
+                }
             }
             #[cfg(target_os = "macos")]
             service::Event::CardPresent { present: true, uid } if !uid.is_empty() => {
@@ -438,9 +480,9 @@ fn tick(inbox: &mpsc::Receiver<UiEvent>, cx: &mut App) {
         });
     }
     card_tick(cx);
-    // An unused invitation expired while its window is open: show a fresh one.
+    // The open invitation expired and the user pressed "Try again".
     if let Some(window) = cx.global::<Shell>().pairing {
-        match ui::pairing_expired(window, cx) {
+        match ui::pairing_wants_new_code(window, cx) {
             Some(true) => open_pairing(cx),
             Some(false) => {}
             None => cx.update_global::<Shell, _>(|shell, _| shell.pairing = None),
@@ -485,6 +527,7 @@ fn handle_event(event: UiEvent, cx: &mut App) {
             cx.update_global::<Shell, _>(|shell, _| {
                 shell.service = Some(handle);
                 shell.reload_cards();
+                shell.cards_loaded = true;
                 #[cfg(windows)]
                 if shell.usbip != Usbip::Missing {
                     let events = shell.events.clone();

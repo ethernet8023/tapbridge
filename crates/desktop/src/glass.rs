@@ -79,6 +79,12 @@ fn layer(
     radius: Option<f32>,
 ) -> AnyElement {
     let id = surface_id(key);
+    // Build each surface's distance field on the GPU: the CPU path stalls
+    // the main thread for ~0.5 s per large surface (dialogs, panels).
+    let params = GlassParams {
+        dynamic_shape: true,
+        ..params
+    };
     match radius {
         None => gpui_glass::glass_layer(renderer, id, params, Shape::Capsule)
             .absolute()
@@ -124,6 +130,57 @@ pub fn panel(key: &str, radius: f32, cx: &mut App) -> Div {
         panel_params(),
         Some(radius),
     ))
+}
+
+/// Dialog material: heavier frost than a panel, so the window behind
+/// blurs away and the dialog reads as a sheet above it.
+fn dialog_params() -> GlassParams {
+    GlassParams {
+        tint_color: [0.08, 0.06, 0.12],
+        opacity: 0.55,
+        blur: 28.0,
+        edge: 14.0,
+        distortion: 10.0,
+        ..panel_params()
+    }
+}
+
+/// A frosted glass dialog surface (see [`panel`]).
+pub fn dialog(key: &str, radius: f32, cx: &mut App) -> Div {
+    div().relative().rounded(px(radius)).child(layer(
+        renderer(cx),
+        key,
+        dialog_params(),
+        Some(radius),
+    ))
+}
+
+/// Full-window glass scrim under a dialog: blurs and dims the window.
+/// Absolute and full-size.
+pub fn scrim(key: &str, cx: &mut App) -> Div {
+    let params = GlassParams {
+        tint_color: [0.04, 0.03, 0.07],
+        opacity: 0.35,
+        blur: 18.0,
+        edge: 0.0,
+        distortion: 0.0,
+        dispersion: 0.0,
+        light: 0.0,
+        ..panel_params()
+    };
+    div().absolute().inset_0().child(
+        gpui_glass::glass_layer(
+            renderer(cx),
+            surface_id(key),
+            GlassParams {
+                dynamic_shape: true,
+                ..params
+            },
+            Shape::Rectangle,
+        )
+        .absolute()
+        .inset_0(),
+    )
 }
 
 /// A capsule glass button tinted `tint` (a 0xRRGGBB brand colour).

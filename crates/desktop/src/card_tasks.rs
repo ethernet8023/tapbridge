@@ -227,18 +227,6 @@ impl Checklist {
     pub fn ready(&self) -> bool {
         self.mac_login == StepState::Done
     }
-
-    /// The one-line summary under the card name.
-    pub fn summary(&self) -> &'static str {
-        match (self.applet, self.certificates, self.mac_login) {
-            (StepState::Problem, ..) => "Smart-card applet blocks NFC",
-            (StepState::Todo, ..) => "No smart-card applet",
-            (_, StepState::Todo, _) => "Certificates not set up",
-            (_, _, StepState::Todo) => "Ready to set up macOS login",
-            (_, _, StepState::Done) => "Ready for macOS login",
-            _ => "",
-        }
-    }
 }
 
 /// Dangerous Things flexSecure: its ATR historical bytes (the phone builds
@@ -535,7 +523,6 @@ mod tests {
             c.mac_login = true;
         }));
         assert!(ready.ready());
-        assert_eq!(ready.summary(), "Ready for macOS login");
         // A stale Mac login flag can't skip missing certificates.
         let stale = Checklist::new(&card(|c| {
             c.has_piv = true;
@@ -552,7 +539,6 @@ mod tests {
         }));
         assert_eq!(blocked.applet, StepState::Problem);
         assert_eq!(blocked.certificates, StepState::Locked);
-        assert_eq!(blocked.summary(), "Smart-card applet blocks NFC");
     }
 
     #[test]

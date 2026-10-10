@@ -49,6 +49,8 @@ pub struct PairingView {
     test: Option<TestTap>,
     /// When the invitation stops working (the host gate uses the same TTL).
     expires: Instant,
+    /// "Try again" was pressed on the expired code: the shell mints a new one.
+    retry: bool,
     /// Re-renders once a second for the countdown; dropped with the view.
     _ticker: Task<()>,
 }
@@ -70,13 +72,19 @@ impl PairingView {
             paired: None,
             test: None,
             expires: Instant::now() + INVITATION_TTL,
+            retry: false,
             _ticker: ticker,
         }
     }
 
-    /// The invitation ran out and nobody paired: time for a fresh one.
+    /// The invitation ran out and nobody paired.
     pub fn expired(&self) -> bool {
         self.paired.is_none() && Instant::now() >= self.expires
+    }
+
+    /// The user asked for a fresh code after this one expired.
+    pub fn wants_new_code(&self) -> bool {
+        self.retry && self.expired()
     }
 }
 
@@ -157,6 +165,41 @@ impl Render for PairingView {
                     ring.opacity(0.25 + 0.75 * wave)
                 },
             );
+        let header = div()
+            .text_size(px(18.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .child("Pair your phone");
+        if self.expired() {
+            // The old code no longer pairs: hide it so nobody scans it.
+            let blank = glass::panel("pairing-card", 20.0, cx)
+                .size(stage)
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .text_size(px(20.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(WARN))
+                        .child("Code expired"),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(rgb(ACCENT_SOFT))
+                        .child("Codes work for a few minutes."),
+                );
+            return root.child(header).child(blank).child(
+                button("pair-retry", "Try again", ACCENT, 0.6, cx).on_click(cx.listener(
+                    |view, _: &gpui::ClickEvent, _, cx| {
+                        view.retry = true;
+                        cx.notify();
+                    },
+                )),
+            );
+        }
         let card = glass::panel("pairing-card", 20.0, cx)
             .size(stage)
             .flex()
@@ -175,14 +218,7 @@ impl Render for PairingView {
                     .child(grid),
             );
         let remaining = self.expires.saturating_duration_since(Instant::now());
-        root.child(
-            div()
-                .text_size(px(18.0))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .child("Pair your phone"),
-        )
-        .child(card)
-        .child(
+        root.child(header).child(card).child(
             div()
                 .text_size(px(26.0))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
@@ -346,8 +382,8 @@ pub fn open_pairing_window(
 
 /// `Some(true)` when the open pairing window's invitation ran out; `None`
 /// when the window is closed.
-pub fn pairing_expired(handle: WindowHandle<PairingView>, cx: &mut App) -> Option<bool> {
-    handle.update(cx, |view, _, _| view.expired()).ok()
+pub fn pairing_wants_new_code(handle: WindowHandle<PairingView>, cx: &mut App) -> Option<bool> {
+    handle.update(cx, |view, _, _| view.wants_new_code()).ok()
 }
 
 /// Shows the pairing-successful screen with its test-tap step.
@@ -839,6 +875,24 @@ pub enum SettingsAction {
     DismissCardTask,
 }
 
+impl SettingsAction {
+    /// For logs: the action without its data.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Pair => "pair",
+            Self::Forget => "forget phone",
+            Self::SetAutostart(_) => "set autostart",
+            Self::RenameCard(..) => "rename card",
+            Self::ForgetCard(_) => "forget card",
+            Self::SetUpCard(_) => "set up certificates",
+            Self::CheckCard => "check card",
+            Self::OpenUrl(_) => "open url",
+            Self::MacLogin(_) => "mac login",
+            Self::DismissCardTask => "dismiss card task",
+        }
+    }
+}
+
 /// One known card as the Cards section shows it.
 #[derive(Clone, PartialEq, Eq, Default)]
 pub struct CardRow {
@@ -901,8 +955,8 @@ pub struct SettingsView {
     confirm_forget: bool,
     /// "Forget" on a card asks once more, too.
     confirm_forget_card: Option<Vec<u8>>,
-    /// Cards whose checklist is open.
-    expanded: std::collections::HashSet<Vec<u8>>,
+    /// The card dialog on screen (login setup, or naming a new card).
+    dialog: Option<CardDialog>,
     /// Cards showing the applet install instructions.
     show_install: std::collections::HashSet<Vec<u8>>,
     /// Card being renamed, its text field, and the field's event subscription.
@@ -923,7 +977,7 @@ impl SettingsView {
             on_action,
             confirm_forget: false,
             confirm_forget_card: None,
-            expanded: Default::default(),
+            dialog: None,
             show_install: Default::default(),
             editing: None,
             focus: cx.focus_handle(),
@@ -938,6 +992,13 @@ impl SettingsView {
                 self.confirm_forget = false;
             }
             let known = |uid: &Vec<u8>| snapshot.cards.iter().any(|card| &card.uid == uid);
+            if self
+                .dialog
+                .as_ref()
+                .is_some_and(|dialog| !known(&dialog.uid().to_vec()))
+            {
+                self.dialog = None;
+            }
             if self.editing.as_ref().is_some_and(|(uid, ..)| !known(uid)) {
                 self.editing = None;
             }
@@ -972,6 +1033,10 @@ impl SettingsView {
         // Return saves, Escape cancels.
         let subscription = cx.subscribe(&input, |view, _, event: &InputEvent, cx| match event {
             InputEvent::Submit(_) => view.finish_rename(true, cx),
+            InputEvent::Cancel if view.dialog.is_some() => {
+                view.finish_rename(false, cx);
+                view.dialog = None;
+            }
             InputEvent::Cancel => view.finish_rename(false, cx),
         });
         let handle = gpui::Focusable::focus_handle(input.read(cx), cx);
@@ -1014,10 +1079,15 @@ impl SettingsView {
     }
 
     fn render_card(&self, index: usize, card: &CardRow, cx: &mut Context<Self>) -> gpui::Div {
+        // The dialog owns the field while it shows this card.
+        let in_dialog = self
+            .dialog
+            .as_ref()
+            .is_some_and(|d| d.uid() == card.uid.as_slice());
         let editing = self
             .editing
             .as_ref()
-            .filter(|(uid, ..)| *uid == card.uid)
+            .filter(|(uid, ..)| *uid == card.uid && !in_dialog)
             .map(|(_, input, _)| input.clone());
         let title = match &editing {
             Some(input) => div().child(input.clone()),
@@ -1058,13 +1128,14 @@ impl SettingsView {
                         div()
                             .text_size(px(12.5))
                             .text_color(rgb(ACCENT_SOFT))
-                            .child(match card.checklist.map(|c| c.summary()) {
-                                Some(summary) if !summary.is_empty() => {
-                                    format!("Last seen {} \u{00B7} {summary}", card.last_seen)
-                                }
-                                _ => format!("Last seen {}", card.last_seen),
-                            }),
-                    ),
+                            .child(format!("Last seen {}", card.last_seen)),
+                    )
+                    .when(cfg!(target_os = "macos"), |column| {
+                        column.child(capability_marks(
+                            card.passkey,
+                            card.checklist.is_some_and(|c| c.ready()),
+                        ))
+                    }),
             )
             .child(badges);
         let uid = card.uid.clone();
@@ -1118,27 +1189,19 @@ impl SettingsView {
                     cx.notify();
                 })),
             );
-            if let Some(checklist) = card.checklist {
-                let open = self.expanded.contains(&card.uid);
-                let toggle_uid = uid.clone();
-                let label = if open {
-                    "Hide macOS login".to_owned()
-                } else if checklist.ready() {
-                    "macOS login \u{2713}".to_owned()
+            if let Some(checklist) = card.checklist
+                && cfg!(target_os = "macos")
+            {
+                let open_uid = uid.clone();
+                let (label, tint, opacity) = if checklist.ready() {
+                    ("Login", 0xFFFFFF, 0.06)
                 } else {
-                    "Set up macOS login\u{2026}".to_owned()
-                };
-                let (tint, opacity) = if open || checklist.ready() {
-                    (0xFFFFFF, 0.06)
-                } else {
-                    (ACCENT, 0.6)
+                    ("Set up login", ACCENT, 0.6)
                 };
                 buttons = buttons.child(
                     card_button("card-wizard", index, label, tint, opacity, cx).on_click(
                         cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
-                            if !view.expanded.remove(&toggle_uid) {
-                                view.expanded.insert(toggle_uid.clone());
-                            }
+                            view.dialog = Some(CardDialog::Login(open_uid.clone()));
                             cx.notify();
                         }),
                     ),
@@ -1151,11 +1214,6 @@ impl SettingsView {
             .gap(px(10.0))
             .p(px(14.0))
             .child(header);
-        if let Some(checklist) = card.checklist
-            && self.expanded.contains(&card.uid)
-        {
-            panel = panel.child(self.render_checklist(index, card, checklist, cx));
-        }
         if let Some(task) = &card.task {
             let mut line = div().flex().flex_row().items_center().gap(px(10.0)).child(
                 div()
@@ -1194,13 +1252,7 @@ impl SettingsView {
     ) -> gpui::Div {
         let busy = self.snapshot.card_busy;
         let uid = card.uid.clone();
-        let mut list = div()
-            .flex()
-            .flex_col()
-            .gap(px(10.0))
-            .pt(px(10.0))
-            .border_t_1()
-            .border_color(rgba(0xFFFFFF1F));
+        let mut list = div().flex().flex_col().gap(px(14.0));
 
         // 1. Applet.
         let applet_detail = match checklist.applet {
@@ -1337,6 +1389,49 @@ impl SettingsView {
             login_body,
         ))
     }
+}
+
+/// What the card dialog shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CardDialog {
+    /// "Set up login": the three steps for this card.
+    Login(Vec<u8>),
+    /// A card tapped for the first time: name it, then the same steps.
+    New(Vec<u8>),
+}
+
+impl CardDialog {
+    fn uid(&self) -> &[u8] {
+        match self {
+            Self::Login(uid) | Self::New(uid) => uid,
+        }
+    }
+}
+
+/// "✓ 2FA  ✓ Login" under a card's name (macOS).
+fn capability_marks(two_factor: bool, login: bool) -> gpui::Div {
+    let mark = |on: bool, label: &'static str| {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .text_size(px(12.0))
+            .text_color(rgb(if on { GOOD } else { 0x8A84A3 }))
+            .child(if on { "\u{2713}" } else { "\u{2715}" })
+            .child(
+                div()
+                    .text_color(rgb(if on { TEXT } else { 0x8A84A3 }))
+                    .child(label),
+            )
+    };
+    div()
+        .flex()
+        .flex_row()
+        .gap(px(12.0))
+        .pt(px(2.0))
+        .child(mark(two_factor, "2FA"))
+        .child(mark(login, "Login"))
 }
 
 /// One checklist row: mark, then title, detail and `body` (actions,
@@ -1602,6 +1697,7 @@ impl Render for SettingsView {
         #[cfg(windows)]
         let column = column.child(self.passkeys.clone());
         let column = column.child(details);
+        let dialog = self.render_dialog(cx);
         div()
             .relative()
             .size_full()
@@ -1616,6 +1712,138 @@ impl Render for SettingsView {
                     .overflow_y_scroll()
                     .child(column),
             )
+            .children(dialog)
+    }
+}
+
+impl SettingsView {
+    /// Opens the "New card" dialog for a card seen for the first time,
+    /// unless another dialog is up.
+    pub fn new_card(&mut self, uid: Vec<u8>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dialog.is_some() || !self.snapshot.cards.iter().any(|card| card.uid == uid) {
+            return;
+        }
+        let label = self
+            .snapshot
+            .cards
+            .iter()
+            .find(|card| card.uid == uid)
+            .map(|card| card.label.clone())
+            .unwrap_or_default();
+        self.dialog = Some(CardDialog::New(uid.clone()));
+        self.start_rename(uid, &label, window, cx);
+    }
+
+    fn close_dialog(&mut self, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.dialog.take()
+            && self
+                .editing
+                .as_ref()
+                .is_some_and(|(uid, ..)| uid.as_slice() == dialog.uid())
+        {
+            // A name typed into the New card dialog is kept.
+            self.finish_rename(matches!(dialog, CardDialog::New(_)), cx);
+        }
+        cx.notify();
+    }
+
+    /// The card dialog over a blurred window: frosted scrim, glass sheet.
+    fn render_dialog(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let dialog = self.dialog.clone()?;
+        let Some((index, card)) = self
+            .snapshot
+            .cards
+            .iter()
+            .enumerate()
+            .find(|(_, card)| card.uid.as_slice() == dialog.uid())
+            .map(|(index, card)| (index, card.clone()))
+        else {
+            self.dialog = None;
+            return None;
+        };
+        let is_new = matches!(dialog, CardDialog::New(_));
+        let name: gpui::AnyElement =
+            match self.editing.as_ref().filter(|(uid, ..)| *uid == card.uid) {
+                Some((_, input, _)) => div().child(input.clone()).into_any_element(),
+                None => div()
+                    .text_size(px(17.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(card.label.clone())
+                    .into_any_element(),
+            };
+        let mut sheet = glass::dialog("card-dialog", 18.0, cx)
+            .id("card-dialog")
+            .occlude()
+            .w(px(400.0))
+            .max_h(px(560.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(14.0))
+            .p(px(20.0))
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(ACCENT_SOFT))
+                    .child(if is_new { "NEW CARD" } else { "SET UP LOGIN" }),
+            )
+            .child(name);
+        if is_new {
+            sheet = sheet.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(ACCENT_SOFT))
+                    .child("Name this card. Return saves."),
+            );
+        }
+        if cfg!(target_os = "macos") {
+            sheet = sheet.child(capability_marks(
+                card.passkey,
+                card.checklist.is_some_and(|c| c.ready()),
+            ));
+        }
+        if let Some(checklist) = card.checklist
+            && cfg!(target_os = "macos")
+        {
+            sheet = sheet.child(div().h(px(1.0)).bg(rgba(0xFFFFFF1F)));
+            sheet = sheet.child(self.render_checklist(index, &card, checklist, cx));
+        }
+        if let Some(task) = &card.task {
+            sheet = sheet.child(
+                div()
+                    .text_size(px(12.5))
+                    .text_color(rgb(if card.task_failed { WARN } else { TEXT }))
+                    .child(task.clone()),
+            );
+        }
+        let done = if is_new { "Done" } else { "Close" };
+        sheet =
+            sheet.child(div().flex().flex_row().justify_end().child(
+                card_button("dialog-close", index, done, 0xFFFFFF, 0.08, cx).on_click(
+                    cx.listener(|view, _: &gpui::ClickEvent, _, cx| view.close_dialog(cx)),
+                ),
+            ));
+        Some(
+            div()
+                .id("card-dialog-scrim")
+                .absolute()
+                .inset_0()
+                .occlude()
+                .on_click(cx.listener(|view, _: &gpui::ClickEvent, _, cx| view.close_dialog(cx)))
+                .child(glass::scrim("card-dialog-scrim", cx))
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .p(px(20.0))
+                        .child(sheet.on_click(|_, _, cx| cx.stop_propagation())),
+                )
+                .into_any_element(),
+        )
     }
 }
 
@@ -1689,6 +1917,14 @@ fn build_qr(text: &str) -> Option<(Vec<bool>, u16)> {
         .map(|color| color == qrcode::Color::Dark)
         .collect();
     Some((dark, dimension))
+}
+
+/// Shows the "New card" dialog in an open Settings window.
+pub fn settings_new_card(handle: WindowHandle<SettingsView>, uid: Vec<u8>, cx: &mut App) {
+    let _ = handle.update(cx, |view, window, cx| {
+        view.new_card(uid, window, cx);
+        window.activate();
+    });
 }
 
 #[cfg(test)]

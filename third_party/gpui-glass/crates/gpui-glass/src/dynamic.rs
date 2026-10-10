@@ -58,6 +58,7 @@ impl Pipeline {
         state: &mut State,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
+        contour: Option<&[[f32; 2]]>,
         shape: crate::Shape,
         smoothing: f32,
         logical: [f32; 2],
@@ -74,12 +75,21 @@ impl Pipeline {
             logical[0] * fraction[0].clamp(0.05, 1.),
             logical[1] * fraction[1].clamp(0.05, 1.),
         ];
-        let points = crate::shape::outline(shape, dimensions[0], dimensions[1], smoothing);
-        let points = simplify(&points, 0.05);
-        assert!(
-            points.len() <= 1024,
-            "dynamic contour exceeds segment buffer"
-        );
+        let points = match contour {
+            // Normalized custom outline, scaled to the current dimensions.
+            Some(normalized) => normalized
+                .iter()
+                .map(|p| [p[0] * dimensions[0], p[1] * dimensions[1]])
+                .collect(),
+            None => crate::shape::outline(shape, dimensions[0], dimensions[1], smoothing),
+        };
+        // Coarsen until the outline fits the segment buffer.
+        let mut epsilon = 0.05;
+        let mut points = simplify(&points, epsilon);
+        while points.len() > 1024 {
+            epsilon *= 2.;
+            points = simplify(&points, epsilon);
+        }
         let offset = [
             (logical[0] - dimensions[0]) * 0.5,
             (logical[1] - dimensions[1]) * 0.5,
