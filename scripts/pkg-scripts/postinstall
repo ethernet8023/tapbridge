@@ -14,7 +14,29 @@ fi
 # that runs next (best-effort; a stale tray process may hold the IFD socket).
 killall tapbridge 2>/dev/null || true
 
+# Register the virtual reader with com.apple.ifdreader through
+# /etc/reader.conf (pcsc-lite's serial-reader format, which ifdreader still
+# reads: launchd keeps it running while the file exists). Without this the
+# bundle only loads when a USB device with its VID/PID is attached, and no
+# real device has one, so macOS never showed the reader. Leave a foreign
+# reader.conf alone.
+READER_CONF=/etc/reader.conf
+if [[ ! -e "$READER_CONF" ]] || grep -q "tapbridge" "$READER_CONF"; then
+    cat > "$READER_CONF" <<'CONF'
+# tapbridge virtual PIV reader (the phone is the NFC reader). Written by the
+# tapbridge installer; delete this file to remove the reader.
+# LIBPATH is the .bundle, not the dylib inside it: ifdreader loads it as a
+# CFBundle ("Failed to create IFD bundle for static reader" otherwise).
+FRIENDLYNAME "tapbridge PIV reader"
+DEVICENAME   /dev/null
+LIBPATH      /usr/local/libexec/SmartCardServices/drivers/tapbridge.bundle
+CHANNELID    0
+CONF
+    chmod 644 "$READER_CONF"
+fi
+
 # Restart the PC/SC reader daemon so it enumerates the new IFD bundle.
 killall -SIGKILL com.apple.ifdreader 2>/dev/null || true
+launchctl kickstart -k system/com.apple.ifdreader 2>/dev/null || true
 
 exit 0

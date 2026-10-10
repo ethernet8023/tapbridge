@@ -8,6 +8,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Badge
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.*
@@ -107,6 +108,7 @@ fun KeysScreen(
     onAddKey: () -> Unit,
     onRename: (RegisteredKeys.KeyRecord, String) -> Unit,
     onRemove: (RegisteredKeys.KeyRecord) -> Unit,
+    onSetUpPiv: () -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -157,6 +159,14 @@ fun KeysScreen(
                     }
                 },
             )
+        }
+        TextButton(
+            onClick = onSetUpPiv,
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+        ) {
+            Icon(Icons.Filled.Badge, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("Set up smart-card login")
         }
         if (keys.isEmpty()) {
             Text(

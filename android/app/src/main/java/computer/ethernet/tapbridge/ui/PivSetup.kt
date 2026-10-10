@@ -25,6 +25,8 @@ import computer.ethernet.tapbridge.Piv
 
 /** Steps of the phone-side PIV setup (see Piv.kt). */
 sealed class PivPrompt {
+    /** Started from Your keys: waiting for a key to read its PIV state. */
+    object Scan : PivPrompt()
     /** A tapped key has a PIV applet with empty login slots. */
     data class Offer(val status: Piv.Status) : PivPrompt()
     /**
@@ -39,6 +41,8 @@ sealed class PivPrompt {
         val pin: String = "",
         val managementKey: String = Piv.DEFAULT_MANAGEMENT_KEY_HEX,
         val name: String? = null,
+        /** Slots to (re)create; null = whichever are empty on the key. */
+        val slots: List<Piv.Slot>? = null,
     ) : PivPrompt()
     /** Waiting for the key to be held to the phone. */
     data class Waiting(val form: Form) : PivPrompt()
@@ -73,7 +77,9 @@ fun PivSetupDialogs(
                             "slot ${slotNames(prompt.status.missing)}. tapbridge can create a key and a " +
                             "self-signed certificate on it, so your Mac can pair it for login.",
                     )
-                    if (pinLocked(prompt.status.pinRetries)) {
+                    if (prompt.status.contactlessBlocked == true) {
+                        ContactlessWarning()
+                    } else if (pinLocked(prompt.status.pinRetries)) {
                         Text(
                             Piv.PinRetriesTooLow(prompt.status.pinRetries).message!!,
                             color = MaterialTheme.colorScheme.error,
@@ -83,7 +89,10 @@ fun PivSetupDialogs(
                 }
             },
             confirmButton = {
-                TextButton(enabled = !pinLocked(prompt.status.pinRetries), onClick = onStart) { Text("Set up") }
+                TextButton(
+                    enabled = !pinLocked(prompt.status.pinRetries) && prompt.status.contactlessBlocked != true,
+                    onClick = onStart,
+                ) { Text("Set up") }
             },
             dismissButton = { TextButton(onClick = onDismiss) { Text("Not now") } },
         )
@@ -101,6 +110,7 @@ fun PivSetupDialogs(
                 title = { Text("Smart-card setup") },
                 text = {
                     Column(Modifier.verticalScroll(rememberScrollState())) {
+                        if (prompt.status.contactlessBlocked == true) ContactlessWarning()
                         Text(
                             "Creates new keys in slot ${slotNames(prompt.status.missing)}. " +
                                 "Anything already in those slots is replaced.",
@@ -156,7 +166,8 @@ fun PivSetupDialogs(
                 },
                 confirmButton = {
                     TextButton(
-                        enabled = !locked && pinOk && keyOk && name.isNotBlank(),
+                        enabled = !locked && pinOk && keyOk && name.isNotBlank() &&
+                            prompt.status.contactlessBlocked != true,
                         onClick = {
                             onSubmit(prompt.copy(pin = pin, managementKey = key, name = name.trim(),
                                 pinError = null, keyError = null))
@@ -166,6 +177,12 @@ fun PivSetupDialogs(
                 dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
             )
         }
+        PivPrompt.Scan -> AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text("Smart-card setup") },
+            text = { KeyReaderOverlay(null) },
+            confirmButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        )
         is PivPrompt.Waiting -> AlertDialog(
             onDismissRequest = onDismiss,
             title = { Text("Smart-card setup") },
@@ -201,4 +218,15 @@ fun PivSetupDialogs(
             confirmButton = { TextButton(onClick = onDismiss) { Text("OK") } },
         )
     }
+}
+
+/** Shown when the applet refuses login slots over NFC (strict contactless). */
+@Composable
+private fun ContactlessWarning() {
+    Text(
+        "This key's smart-card applet blocks login slots over NFC, so a phone can't set it up or use it. " +
+            "If it runs PivApplet, install a build without \"S\" in its name (for example REePAxaD).",
+        color = MaterialTheme.colorScheme.error,
+        modifier = Modifier.padding(vertical = 12.dp),
+    )
 }

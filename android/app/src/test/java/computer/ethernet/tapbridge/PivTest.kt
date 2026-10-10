@@ -29,7 +29,18 @@ class PivTest {
         val emptyVerify: Boolean = true,
         val managementKey: ByteArray = Piv.DEFAULT_MANAGEMENT_KEY,
         var retries: Int = 5,
+        /**
+         * PIN policy "always" that ignores the generate template's AA tag
+         * (other applet builds): a signature needs a VERIFY as the command
+         * right before it.
+         */
+        val pinAlways: Boolean = false,
+        /** PIV_STRICT_CONTACTLESS: 9A/9C/9D never sign over NFC. */
+        val strictSigning: Boolean = false,
+        /** ...and their certificates can't even be read. */
+        val strictReads: Boolean = false,
     ) : Piv.Transport {
+        private var lastWasVerify = false
         val objects = HashMap<Int, ByteArray>()
         val keys = HashMap<Int, KeyPair>()
         var pinOk = false
@@ -73,6 +84,8 @@ class PivTest {
             if (cla and 0x10 != 0) return byteArrayOf(0x90.toByte(), 0)
             val data = chain.toByteArray()
             chain = ByteArrayOutputStream()
+            val verifiedJustNow = lastWasVerify
+            lastWasVerify = ins == 0x20 && data.isNotEmpty() && pinOk
             return when (ins) {
                 0xA4 -> when {
                     selectsEverything -> reply(ByteArray(0))
@@ -80,6 +93,7 @@ class PivTest {
                     else -> reply(ByteArray(0), 0x6A82)
                 }
                 0xCB -> {
+                    if (strictReads && Tlv.find(data, 0x5C)!!.last() != 0x01.toByte()) return reply(ByteArray(0), 0x6982)
                     val id = Tlv.find(data, 0x5C)!!.fold(0) { a, b -> (a shl 8) or (b.toInt() and 0xff) }
                     objects[id]?.let { reply(it) } ?: reply(ByteArray(0), 0x6A82)
                 }
@@ -137,6 +151,8 @@ class PivTest {
                         reply(Der.tlv(0x7C, Der.tlv(0x82, mgmtCipher(Cipher.ENCRYPT_MODE, challenge))))
                     } else {
                         if (!pinOk) return reply(ByteArray(0), 0x6982)
+                        if (pinAlways && !verifiedJustNow) return reply(ByteArray(0), 0x6982)
+                        if (strictSigning && p2 != 0x9E) return reply(ByteArray(0), 0x6982)
                         val digest = inner.first { it.tag == 0x81 }.value
                         val sig = Signature.getInstance("NONEwithECDSA").apply { initSign(keys[p2]!!.private); update(digest) }.sign()
                         reply(Der.tlv(0x7C, Der.tlv(0x82, sig)))
@@ -183,6 +199,31 @@ class PivTest {
             assertNotNull(card.objects[0x5FC102]) // CHUID written
             assertTrue(Piv.probe(card)!!.missing.isEmpty())
         }
+    }
+
+    @Test fun signsSlotsWhosePinPolicyIsAlways() {
+        val card = FakeCard(pinAlways = true)
+        val result = Piv.setUp(card, "123456", "x")
+        assertEquals(Piv.SETUP_SLOTS, result.slots)
+        // Re-verifying the PIN the card just accepted costs no tries.
+        assertEquals(5, card.retries)
+    }
+
+    @Test fun strictContactlessSigningIsReportedAsSuch() {
+        val card = FakeCard(strictSigning = true)
+        assertThrows(Piv.ContactlessBlocked::class.java) { Piv.setUp(card, "123456", "x") }
+        assertEquals(5, card.retries)
+    }
+
+    @Test fun strictContactlessReadsAreFlaggedBeforeAnyPin() {
+        val card = FakeCard(strictSigning = true, strictReads = true)
+        assertEquals(true, Piv.probe(card)!!.contactlessBlocked)
+        assertThrows(Piv.ContactlessBlocked::class.java) { Piv.setUp(card, "123456", "x") }
+        assertEquals(0, card.pinAttempts)
+    }
+
+    @Test fun ordinaryCardsAreNotFlagged() {
+        assertNull(Piv.probe(FakeCard())!!.contactlessBlocked)
     }
 
     @Test fun longPutDataIsChained() {

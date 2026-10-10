@@ -36,7 +36,7 @@ object Piv {
     /** The two slots macOS pairs for smart-card login. */
     val SETUP_SLOTS = listOf(Slot.AUTHENTICATION, Slot.KEY_MANAGEMENT)
 
-    class PivException(message: String) : IOException(message)
+    open class PivException(message: String) : IOException(message)
 
     /** PIN refused; [retries] left, 0 when blocked. */
     class WrongPin(val retries: Int) : IOException(
@@ -60,6 +60,20 @@ object Piv {
      */
     class WrongManagementKey : IOException("That management key didn't work")
 
+    /** 6982 on a key operation: the card wants a (fresh) PIN VERIFY. */
+    class PinRequired : PivException("The key wants its PIN first")
+
+    /**
+     * The PIN was just accepted and the slot still refuses to sign: the
+     * applet blocks this slot over contactless. PivApplet's
+     * PIV_STRICT_CONTACTLESS ("S" in release names like REePSAaD) does that
+     * for 9A, 9C and 9D, and the phone is always contactless.
+     */
+    class ContactlessBlocked(slot: Slot) : PivException(
+        "This key's PIV applet blocks slot ${slot.label} over NFC, so it can't be set up from a phone. " +
+            "If it runs PivApplet, install a build without \"S\" in its name (for example REePAxaD).",
+    )
+
     /** PIN attempts are only made while more than this many tries remain. */
     const val MIN_PIN_RETRIES = 2
 
@@ -72,6 +86,11 @@ object Piv {
         val missing: List<Slot>,
         val defaultManagementKey: Boolean? = null,
         val pinRetries: Int? = null,
+        /**
+         * The applet advertises strict contactless rules (see
+         * [ContactlessBlocked]); null when it doesn't say.
+         */
+        val contactlessBlocked: Boolean? = null,
     ) {
         val needsSetup get() = missing.isNotEmpty()
     }
@@ -85,6 +104,7 @@ object Piv {
     private const val ALG_ECCP256 = 0x11
     private const val SLOT_MANAGEMENT = 0x9B
     private const val PIN_REFERENCE = 0x80
+    private const val PIN_POLICY_ONCE: Byte = 0x02
 
     /** Factory management key of every YubiKey (3DES before 5.7, AES-192 after). */
     val DEFAULT_MANAGEMENT_KEY = byteArrayOf(
@@ -100,12 +120,25 @@ object Piv {
      */
     fun probe(card: Transport): Status? {
         if (!select(card)) return null
-        val missing = SETUP_SLOTS.filter { readObject(card, it.objectId)?.let(::holdsCertificate) != true }
+        // Strict-contactless builds refuse to even read these certificates
+        // over NFC (6982); some builds only refuse the signature, which
+        // setUp reports as ContactlessBlocked instead.
+        var blocked = false
+        val missing = SETUP_SLOTS.filter { slot ->
+            val (data, sw) = send(card, apdu(0x00, 0xCB, 0x3F, 0xFF, objectTag(slot.objectId), le = true))
+            when (sw) {
+                0x9000 -> !holdsCertificate(data)
+                0x6A82 -> true
+                0x6982 -> { blocked = true; true }
+                else -> throw PivException("reading object ${"%06X".format(slot.objectId)} failed (SW ${"%04X".format(sw)})")
+            }
+        }
         val management = metadata(card, SLOT_MANAGEMENT)
         return Status(
             missing,
             defaultManagementKey = management?.let { Tlv.find(it, 0x05) }?.firstOrNull()?.let { it.toInt() == 1 },
             pinRetries = pinRetries(card),
+            contactlessBlocked = blocked.takeIf { it },
         )
     }
 
@@ -172,6 +205,7 @@ object Piv {
         random: SecureRandom = SecureRandom(),
     ): Result {
         val status = probe(card) ?: throw PivException("This key has no PIV applet")
+        if (status.contactlessBlocked == true) throw ContactlessBlocked(status.missing.first())
         val targets = slots ?: status.missing
         if (targets.isEmpty()) return Result(emptyList(), emptyMap())
         authenticate(card, managementKey, random)
@@ -189,7 +223,7 @@ object Piv {
                 notAfter = now.truncatedTo(ChronoUnit.SECONDS).plus(3650, ChronoUnit.DAYS),
             )
             val digest = MessageDigest.getInstance("SHA-256").digest(tbs)
-            val cert = SelfSignedCert.assemble(tbs, sign(card, slot, digest))
+            val cert = SelfSignedCert.assemble(tbs, signVerified(card, slot, digest, pin))
             putCertificate(card, slot, cert)
             certificates[slot] = cert
         }
@@ -277,9 +311,17 @@ object Piv {
         return Cipher.getInstance(transform).apply { init(mode, spec) }.doFinal(block)
     }
 
-    /** GENERATE ASYMMETRIC KEY PAIR (ECCP256); returns the 65-byte point. */
+    /**
+     * GENERATE ASYMMETRIC KEY PAIR (ECCP256); returns the 65-byte point.
+     * Sets PIN policy "once" (AA 02, the 9A/9D default) explicitly: PivApplet
+     * keeps a slot's old policy across regeneration, and a leftover "always"
+     * makes the certificate signature below fail with 6982.
+     */
     fun generate(card: Transport, slot: Slot): ByteArray {
-        val template = Der.tlv(0xAC, Der.tlv(0x80, byteArrayOf(ALG_ECCP256.toByte())))
+        val template = Der.tlv(
+            0xAC,
+            Der.tlv(0x80, byteArrayOf(ALG_ECCP256.toByte())) + Der.tlv(0xAA, byteArrayOf(PIN_POLICY_ONCE)),
+        )
         val (data, sw) = send(card, apdu(0x00, 0x47, 0x00, slot.id, template, le = true))
         check(sw, "generating a key in ${slot.label}")
         val publicKey = Tlv.find(data, 0x7F49) ?: throw PivException("No public key in the generate reply")
@@ -292,6 +334,25 @@ object Piv {
         val reply = generalAuthenticate(card, ALG_ECCP256, slot.id, Der.tlv(0x82), Der.tlv(0x81, digest))
         return Tlv.find(reply, 0x82) ?: throw PivException("No signature from ${slot.label}")
     }
+
+    /**
+     * [sign] during setup, where [pin] was verified by this card moments
+     * ago. A slot with PIN policy "always" refuses (6982) unless VERIFY is
+     * the command right before the signature; PivApplet keeps such a policy
+     * when the slot is regenerated. Re-sending the PIN the card just accepted
+     * cannot cost a try, and it happens at most once per slot.
+     */
+    private fun signVerified(card: Transport, slot: Slot, digest: ByteArray, pin: String): ByteArray =
+        try {
+            sign(card, slot, digest)
+        } catch (_: PinRequired) {
+            verifyPin(card, pin)
+            try {
+                sign(card, slot, digest)
+            } catch (_: PinRequired) {
+                throw ContactlessBlocked(slot)
+            }
+        }
 
     fun putCertificate(card: Transport, slot: Slot, cert: ByteArray) =
         putObject(card, slot.objectId, Der.tlv(0x70, cert) + Der.tlv(0x71, byteArrayOf(0)) + Der.tlv(0xFE))
@@ -317,7 +378,7 @@ object Piv {
 
     private fun generalAuthenticate(card: Transport, algorithm: Int, slot: Int, vararg items: ByteArray): ByteArray {
         val (data, sw) = send(card, apdu(0x00, 0x87, algorithm, slot, Der.tlv(0x7C, *items), le = true))
-        if (sw == 0x6982) throw PivException("The key wants its PIN first")
+        if (sw == 0x6982) throw PinRequired()
         check(sw, "GENERAL AUTHENTICATE")
         return Tlv.find(data, 0x7C) ?: throw PivException("Malformed GENERAL AUTHENTICATE reply")
     }

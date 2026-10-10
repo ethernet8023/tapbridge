@@ -147,6 +147,7 @@ class MainActivity : ComponentActivity() {
         val ui = state
         when {
             ui?.pivPrompt is PivPrompt.Waiting -> pivWorker.execute { runPivSetup(tag) }
+            ui?.pivPrompt is PivPrompt.Scan -> pivWorker.execute { scanPiv(tag) }
             ui?.addKeyMode == true -> runOnUiThread { handleRegistrationTag(tag) }
             // No PC is using the key: look for an unconfigured PIV applet
             // before handing the tag on. Never during a PC request, where
@@ -184,6 +185,35 @@ class MainActivity : ComponentActivity() {
 
     private var pivOfferedUid: String? = null
 
+    /** Your keys -> "Set up smart-card login": any key, any time. */
+    internal fun startPivSetup() {
+        state?.pivPrompt = PivPrompt.Scan
+    }
+
+    /**
+     * Reads the tapped key's PIV state for a manual setup. Both login slots
+     * are (re)created, even ones that already hold a certificate: this is
+     * how a user replaces certificates after the first setup.
+     */
+    private fun scanPiv(tag: Tag) {
+        val iso = android.nfc.tech.IsoDep.get(tag)
+        val status = try {
+            iso?.connect()
+            iso?.timeout = 5000
+            iso?.let { card -> Piv.probe { card.transceive(it) } }
+        } catch (_: Exception) {
+            null
+        } finally {
+            runCatching { iso?.close() }
+        }
+        val next = when {
+            iso == null -> PivPrompt.Failed("That isn't a smart card.")
+            status == null -> PivPrompt.Failed("This key has no smart-card (PIV) applet, or it moved away too soon.")
+            else -> PivPrompt.Form(status.copy(missing = Piv.SETUP_SLOTS), slots = Piv.SETUP_SLOTS)
+        }
+        runOnUiThread { if (state?.pivPrompt == PivPrompt.Scan) state?.pivPrompt = next }
+    }
+
     internal fun declinePiv() {
         pivOfferedUid?.let { pivDeclined.add(it) }
         endPiv()
@@ -211,6 +241,21 @@ class MainActivity : ComponentActivity() {
         val key = Piv.parseManagementKey(form.managementKey) ?: return
         runOnUiThread { state?.pivPrompt = PivPrompt.Working }
         val iso = android.nfc.tech.IsoDep.get(tag)
+        // Debug builds log every PIV exchange (command header + SW only,
+        // never data: the VERIFY body is the PIN).
+        val transport = Piv.Transport { apdu ->
+            val reply = iso!!.transceive(apdu)
+            if (BuildConfig.DEBUG && apdu.size >= 4 && reply.size >= 2) {
+                android.util.Log.d(
+                    "tapbridge-piv",
+                    "%02X %02X %02X %02X len=%d -> SW %02X%02X (%d bytes)".format(
+                        apdu[0], apdu[1], apdu[2], apdu[3], apdu.size,
+                        reply[reply.size - 2], reply[reply.size - 1], reply.size - 2,
+                    ),
+                )
+            }
+            reply
+        }
         val next: PivPrompt = if (iso == null) {
             PivPrompt.Failed("That isn't a smart card.")
         } else try {
@@ -219,7 +264,7 @@ class MainActivity : ComponentActivity() {
             iso.timeout = 20000
             // slots = null: fill whatever is empty on the key actually held
             // now, which may not be the one that got the offer.
-            val result = Piv.setUp({ iso.transceive(it) }, pin, form.name ?: "", managementKey = key)
+            val result = Piv.setUp(transport, pin, form.name ?: "", slots = form.slots, managementKey = key)
             if (result.slots.isEmpty()) PivPrompt.Failed("This key already has its certificates.")
             else PivPrompt.Done(result.slots)
         } catch (wrong: Piv.WrongPin) {
@@ -475,6 +520,7 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
                         RegisteredKeys.remove(context, record.id)
                         keys = RegisteredKeys.list(context)
                     },
+                    onSetUpPiv = { activity.startPivSetup() },
                     onBack = { screen = "home" },
                     Modifier.fillMaxSize(),
                 )

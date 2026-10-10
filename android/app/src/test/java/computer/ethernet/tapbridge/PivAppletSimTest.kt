@@ -101,4 +101,22 @@ class PivAppletSimTest {
         assertThrows(Piv.PinRetriesTooLow::class.java) { Piv.setUp(card, "123456", "x") }
         assertEquals(1, pinVerifies)
     }
+
+    /**
+     * A slot left with PIN policy "always" (an earlier tool generated it
+     * with tag AA 03) wants VERIFY right before every signature; one VERIFY
+     * up front then gets 6982 on the certificate signature. Seen live.
+     */
+    @Test fun setUpSignsSlotsWithPinPolicyAlways() {
+        assertTrue(Piv.select(card))
+        Piv.authenticate(card, Piv.DEFAULT_MANAGEMENT_KEY)
+        val template = Der.tlv(0xAC, Der.tlv(0x80, byteArrayOf(0x11)) + Der.tlv(0xAA, byteArrayOf(0x03)))
+        val (_, sw) = Piv.send(card, Piv.apdu(0x00, 0x47, 0x00, 0x9A, template, le = true))
+        assertEquals(0x9000, sw)
+        pinVerifies = 0
+        val result = Piv.setUp(card, "123456", "x")
+        assertEquals(Piv.SETUP_SLOTS, result.slots)
+        certIn(Piv.Slot.AUTHENTICATION).let { it.verify(it.publicKey) }
+        assertEquals(5, Piv.probe(card)!!.pinRetries)
+    }
 }

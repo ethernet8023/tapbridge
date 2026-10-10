@@ -333,8 +333,11 @@ RESPONSECODE IFDHPowerICC(DWORD Lun, DWORD Action, PUCHAR Atr, PDWORD AtrLength)
         *AtrLength = 0;
         return IFD_COMMUNICATION_ERROR;
     }
-    if (atr_len > *AtrLength)
-        atr_len = *AtrLength;
+    /* Apple's ifdreader passes *AtrLength unreliably (often 0), so trusting
+     * it truncated the ATR to nothing and macOS logged "failed to reset the
+     * card". Like vpcd on __APPLE__: the buffer is always MAX_ATR_SIZE. */
+    if (atr_len > MAX_ATR_SIZE)
+        atr_len = MAX_ATR_SIZE;
     memcpy(Atr, atr, atr_len);
     *AtrLength = atr_len;
     return IFD_SUCCESS;
