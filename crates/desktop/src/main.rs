@@ -38,8 +38,10 @@ use std::path::PathBuf;
 
 fn state_dir() -> PathBuf {
     #[cfg(windows)]
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(local).join("tapbridge");
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .map(|local| PathBuf::from(local).join("tapbridge"))
+            .unwrap_or_else(|| PathBuf::from("tapbridge-state"))
     }
     #[cfg(target_os = "macos")]
     {

@@ -130,19 +130,6 @@ type ShellInstance = single::Instance;
 #[cfg(not(windows))]
 type ShellInstance = NoopInstance;
 
-/// Conversion helper for the Windows guard.
-#[cfg(windows)]
-trait IntoShellInstance {
-    fn into_shell_instance(self) -> single::Instance;
-}
-
-#[cfg(windows)]
-impl IntoShellInstance for single::Instance {
-    fn into_shell_instance(self) -> single::Instance {
-        self
-    }
-}
-
 pub fn run(state_dir: PathBuf, trace_apdu: bool, instance: impl InstanceGuard) {
     let (events, inbox) = mpsc::channel();
     #[cfg(windows)]
@@ -273,6 +260,9 @@ pub trait InstanceGuard: 'static {
     /// Windows: forward `--pair`/`--passkey-options` launches into the loop.
     #[cfg(windows)]
     fn listen_requests(&self, events: mpsc::Sender<UiEvent>);
+    /// Windows: the guard the shell keeps alive for the app's lifetime.
+    #[cfg(windows)]
+    fn into_shell_instance(self) -> single::Instance;
 }
 
 #[cfg(windows)]
@@ -281,6 +271,10 @@ impl InstanceGuard for single::Instance {
         single::Instance::listen(self, move |request| {
             let _ = events.send(UiEvent::Open(request));
         })
+    }
+
+    fn into_shell_instance(self) -> single::Instance {
+        self
     }
 }
 

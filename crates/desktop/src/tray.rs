@@ -95,11 +95,11 @@ impl Tray {
         let builder = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("tapbridge");
-        let builder = if assets::Icons::TEMPLATE {
-            builder.with_icon_templated(icons.for_state(TrayState::Disconnected, 0))
-        } else {
-            builder.with_icon(icons.for_state(TrayState::Disconnected, 0))
-        };
+        // macOS: template icons, recoloured by the system for the menu bar.
+        #[cfg(target_os = "macos")]
+        let builder = builder.with_icon_templated(icons.for_state(TrayState::Disconnected, 0));
+        #[cfg(not(target_os = "macos"))]
+        let builder = builder.with_icon(icons.for_state(TrayState::Disconnected, 0));
         let tray = builder.build().map_err(|e| e.to_string())?;
         Ok(Self {
             tray,
@@ -128,11 +128,10 @@ impl Tray {
         if self.shown != Some((state, frame)) {
             self.shown = Some((state, frame));
             let icon = self.icons.for_state(state, frame);
-            let _ = if assets::Icons::TEMPLATE {
-                self.tray.set_icon_templated(Some(icon))
-            } else {
-                self.tray.set_icon(Some(icon))
-            };
+            #[cfg(target_os = "macos")]
+            let _ = self.tray.set_icon_templated(Some(icon));
+            #[cfg(not(target_os = "macos"))]
+            let _ = self.tray.set_icon(Some(icon));
         }
         let tooltip = if state == TrayState::MissingUsbip {
             "Install USB/IP driver"

@@ -32,9 +32,6 @@ fn load(embedded: &[u8]) -> tray_icon::Icon {
 }
 
 impl Icons {
-    /// Whether these icons must be drawn as macOS template images.
-    pub const TEMPLATE: bool = cfg!(target_os = "macos");
-
     #[cfg(target_os = "macos")]
     pub fn load() -> Self {
         Self {
