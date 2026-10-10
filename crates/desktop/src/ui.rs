@@ -1561,17 +1561,12 @@ impl Render for SettingsView {
             );
 
         let (phone_title, phone_detail) = match &snapshot.phone {
-            Some(name) if snapshot.phone_connected => {
-                (name.clone(), "Paired, connected now".to_owned())
-            }
+            Some(name) if snapshot.phone_connected => (name.clone(), Some("Paired, connected now")),
             Some(name) => (
                 name.clone(),
-                "Paired. Connects when you need your key.".to_owned(),
+                Some("Paired. Connects when you need your key."),
             ),
-            None => (
-                "No phone paired".to_owned(),
-                "Pair your Android phone to use it as this computer's key reader.".to_owned(),
-            ),
+            None => ("No phone paired".to_owned(), None),
         };
         let phone_button = if snapshot.phone.is_some() {
             let label = if self.confirm_forget {
@@ -1600,7 +1595,7 @@ impl Render for SettingsView {
                 cx.notify();
             }))
         } else {
-            button("pair", "Pair phone\u{2026}", ACCENT, 0.6, cx).on_click(
+            button("pair", "Pair a phone", ACCENT, 0.6, cx).on_click(
                 cx.listener(|view, _: &gpui::ClickEvent, _, cx| view.act(SettingsAction::Pair, cx)),
             )
         };
@@ -1629,12 +1624,12 @@ impl Render for SettingsView {
                                     .font_weight(gpui::FontWeight::MEDIUM)
                                     .child(phone_title),
                             )
-                            .child(
+                            .children(phone_detail.map(|detail| {
                                 div()
                                     .text_size(px(12.5))
                                     .text_color(rgb(ACCENT_SOFT))
-                                    .child(phone_detail),
-                            ),
+                                    .child(detail)
+                            })),
                     )
                     .child(phone_button),
             );
