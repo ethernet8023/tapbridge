@@ -82,9 +82,9 @@ pub struct Status {
     pub phone_name: Option<String>,
     pub card_present: bool,
     pub push_stored: bool,
-    /// Current card ATR when present (macOS IFD path; empty otherwise).
+    /// Current card ATR when present (empty otherwise).
     pub atr: Vec<u8>,
-    /// Generation of the current card tap (macOS; 0 otherwise). Every tap
+    /// Generation of the current card tap (0 before the first). Every tap
     /// powers the card up afresh, which regenerates its CTAP PIN key
     /// agreement key: the security key uses this to notice a re-tap.
     pub card_generation: u64,
@@ -427,11 +427,10 @@ async fn run_inner(
     let mut card_uid: Vec<u8> = Vec::new();
     let mut known = KnownCards::open(&settings.state_dir);
     let mut probe = CapabilityProbe::default();
-    // Latest card state for the macOS IFD path: generation + ATR
-    // (latest-wins, like the reader's `Shared::latest_card`).
-    #[cfg(target_os = "macos")]
+    // Latest card state: generation + ATR (latest-wins, like the reader's
+    // `Shared::latest_card`). Reported in Status; the macOS IFD path also
+    // tags PIV APDUs with the generation.
     let mut card_generation: u64 = 0;
-    #[cfg(target_os = "macos")]
     let mut latest_atr: Vec<u8> = Vec::new();
     // One PIV APDU in flight (size-1, like the reader's `InFlight`).
     #[cfg(target_os = "macos")]
@@ -507,14 +506,8 @@ async fn run_inner(
                                 phone_name: store.peer_name.clone(),
                                 card_present,
                                 push_stored: store.push_token.is_some(),
-                                #[cfg(target_os = "macos")]
                                 atr: if card_present { latest_atr.clone() } else { Vec::new() },
-                                #[cfg(not(target_os = "macos"))]
-                                atr: Vec::new(),
-                                #[cfg(target_os = "macos")]
                                 card_generation,
-                                #[cfg(not(target_os = "macos"))]
-                                card_generation: 0,
                                 card_uid: if card_present { card_uid.clone() } else { Vec::new() },
                             });
                         },
@@ -703,8 +696,6 @@ async fn run_inner(
                         Some(Ok(frame @ (Frame::Card { .. } | Frame::Response { .. } | Frame::Failed { .. }))) => {
                             if let Some(line) = tracer.as_mut().and_then(|t| t.observe(&frame)) { let _ = events.send(Event::Trace(line)); }
                             if let Frame::Card { generation, atr, uid, .. } = &frame {
-                                #[cfg(not(target_os = "macos"))]
-                                let _ = generation;
                                 card_present = !atr.is_empty();
                                 probe.reset();
                                 card_uid = if card_present && uid_stable(uid) { uid.clone() } else { Vec::new() };
@@ -712,11 +703,8 @@ async fn run_inner(
                                     let _ = known.save();
                                     let _ = events.send(Event::CardsChanged);
                                 }
-                                #[cfg(target_os = "macos")]
-                                {
-                                    card_generation = *generation;
-                                    latest_atr.clone_from(atr);
-                                }
+                                card_generation = *generation;
+                                latest_atr.clone_from(atr);
                                 let _ = events.send(Event::CardPresent { present: card_present, uid: card_uid.clone() });
                                 // Card absence/replacement retires a pending
                                 // PIV APDU (never carried to the next tag),
