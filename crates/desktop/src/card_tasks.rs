@@ -89,11 +89,14 @@ impl CardTask {
         }
     }
 
-    /// The phone reported the setup outcome.
-    pub fn setup_done(&mut self, ok: bool) {
-        if matches!(self.step, Step::OnPhone | Step::Connecting { .. }) {
+    /// The phone reported the setup outcome. Returns whether this task
+    /// was waiting for it.
+    pub fn setup_done(&mut self, ok: bool) -> bool {
+        let waiting = matches!(self.step, Step::OnPhone | Step::Connecting { .. });
+        if waiting {
             self.step = Step::SetupDone { ok };
         }
+        waiting
     }
 
     /// "Use for Mac login": runs at once when the card is on the phone.
@@ -273,7 +276,10 @@ mod tests {
         assert_eq!(task.tick(now, true, &[]), Some(Effect::SendSetup));
         assert_eq!(task.setup_sent(true, now), None);
         assert_eq!(task.step, Step::OnPhone);
-        task.setup_done(false);
+        assert!(task.setup_done(false));
+        assert!(task.failed());
+        // A late or repeated answer changes nothing.
+        assert!(!task.setup_done(true));
         assert!(task.failed());
     }
 

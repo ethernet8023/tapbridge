@@ -396,11 +396,11 @@ fn tick(inbox: &mpsc::Receiver<UiEvent>, cx: &mut App) {
             service::Event::PivSetupDone { ok } => {
                 let ok = *ok;
                 cx.update_global::<Shell, _>(|shell, _| {
-                    if let Some(task) = shell.card_task.as_mut() {
-                        task.setup_done(ok);
-                        if ok {
-                            shell.setup_ok.insert(task.uid.clone());
-                        }
+                    if let Some(task) = shell.card_task.as_mut()
+                        && task.setup_done(ok)
+                        && ok
+                    {
+                        shell.setup_ok.insert(task.uid.clone());
                     }
                 });
             }
