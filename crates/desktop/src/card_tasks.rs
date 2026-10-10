@@ -177,6 +177,134 @@ impl CardTask {
     }
 }
 
+/// One step of the "macOS login" checklist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepState {
+    Done,
+    /// Can be done now.
+    Todo,
+    /// Something is wrong and needs the user (e.g. an applet that blocks NFC).
+    Problem,
+    /// Waits for an earlier step.
+    Locked,
+}
+
+/// The three steps toward signing in to the Mac with a card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Checklist {
+    pub applet: StepState,
+    pub certificates: StepState,
+    pub mac_login: StepState,
+}
+
+impl Checklist {
+    /// From what is known about the card. Each step needs the one before.
+    pub fn new(card: &tapbridge_host::cards::KnownCard) -> Self {
+        let applet = if card.piv_blocked {
+            StepState::Problem
+        } else if card.has_piv || card.piv_certs {
+            StepState::Done
+        } else {
+            StepState::Todo
+        };
+        let certificates = match applet {
+            StepState::Done if card.piv_certs => StepState::Done,
+            StepState::Done => StepState::Todo,
+            _ => StepState::Locked,
+        };
+        let mac_login = match certificates {
+            StepState::Done if card.mac_login => StepState::Done,
+            StepState::Done => StepState::Todo,
+            _ => StepState::Locked,
+        };
+        Self {
+            applet,
+            certificates,
+            mac_login,
+        }
+    }
+
+    pub fn ready(&self) -> bool {
+        self.mac_login == StepState::Done
+    }
+
+    /// The one-line summary under the card name.
+    pub fn summary(&self) -> &'static str {
+        match (self.applet, self.certificates, self.mac_login) {
+            (StepState::Problem, ..) => "Smart-card applet blocks NFC",
+            (StepState::Todo, ..) => "No smart-card applet",
+            (_, StepState::Todo, _) => "Certificates not set up",
+            (_, _, StepState::Todo) => "Ready to set up macOS login",
+            (_, _, StepState::Done) => "Ready for macOS login",
+            _ => "",
+        }
+    }
+}
+
+/// Dangerous Things flexSecure: its ATR historical bytes (the phone builds
+/// `3B 8n 80 01 <historical> TCK`). Matches the ATR the forum and our own
+/// implant report: 3B8D80010031C173C8400052A51000900070.
+const FLEXSECURE_HISTORICAL: [u8; 13] = [
+    0x00, 0x31, 0xC1, 0x73, 0xC8, 0x40, 0x00, 0x52, 0xA5, 0x10, 0x00, 0x90, 0x00,
+];
+
+pub fn is_flexsecure(atr: &[u8]) -> bool {
+    match atr {
+        [0x3B, t0, 0x80, 0x01, rest @ ..] if t0 & 0xF0 == 0x80 => rest
+            .get(..usize::from(t0 & 0x0F))
+            .is_some_and(|historical| historical == FLEXSECURE_HISTORICAL),
+        _ => false,
+    }
+}
+
+pub const GP_MOBILE_URL: &str =
+    "https://play.google.com/store/apps/details?id=com.dangerousthings.gpmobile";
+pub const PIVAPPLET_RELEASE_URL: &str =
+    "https://github.com/arekinath/PivApplet/releases/tag/v0.9.0";
+/// The build that works over NFC on a flexSecure: P-256/P-384 ECDSA, RSA,
+/// AES/3DES admin keys, extended APDUs, and no strict-contactless lock.
+pub const FLEXSECURE_CAP: &str = "PivApplet-0.9.0-jc304-REePAxaD.cap";
+
+/// "How to install" for step 1, one paragraph per entry. `blocked`: an
+/// applet is there but locks its keys over NFC.
+pub fn install_steps(atr: &[u8], blocked: bool) -> Vec<String> {
+    let mut steps = Vec::new();
+    if blocked {
+        steps.push(
+            "The smart-card applet on this card refuses its keys over NFC: it's a \
+             strict-contactless build (an S in its name, like REePSAaD). Replace it \
+             with a build without the S."
+                .to_owned(),
+        );
+    }
+    if is_flexsecure(atr) {
+        steps.push(format!(
+            "This looks like a flexSecure. Install {FLEXSECURE_CAP} from the PivApplet \
+             v0.9.0 release with the GlobalPlatform Mobile app on your phone. Don't use \
+             builds with S in the name: they block NFC."
+        ));
+    } else {
+        steps.push(
+            "Install PivApplet from its releases page with the GlobalPlatform Mobile \
+             app on your phone, if your card can take applets. Pick a jc304 build \
+             without S in its name: those block NFC."
+                .to_owned(),
+        );
+    }
+    steps.push(
+        "With gp.jar instead: java -jar gp.jar --list, then --delete <old PivApplet \
+         package AID from the list> if one is there, then --install <the .cap file>. \
+         Add --key if your card's GlobalPlatform key isn't the default."
+            .to_owned(),
+    );
+    steps.push(
+        "This doesn't touch the passkey (FIDO) applet. A new PivApplet starts with \
+         PIN 123456 and PUK 12345678."
+            .to_owned(),
+    );
+    steps
+}
+
 /// "Last seen" for a card row.
 pub fn last_seen_text(now: u64, last_seen: u64, present: bool) -> String {
     if present {
@@ -370,5 +498,89 @@ mod tests {
         assert_eq!(test, TestTap::TimedOut);
         test.card("late".into());
         assert_eq!(test, TestTap::TimedOut);
+    }
+
+    fn card(
+        edit: impl FnOnce(&mut tapbridge_host::cards::KnownCard),
+    ) -> tapbridge_host::cards::KnownCard {
+        let mut card = tapbridge_host::cards::KnownCard::default();
+        edit(&mut card);
+        card
+    }
+
+    #[test]
+    fn each_step_waits_for_the_one_before() {
+        use StepState::*;
+        let none = Checklist::new(&card(|_| {}));
+        assert_eq!(
+            (none.applet, none.certificates, none.mac_login),
+            (Todo, Locked, Locked)
+        );
+        let applet = Checklist::new(&card(|c| c.has_piv = true));
+        assert_eq!(
+            (applet.applet, applet.certificates, applet.mac_login),
+            (Done, Todo, Locked)
+        );
+        let certs = Checklist::new(&card(|c| {
+            c.has_piv = true;
+            c.piv_certs = true;
+        }));
+        assert_eq!(
+            (certs.applet, certs.certificates, certs.mac_login),
+            (Done, Done, Todo)
+        );
+        let ready = Checklist::new(&card(|c| {
+            c.has_piv = true;
+            c.piv_certs = true;
+            c.mac_login = true;
+        }));
+        assert!(ready.ready());
+        assert_eq!(ready.summary(), "Ready for macOS login");
+        // A stale Mac login flag can't skip missing certificates.
+        let stale = Checklist::new(&card(|c| {
+            c.has_piv = true;
+            c.mac_login = true;
+        }));
+        assert_eq!(stale.mac_login, Locked);
+    }
+
+    #[test]
+    fn a_blocking_applet_is_a_problem_and_locks_the_rest() {
+        let blocked = Checklist::new(&card(|c| {
+            c.has_piv = true;
+            c.piv_blocked = true;
+        }));
+        assert_eq!(blocked.applet, StepState::Problem);
+        assert_eq!(blocked.certificates, StepState::Locked);
+        assert_eq!(blocked.summary(), "Smart-card applet blocks NFC");
+    }
+
+    #[test]
+    fn flexsecure_is_recognised_by_its_atr() {
+        let atr = [
+            0x3B, 0x8D, 0x80, 0x01, 0x00, 0x31, 0xC1, 0x73, 0xC8, 0x40, 0x00, 0x52, 0xA5, 0x10,
+            0x00, 0x90, 0x00, 0x70,
+        ];
+        assert!(is_flexsecure(&atr));
+        let mut other = atr;
+        other[8] = 0x00;
+        assert!(!is_flexsecure(&other));
+        assert!(!is_flexsecure(&[]));
+        assert!(!is_flexsecure(&[0x3B, 0x80, 0x80, 0x01, 0x01]));
+    }
+
+    #[test]
+    fn install_steps_name_the_exact_build_for_a_flexsecure() {
+        let flex = [
+            0x3B, 0x8D, 0x80, 0x01, 0x00, 0x31, 0xC1, 0x73, 0xC8, 0x40, 0x00, 0x52, 0xA5, 0x10,
+            0x00, 0x90, 0x00, 0x70,
+        ];
+        let steps = install_steps(&flex, false).join(" ");
+        assert!(steps.contains(FLEXSECURE_CAP));
+        assert!(!steps.contains("strict-contactless"));
+        let generic = install_steps(&[], true).join(" ");
+        assert!(!generic.contains(FLEXSECURE_CAP));
+        assert!(generic.contains("strict-contactless"));
+        assert!(generic.contains("gp.jar"));
     }
 }

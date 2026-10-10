@@ -1,6 +1,6 @@
 //! gpui windows: the pairing QR window and the Settings window. Only these
 //! surfaces use gpui; the tray and all orchestration live beside them.
-use crate::card_tasks::TestTap;
+use crate::card_tasks::{Checklist, StepState, TestTap};
 use crate::glass;
 #[cfg(windows)]
 use crate::passkeys;
@@ -828,6 +828,10 @@ pub enum SettingsAction {
     RenameCard(Vec<u8>, String),
     ForgetCard(Vec<u8>),
     SetUpCard(Vec<u8>),
+    /// Ask for a tap so the card's applets are read again (macOS's PIV
+    /// driver reads the card when it arrives; the probe watches that).
+    CheckCard,
+    OpenUrl(String),
     /// macOS only: pair the card's login certificate with this Mac.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     MacLogin(Vec<u8>),
@@ -844,6 +848,12 @@ pub struct CardRow {
     pub last_seen: String,
     pub passkey: bool,
     pub smart_card: bool,
+    /// The "macOS login" steps for this card.
+    pub checklist: Option<Checklist>,
+    /// "How to install" paragraphs for the applet step.
+    pub install_steps: Vec<String>,
+    /// A flexSecure: link the exact PivApplet build.
+    pub flexsecure: bool,
     /// Status line of the action in progress on this card.
     pub task: Option<String>,
     pub task_failed: bool,
@@ -891,6 +901,10 @@ pub struct SettingsView {
     confirm_forget: bool,
     /// "Forget" on a card asks once more, too.
     confirm_forget_card: Option<Vec<u8>>,
+    /// Cards whose checklist is open.
+    expanded: std::collections::HashSet<Vec<u8>>,
+    /// Cards showing the applet install instructions.
+    show_install: std::collections::HashSet<Vec<u8>>,
     /// Card being renamed, its text field, and the field's event subscription.
     editing: Option<(Vec<u8>, gpui::Entity<TextInput>, gpui::Subscription)>,
     focus: FocusHandle,
@@ -909,6 +923,8 @@ impl SettingsView {
             on_action,
             confirm_forget: false,
             confirm_forget_card: None,
+            expanded: Default::default(),
+            show_install: Default::default(),
             editing: None,
             focus: cx.focus_handle(),
             #[cfg(windows)]
@@ -1042,7 +1058,12 @@ impl SettingsView {
                         div()
                             .text_size(px(12.5))
                             .text_color(rgb(ACCENT_SOFT))
-                            .child(format!("Last seen {}", card.last_seen)),
+                            .child(match card.checklist.map(|c| c.summary()) {
+                                Some(summary) if !summary.is_empty() => {
+                                    format!("Last seen {} \u{00B7} {summary}", card.last_seen)
+                                }
+                                _ => format!("Last seen {}", card.last_seen),
+                            }),
                     ),
             )
             .child(badges);
@@ -1097,32 +1118,31 @@ impl SettingsView {
                     cx.notify();
                 })),
             );
-            if !self.snapshot.card_busy {
-                let setup_uid = uid.clone();
+            if let Some(checklist) = card.checklist {
+                let open = self.expanded.contains(&card.uid);
+                let toggle_uid = uid.clone();
+                let label = if open {
+                    "Hide macOS login".to_owned()
+                } else if checklist.ready() {
+                    "macOS login \u{2713}".to_owned()
+                } else {
+                    "Set up macOS login\u{2026}".to_owned()
+                };
+                let (tint, opacity) = if open || checklist.ready() {
+                    (0xFFFFFF, 0.06)
+                } else {
+                    (ACCENT, 0.6)
+                };
                 buttons = buttons.child(
-                    card_button(
-                        "card-setup",
-                        index,
-                        "Set up as smart card",
-                        0xFFFFFF,
-                        0.06,
-                        cx,
-                    )
-                    .on_click(cx.listener(
-                        move |view, _: &gpui::ClickEvent, _, cx| {
-                            view.act(SettingsAction::SetUpCard(setup_uid.clone()), cx)
-                        },
-                    )),
+                    card_button("card-wizard", index, label, tint, opacity, cx).on_click(
+                        cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
+                            if !view.expanded.remove(&toggle_uid) {
+                                view.expanded.insert(toggle_uid.clone());
+                            }
+                            cx.notify();
+                        }),
+                    ),
                 );
-                if card.offer_mac_login {
-                    let login_uid = uid.clone();
-                    buttons = buttons.child(
-                        card_button("card-login", index, "Use for Mac login", ACCENT, 0.6, cx)
-                            .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
-                                view.act(SettingsAction::MacLogin(login_uid.clone()), cx)
-                            })),
-                    );
-                }
             }
         }
         let mut panel = glass::panel(&format!("card-{index}"), 14.0, cx)
@@ -1131,6 +1151,11 @@ impl SettingsView {
             .gap(px(10.0))
             .p(px(14.0))
             .child(header);
+        if let Some(checklist) = card.checklist
+            && self.expanded.contains(&card.uid)
+        {
+            panel = panel.child(self.render_checklist(index, card, checklist, cx));
+        }
         if let Some(task) = &card.task {
             let mut line = div().flex().flex_row().items_center().gap(px(10.0)).child(
                 div()
@@ -1154,6 +1179,221 @@ impl SettingsView {
         }
         panel.child(buttons)
     }
+}
+
+impl SettingsView {
+    /// The three "macOS login" steps: applet, certificates, Mac login.
+    /// Each button runs on the device that does the work: the phone creates
+    /// certificates, this Mac pairs its login.
+    fn render_checklist(
+        &self,
+        index: usize,
+        card: &CardRow,
+        checklist: Checklist,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let busy = self.snapshot.card_busy;
+        let uid = card.uid.clone();
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .pt(px(10.0))
+            .border_t_1()
+            .border_color(rgba(0xFFFFFF1F));
+
+        // 1. Applet.
+        let applet_detail = match checklist.applet {
+            StepState::Done => "The card has a PIV smart-card applet.",
+            StepState::Problem => "The applet on this card blocks its keys over NFC.",
+            _ => "Your card needs a PIV smart-card applet first.",
+        };
+        let mut applet_actions = div().flex().flex_row().flex_wrap().gap(px(8.0));
+        if checklist.applet != StepState::Done {
+            let install_uid = uid.clone();
+            let showing = self.show_install.contains(&card.uid);
+            applet_actions = applet_actions.child(
+                card_button(
+                    "step-install",
+                    index,
+                    if showing {
+                        "Hide instructions"
+                    } else {
+                        "How to install"
+                    },
+                    0xFFFFFF,
+                    0.06,
+                    cx,
+                )
+                .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
+                    if !view.show_install.remove(&install_uid) {
+                        view.show_install.insert(install_uid.clone());
+                    }
+                    cx.notify();
+                })),
+            );
+            if !busy {
+                applet_actions = applet_actions.child(
+                    card_button("step-check", index, "Check card", ACCENT, 0.6, cx).on_click(
+                        cx.listener(|view, _: &gpui::ClickEvent, _, cx| {
+                            view.act(SettingsAction::CheckCard, cx)
+                        }),
+                    ),
+                );
+            }
+        }
+        let mut applet_body = div().flex().flex_col().gap(px(8.0)).child(applet_actions);
+        if checklist.applet != StepState::Done && self.show_install.contains(&card.uid) {
+            let mut how = div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .text_size(px(12.0))
+                .text_color(rgb(TEXT));
+            for line in &card.install_steps {
+                how = how.child(div().child(line.clone()));
+            }
+            let mut links = div().flex().flex_row().flex_wrap().gap(px(8.0));
+            for (id, label, url) in [
+                (
+                    "link-gp",
+                    "GlobalPlatform Mobile",
+                    crate::card_tasks::GP_MOBILE_URL,
+                ),
+                (
+                    "link-pivapplet",
+                    if card.flexsecure {
+                        "PivApplet v0.9.0 (REePAxaD)"
+                    } else {
+                        "PivApplet releases"
+                    },
+                    crate::card_tasks::PIVAPPLET_RELEASE_URL,
+                ),
+            ] {
+                links = links.child(card_button(id, index, label, 0xFFFFFF, 0.06, cx).on_click(
+                    cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
+                        view.act(SettingsAction::OpenUrl(url.to_owned()), cx)
+                    }),
+                ));
+            }
+            applet_body = applet_body.child(how.child(links));
+        }
+        list = list.child(step_row(
+            1,
+            "Smart-card applet installed",
+            applet_detail,
+            checklist.applet,
+            applet_body,
+        ));
+
+        // 2. Certificates (made on the phone).
+        let mut certs_body = div().flex().flex_row();
+        if checklist.certificates == StepState::Todo && !busy {
+            let setup_uid = uid.clone();
+            certs_body = certs_body.child(
+                card_button("step-certs", index, "Create on phone", ACCENT, 0.6, cx).on_click(
+                    cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
+                        view.act(SettingsAction::SetUpCard(setup_uid.clone()), cx)
+                    }),
+                ),
+            );
+        }
+        list = list.child(step_row(
+            2,
+            "Certificates created",
+            match checklist.certificates {
+                StepState::Done => "The login certificate is on the card.",
+                StepState::Locked => "Needs the applet.",
+                _ => "Your phone creates them. Existing certificates are never replaced.",
+            },
+            checklist.certificates,
+            certs_body,
+        ));
+
+        // 3. macOS login (paired on this Mac).
+        let mut login_body = div().flex().flex_row();
+        if checklist.mac_login == StepState::Todo && !busy && cfg!(target_os = "macos") {
+            let login_uid = uid.clone();
+            login_body = login_body.child(
+                card_button("step-login", index, "Set up macOS login", ACCENT, 0.6, cx).on_click(
+                    cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
+                        view.act(SettingsAction::MacLogin(login_uid.clone()), cx)
+                    }),
+                ),
+            );
+        }
+        list.child(step_row(
+            3,
+            "macOS login",
+            match checklist.mac_login {
+                StepState::Done => "This card unlocks your Mac.",
+                StepState::Locked => "Needs certificates.",
+                _ if cfg!(target_os = "macos") => {
+                    "Pairs the card with your account. macOS asks for your password."
+                }
+                _ => "Only on a Mac.",
+            },
+            checklist.mac_login,
+            login_body,
+        ))
+    }
+}
+
+/// One checklist row: mark, then title, detail and `body` (actions,
+/// instructions) stacked beside it.
+fn step_row(number: u8, title: &str, detail: &str, state: StepState, body: gpui::Div) -> gpui::Div {
+    let (mark, color) = match state {
+        StepState::Done => ("\u{2713}".to_owned(), GOOD),
+        StepState::Problem => ("!".to_owned(), WARN),
+        StepState::Todo => (number.to_string(), ACCENT_SOFT),
+        StepState::Locked => (number.to_string(), 0x8A84A3),
+    };
+    let dim = state == StepState::Locked;
+    div()
+        .flex()
+        .flex_row()
+        .gap(px(10.0))
+        .child(
+            div()
+                .flex_none()
+                .size(px(22.0))
+                .rounded_full()
+                .border_1()
+                .border_color(rgb(color))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(11.5))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(rgb(color))
+                .child(mark),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .text_size(px(13.5))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(if dim { 0x8A84A3 } else { TEXT }))
+                        .child(title.to_owned()),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(if state == StepState::Problem {
+                            WARN
+                        } else {
+                            ACCENT_SOFT
+                        }))
+                        .child(detail.to_owned()),
+                )
+                .child(body),
+        )
 }
 
 /// A button inside a card row; `index` keeps ids and glass keys unique.

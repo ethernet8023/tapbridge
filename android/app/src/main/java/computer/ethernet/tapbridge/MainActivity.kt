@@ -263,8 +263,10 @@ class MainActivity : ComponentActivity() {
     }
 
     internal fun endPiv() {
-        // Closed before it finished: the PC stops waiting.
-        finishHostPiv(state?.pivPrompt is PivPrompt.Done)
+        // Closed before it finished: the PC stops waiting. A review that
+        // found the certificates already there counts as done.
+        val prompt = state?.pivPrompt
+        finishHostPiv(prompt is PivPrompt.Done || (prompt is PivPrompt.Review && !prompt.status.needsSetup))
         state?.pivPrompt = null
     }
 

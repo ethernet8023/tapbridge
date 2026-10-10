@@ -274,6 +274,34 @@ pub fn pair_present_card(
     classify_pair(succeeded, &output, now_paired)
 }
 
+/// Whether the inserted card's login identity (PIV Authentication,
+/// else its only identity) is paired: `None` while no inserted card has an
+/// identity yet, or several cards make it unclear.
+pub fn login_paired(tokens: &[Token]) -> Option<bool> {
+    match pick(tokens) {
+        Pick::AlreadyPaired => Some(true),
+        Pick::Pair(_) => Some(false),
+        Pick::NoIdentity | Pick::Ambiguous => None,
+    }
+}
+
+/// Reads [`login_paired`] for the card on the phone, retrying while
+/// macOS's token driver catches up with a fresh tap.
+pub fn present_card_paired(runner: &dyn Runner, attempts: u32, pause: Duration) -> Option<bool> {
+    for attempt in 0..attempts.max(1) {
+        if attempt > 0 {
+            std::thread::sleep(pause);
+        }
+        if let Some(paired) = identities(runner)
+            .ok()
+            .and_then(|tokens| login_paired(&tokens))
+        {
+            return Some(paired);
+        }
+    }
+    None
+}
+
 /// The logged-in user's short name.
 pub fn current_user() -> Option<String> {
     std::env::var("USER").ok().filter(|user| valid_user(user))
@@ -471,6 +499,26 @@ mod tests {
         assert_eq!(
             pair_present_card(&fake, "ethernet", 2, Duration::ZERO),
             Outcome::AlreadyPaired
+        );
+    }
+
+    #[test]
+    fn login_paired_reads_the_present_card() {
+        assert_eq!(login_paired(&parse_identities(UNPAIRED)), Some(false));
+        assert_eq!(login_paired(&parse_identities(PAIRED)), Some(true));
+        assert_eq!(login_paired(&parse_identities("")), None);
+    }
+
+    #[test]
+    fn present_card_paired_waits_for_the_token_and_never_pairs() {
+        let fake = Fake::new(&[(true, ""), (true, PAIRED)]);
+        assert_eq!(present_card_paired(&fake, 3, Duration::ZERO), Some(true));
+        let calls = fake.calls.borrow();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.iter().any(|arg| arg == "identities"))
         );
     }
 }

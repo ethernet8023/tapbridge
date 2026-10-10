@@ -22,7 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tapbridge_host::{
-    cards::KnownCard,
+    cards::{KnownCard, Mark},
     service::{self, ServiceHandle, TapOutcome},
 };
 
@@ -64,6 +64,10 @@ pub enum UiEvent {
     /// "Use for Mac login" finished: (ok, message).
     #[cfg(target_os = "macos")]
     MacLoginDone(bool, String),
+    /// macOS: whether this card's identity is paired with the Mac login
+    /// (read from `sc_auth identities` after a tap).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    LoginChecked(Vec<u8>, bool),
 }
 
 #[cfg(windows)]
@@ -162,20 +166,40 @@ pub fn preview_ui() {
             phone_connected: true,
             autostart: true,
             cards: vec![
-                crate::ui::CardRow {
-                    uid: vec![4, 1, 2, 3, 4, 5, 6],
-                    label: "Implant".into(),
-                    last_seen: "now".into(),
-                    passkey: true,
-                    smart_card: true,
-                    offer_mac_login: cfg!(target_os = "macos"),
-                    ..Default::default()
+                {
+                    let flex = [
+                        0x3B, 0x8D, 0x80, 0x01, 0x00, 0x31, 0xC1, 0x73, 0xC8, 0x40, 0x00, 0x52,
+                        0xA5, 0x10, 0x00, 0x90, 0x00, 0x70,
+                    ];
+                    let card = KnownCard {
+                        has_fido: true,
+                        has_piv: true,
+                        piv_certs: true,
+                        ..Default::default()
+                    };
+                    crate::ui::CardRow {
+                        uid: vec![4, 1, 2, 3, 4, 5, 6],
+                        label: "Implant".into(),
+                        last_seen: "now".into(),
+                        passkey: true,
+                        smart_card: true,
+                        offer_mac_login: cfg!(target_os = "macos"),
+                        checklist: Some(crate::card_tasks::Checklist::new(&card)),
+                        install_steps: crate::card_tasks::install_steps(&flex, false),
+                        flexsecure: true,
+                        ..Default::default()
+                    }
                 },
                 crate::ui::CardRow {
                     uid: vec![4, 9, 9, 9, 9, 9, 9],
                     label: "Card 2".into(),
                     last_seen: "3 days ago".into(),
                     passkey: true,
+                    checklist: Some(crate::card_tasks::Checklist::new(&KnownCard {
+                        has_fido: true,
+                        ..Default::default()
+                    })),
+                    install_steps: crate::card_tasks::install_steps(&[], false),
                     task: Some("Finish the setup on your phone.".into()),
                     task_dismissable: true,
                     ..Default::default()
@@ -388,6 +412,10 @@ fn tick(inbox: &mpsc::Receiver<UiEvent>, cx: &mut App) {
             service::Event::CardsChanged => {
                 cx.update_global::<Shell, _>(|shell, _| shell.reload_cards());
             }
+            #[cfg(target_os = "macos")]
+            service::Event::CardPresent { present: true, uid } if !uid.is_empty() => {
+                check_mac_login(uid.clone(), cx);
+            }
             service::Event::PivSetupDone { ok } => {
                 let ok = *ok;
                 cx.update_global::<Shell, _>(|shell, _| {
@@ -396,6 +424,9 @@ fn tick(inbox: &mpsc::Receiver<UiEvent>, cx: &mut App) {
                         && ok
                     {
                         shell.setup_ok.insert(task.uid.clone());
+                        if let Some(service) = shell.service.as_ref() {
+                            service.mark_card(task.uid.clone(), Mark::Certificates);
+                        }
                     }
                 });
             }
@@ -536,6 +567,16 @@ fn handle_event(event: UiEvent, cx: &mut App) {
             cx.update_global::<Shell, _>(|shell, _| {
                 if let Some(task) = shell.card_task.as_mut() {
                     task.paired(ok, text);
+                    if ok && let Some(service) = shell.service.as_ref() {
+                        service.mark_card(task.uid.clone(), Mark::MacLogin(true));
+                    }
+                }
+            });
+        }
+        UiEvent::LoginChecked(uid, paired) => {
+            cx.update_global::<Shell, _>(|shell, _| {
+                if let Some(service) = shell.service.as_ref() {
+                    service.mark_card(uid, Mark::MacLogin(paired));
                 }
             });
         }
@@ -760,6 +801,11 @@ fn settings_action(action: ui::SettingsAction, cx: &mut App) {
         }
         #[cfg(not(target_os = "macos"))]
         ui::SettingsAction::MacLogin(_) => {}
+        ui::SettingsAction::CheckCard => {
+            logging::log("cards: asking for a tap to check the card");
+            request_tap(cx);
+        }
+        ui::SettingsAction::OpenUrl(url) => cx.open_url(&url),
         ui::SettingsAction::DismissCardTask => {
             cx.update_global::<Shell, _>(|shell, _| {
                 if shell.card_task.as_ref().is_some_and(CardTask::dismissable) {
@@ -768,6 +814,32 @@ fn settings_action(action: ui::SettingsAction, cx: &mut App) {
             });
         }
     }
+}
+
+/// macOS: after a known card arrives, reads `sc_auth identities` (never
+/// pairs) to learn whether its login identity is already paired, so a
+/// pairing made outside tapbridge shows up too. Only for cards that hold
+/// certificates; macOS's token driver needs a moment, hence the retries.
+#[cfg(target_os = "macos")]
+fn check_mac_login(uid: Vec<u8>, cx: &mut App) {
+    let shell = cx.global::<Shell>();
+    if !shell
+        .cards
+        .iter()
+        .any(|card| card.uid == uid && card.piv_certs)
+        || shell.card_task.as_ref().is_some_and(CardTask::busy)
+    {
+        return;
+    }
+    let events = shell.events.clone();
+    std::thread::spawn(move || {
+        use crate::mac_login;
+        if let Some(paired) =
+            mac_login::present_card_paired(&mac_login::SystemRunner, 4, Duration::from_secs(1))
+        {
+            let _ = events.send(UiEvent::LoginChecked(uid, paired));
+        }
+    });
 }
 
 /// Asks the phone for a tap: Windows runs it when a WebAuthn ceremony
@@ -883,6 +955,9 @@ impl Shell {
                     task_dismissable: task.is_some_and(CardTask::dismissable),
                     offer_mac_login: cfg!(target_os = "macos")
                         && (card.piv_certs || self.setup_ok.contains(&card.uid)),
+                    checklist: Some(crate::card_tasks::Checklist::new(card)),
+                    install_steps: crate::card_tasks::install_steps(&card.atr, card.piv_blocked),
+                    flexsecure: crate::card_tasks::is_flexsecure(&card.atr),
                 }
             })
             .collect()

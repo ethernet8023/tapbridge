@@ -125,6 +125,11 @@ enum Command {
         uid: Vec<u8>,
         reply: std::sync::mpsc::SyncSender<bool>,
     },
+    MarkCard {
+        uid: Vec<u8>,
+        mark: crate::cards::Mark,
+        reply: std::sync::mpsc::SyncSender<bool>,
+    },
     /// Ask the connected phone to open its PIV setup for this card.
     SetupPiv {
         uid: Vec<u8>,
@@ -236,6 +241,13 @@ impl ServiceHandle {
     /// Drops a known card; it is added again the next time it is tapped.
     pub fn forget_card(&self, uid: Vec<u8>) -> bool {
         self.reply_option(|reply| Command::ForgetCard { uid, reply })
+            .unwrap_or(false)
+    }
+
+    /// Records something learned about a known card outside the probe
+    /// (certificates created, Mac login paired). `false` when unchanged.
+    pub fn mark_card(&self, uid: Vec<u8>, mark: crate::cards::Mark) -> bool {
+        self.reply_option(|reply| Command::MarkCard { uid, mark, reply })
             .unwrap_or(false)
     }
 
@@ -524,6 +536,14 @@ async fn run_inner(
                         },
                         Command::ForgetCard { uid, reply } => {
                             let changed = known.forget(&uid);
+                            if changed {
+                                let _ = known.save();
+                                let _ = events.send(Event::CardsChanged);
+                            }
+                            let _ = reply.send(changed);
+                        },
+                        Command::MarkCard { uid, mark, reply } => {
+                            let changed = known.mark(&uid, mark);
                             if changed {
                                 let _ = known.save();
                                 let _ = events.send(Event::CardsChanged);

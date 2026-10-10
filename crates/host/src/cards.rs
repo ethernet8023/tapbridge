@@ -10,8 +10,10 @@
 //! ```
 //!
 //! Times are Unix seconds. FLAGS is `-` or any of `f` (FIDO applet), `p`
-//! (PIV applet), `c` (PIV authentication certificate in slot 9A). The label
-//! is last so it may hold anything but tabs and newlines.
+//! (PIV applet), `c` (PIV authentication certificate in slot 9A), `b` (the
+//! PIV applet refuses its keys over NFC: a strict-contactless build), `m`
+//! (paired with this Mac's login). The label is last so it may hold
+//! anything but tabs and newlines.
 
 use std::{
     fs,
@@ -35,21 +37,37 @@ pub struct KnownCard {
     pub has_piv: bool,
     /// A certificate is present in PIV slot 9A (PIV authentication).
     pub piv_certs: bool,
+    /// The PIV applet answered "security status not satisfied" to a
+    /// certificate read: a strict-contactless build, unusable over NFC.
+    pub piv_blocked: bool,
+    /// The card's PIV identity is paired with this Mac's login (`sc_auth`).
+    pub mac_login: bool,
 }
 
-/// What the probe saw a card answer successfully. Only `true` flags carry
-/// information: they are merged in, never cleared.
+/// What the probe saw a card answer. Only `true` flags carry information:
+/// they are merged in, never cleared (except that a readable certificate
+/// clears `piv_blocked`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Capabilities {
     pub has_fido: bool,
     pub has_piv: bool,
     pub piv_certs: bool,
+    pub piv_blocked: bool,
 }
 
 impl Capabilities {
     pub fn any(&self) -> bool {
-        self.has_fido || self.has_piv || self.piv_certs
+        self.has_fido || self.has_piv || self.piv_certs || self.piv_blocked
     }
+}
+
+/// Something the desktop learned about a card outside the probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mark {
+    /// The phone finished creating certificates on it.
+    Certificates,
+    /// Whether its identity is paired with this Mac's login.
+    MacLogin(bool),
 }
 
 /// A UID worth remembering: present, and not a random one (ISO 14443-3
@@ -133,7 +151,11 @@ fn parse_line(line: &str) -> Option<KnownCard> {
     if !uid_stable(&uid) || uid.len() > tapbridge_core::wire::MAX_UID {
         return None;
     }
-    if flags != "-" && !flags.chars().all(|c| matches!(c, 'f' | 'p' | 'c')) {
+    if flags != "-"
+        && !flags
+            .chars()
+            .all(|c| matches!(c, 'f' | 'p' | 'c' | 'b' | 'm'))
+    {
         return None;
     }
     Some(KnownCard {
@@ -145,6 +167,8 @@ fn parse_line(line: &str) -> Option<KnownCard> {
         has_fido: flags.contains('f'),
         has_piv: flags.contains('p'),
         piv_certs: flags.contains('c'),
+        piv_blocked: flags.contains('b'),
+        mac_login: flags.contains('m'),
     })
 }
 
@@ -156,6 +180,8 @@ pub fn serialize(cards: &[KnownCard]) -> String {
             (card.has_fido, 'f'),
             (card.has_piv, 'p'),
             (card.piv_certs, 'c'),
+            (card.piv_blocked, 'b'),
+            (card.mac_login, 'm'),
         ] {
             if set {
                 flags.push(flag);
@@ -240,12 +266,35 @@ impl KnownCards {
         let Some(card) = self.cards.iter_mut().find(|card| card.uid == uid) else {
             return false;
         };
-        let before = (card.has_fido, card.has_piv, card.piv_certs);
+        let before = card.clone();
         card.has_fido |= seen.has_fido;
-        // A certificate read means the PIV applet answered too.
-        card.has_piv |= seen.has_piv || seen.piv_certs;
+        // A certificate read (or refusal) means the PIV applet answered too.
+        card.has_piv |= seen.has_piv || seen.piv_certs || seen.piv_blocked;
         card.piv_certs |= seen.piv_certs;
-        before != (card.has_fido, card.has_piv, card.piv_certs)
+        if seen.piv_certs {
+            // Readable now: the applet was reinstalled without the block.
+            card.piv_blocked = false;
+        } else {
+            card.piv_blocked |= seen.piv_blocked;
+        }
+        before != *card
+    }
+
+    /// Records what the desktop learned; returns whether anything changed.
+    pub fn mark(&mut self, uid: &[u8], mark: Mark) -> bool {
+        let Some(card) = self.cards.iter_mut().find(|card| card.uid == uid) else {
+            return false;
+        };
+        let before = card.clone();
+        match mark {
+            Mark::Certificates => {
+                card.has_piv = true;
+                card.piv_certs = true;
+                card.piv_blocked = false;
+            }
+            Mark::MacLogin(paired) => card.mac_login = paired,
+        }
+        before != *card
     }
 
     pub fn rename(&mut self, uid: &[u8], label: &str) -> bool {
@@ -344,8 +393,13 @@ impl CapabilityProbe {
         match probe {
             Probe::SelectFido => seen.has_fido = ok,
             Probe::SelectPiv => seen.has_piv = ok || more,
-            // An empty 9000 is no certificate; 61xx means data follows.
-            Probe::CertAuth => seen.piv_certs = (ok && rapdu.len() > 2) || more,
+            Probe::CertAuth => {
+                // An empty 9000 is no certificate; 61xx means data follows.
+                seen.piv_certs = (ok && rapdu.len() > 2) || more;
+                // 6982 on a plain object read: the applet locks its keys
+                // over contactless (PivApplet's strict-contactless builds).
+                seen.piv_blocked = (*sw1, *sw2) == (0x69, 0x82);
+            }
         }
         seen
     }
@@ -484,6 +538,7 @@ mod tests {
                 has_fido: true,
                 has_piv: true,
                 piv_certs: false,
+                piv_blocked: false,
             },
         );
         cards.rename(&OTHER, "  Office\tbadge\n ");
@@ -651,5 +706,81 @@ mod tests {
         assert!(!probe.response(7, &[0x00, 0x90, 0x00]).any());
         probe.request(8, &[0x00, 0xA4, 0x04, 0x00, 9, 0xA0]);
         assert!(!probe.response(8, &[0x90]).any());
+    }
+
+    #[test]
+    fn a_refused_certificate_read_marks_the_applet_blocked() {
+        let mut probe = CapabilityProbe::default();
+        probe.request(
+            1,
+            &[
+                0x00, 0xCB, 0x3F, 0xFF, 0x05, 0x5C, 0x03, 0x5F, 0xC1, 0x05, 0x00,
+            ],
+        );
+        let seen = probe.response(1, &[0x69, 0x82]);
+        assert!(seen.piv_blocked);
+        assert!(!seen.piv_certs);
+    }
+
+    #[test]
+    fn blocked_clears_once_a_certificate_is_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cards = KnownCards::open(dir.path());
+        cards.see(&UID, &atr_with(&[]), 1);
+        assert!(cards.note(
+            &UID,
+            Capabilities {
+                piv_blocked: true,
+                ..Default::default()
+            }
+        ));
+        let card = cards.get(&UID).unwrap();
+        assert!(card.has_piv && card.piv_blocked && !card.piv_certs);
+        assert!(cards.note(
+            &UID,
+            Capabilities {
+                piv_certs: true,
+                ..Default::default()
+            }
+        ));
+        let card = cards.get(&UID).unwrap();
+        assert!(card.piv_certs && !card.piv_blocked);
+    }
+
+    #[test]
+    fn marks_record_certificates_and_mac_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cards = KnownCards::open(dir.path());
+        assert!(!cards.mark(&UID, Mark::Certificates), "unknown card");
+        cards.see(&UID, &atr_with(&[]), 1);
+        assert!(cards.mark(&UID, Mark::Certificates));
+        assert!(!cards.mark(&UID, Mark::Certificates), "no change");
+        assert!(cards.mark(&UID, Mark::MacLogin(true)));
+        let card = cards.get(&UID).unwrap();
+        assert!(card.has_piv && card.piv_certs && card.mac_login);
+        assert!(cards.mark(&UID, Mark::MacLogin(false)));
+        assert!(!cards.get(&UID).unwrap().mac_login);
+    }
+
+    #[test]
+    fn new_flags_survive_a_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cards = KnownCards::open(dir.path());
+        cards.see(&UID, &atr_with(&[]), 1);
+        cards.note(
+            &UID,
+            Capabilities {
+                piv_blocked: true,
+                ..Default::default()
+            },
+        );
+        cards.mark(&UID, Mark::MacLogin(true));
+        cards.save().unwrap();
+        let card = KnownCards::open(dir.path()).get(&UID).cloned().unwrap();
+        assert!(card.piv_blocked && card.mac_login && card.has_piv);
+        // Files written before these flags still load.
+        let old = format!("{HEADER}\n{}\t1\t2\t3B00\tfpc\tOld\n", hex(&UID));
+        let parsed = parse(&old).unwrap();
+        assert!(parsed[0].piv_certs && !parsed[0].piv_blocked && !parsed[0].mac_login);
     }
 }
