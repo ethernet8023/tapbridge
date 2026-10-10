@@ -33,7 +33,8 @@ pub enum Step {
     SetupDone {
         ok: bool,
     },
-    /// Waiting for the card on the phone before pairing.
+    /// Waiting for the card on the phone before pairing (macOS login).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     WaitingCard {
         since: Instant,
     },
@@ -100,6 +101,7 @@ impl CardTask {
     }
 
     /// "Use for Mac login": runs at once when the card is on the phone.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn mac_login(uid: Vec<u8>, present: bool, now: Instant) -> (Self, Effect) {
         let (step, effect) = if present {
             (Step::Pairing, Effect::RunPairing)

@@ -25,4 +25,8 @@ pub(crate) fn test_session() -> keychain::TestSession {
     keychain::TestSession::begin()
 }
 #[cfg(all(test, not(target_os = "macos")))]
-pub(crate) fn test_session() {}
+pub(crate) struct TestSession;
+#[cfg(all(test, not(target_os = "macos")))]
+pub(crate) fn test_session() -> TestSession {
+    TestSession
+}
