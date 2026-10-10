@@ -277,6 +277,7 @@ async fn bulk_out_acked_immediately_then_in_reply_independent() {
             generation: 1,
             atr: ATR.to_vec(),
             max_apdu: 261,
+            uid: vec![],
         })
         .await
         .unwrap();
@@ -313,6 +314,7 @@ async fn apdu_roundtrip_out_ack_then_in_data_block() {
             generation: 1,
             atr: ATR.to_vec(),
             max_apdu: 261,
+            uid: vec![],
         })
         .await
         .unwrap();
@@ -366,6 +368,7 @@ async fn card_present_before_import_seen_after_import() {
             generation: 1,
             atr: ATR.to_vec(),
             max_apdu: 261,
+            uid: vec![],
         })
         .await
         .unwrap();
@@ -394,6 +397,7 @@ async fn late_generation_response_is_ignored() {
             generation: 5,
             atr: ATR.to_vec(),
             max_apdu: 261,
+            uid: vec![],
         })
         .await
         .unwrap();
@@ -444,6 +448,7 @@ async fn ccid_abort_two_phase() {
             generation: 1,
             atr: ATR.to_vec(),
             max_apdu: 261,
+            uid: vec![],
         })
         .await
         .unwrap();
@@ -484,6 +489,7 @@ async fn interrupt_in_and_unlink() {
             generation: 1,
             atr: ATR.to_vec(),
             max_apdu: 261,
+            uid: vec![],
         })
         .await
         .unwrap();
@@ -514,6 +520,7 @@ async fn busy_slot_returns_ccid_busy() {
             generation: 1,
             atr: ATR.to_vec(),
             max_apdu: 261,
+            uid: vec![],
         })
         .await
         .unwrap();
@@ -619,6 +626,7 @@ async fn replacement_retires_pending_request_and_drops_late_reply() {
             generation: 1,
             atr: ATR.to_vec(),
             max_apdu: 261,
+            uid: vec![],
         })
         .await
         .unwrap();
@@ -634,6 +642,7 @@ async fn replacement_retires_pending_request_and_drops_late_reply() {
             generation: 2,
             atr: ATR.to_vec(),
             max_apdu: 261,
+            uid: vec![],
         })
         .await
         .unwrap();
@@ -661,6 +670,7 @@ async fn in_reply_capped_to_requested_length_with_tail_retained() {
             generation: 1,
             atr: ATR.to_vec(),
             max_apdu: 261,
+            uid: vec![],
         })
         .await
         .unwrap();

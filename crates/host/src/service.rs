@@ -696,6 +696,7 @@ async fn disconnect(
             generation: 0,
             atr: vec![],
             max_apdu: 0,
+            uid: vec![],
         }),
     )
     .await
@@ -944,6 +945,7 @@ mod tests {
                     generation,
                     atr: vec![0x3B, 0x80, 0x80, 0x01, 0x01],
                     max_apdu: 255,
+                    uid: vec![],
                 },
             )
             .await

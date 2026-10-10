@@ -34,7 +34,7 @@ fn actual_phone_session_relays_frames_and_close_unblocks_reader() {
                 .unwrap();
             assert!(matches!(
                 wire::read_frame(&mut recv).await.unwrap(),
-                Frame::Card { generation: 1, .. }
+                Frame::Card { generation: 1, uid, .. } if uid == [4, 1, 2, 3, 4, 5, 6]
             ));
             let request = Frame::Apdu {
                 id: 7,
@@ -49,6 +49,14 @@ fn actual_phone_session_relays_frames_and_close_unblocks_reader() {
                     generation: 1,
                     data: vec![0x90, 0]
                 }
+            );
+            let setup = Frame::SetupPiv {
+                uid: vec![4, 1, 2, 3, 4, 5, 6],
+            };
+            wire::write_frame(&mut send, &setup).await.unwrap();
+            assert_eq!(
+                wire::read_frame(&mut recv).await.unwrap(),
+                Frame::PivSetupDone { ok: true }
             );
             tokio::time::timeout(Duration::from_secs(5), conn.closed())
                 .await
@@ -74,6 +82,7 @@ fn actual_phone_session_relays_frames_and_close_unblocks_reader() {
             generation: 1,
             atr: vec![0x3b, 0x80, 1, 0x81],
             max_apdu: 261,
+            uid: vec![4, 1, 2, 3, 4, 5, 6],
         })
         .unwrap();
     assert_eq!(
@@ -91,6 +100,13 @@ fn actual_phone_session_relays_frames_and_close_unblocks_reader() {
             data: vec![0x90, 0],
         })
         .unwrap();
+    assert_eq!(
+        session.read().unwrap(),
+        Frame::SetupPiv {
+            uid: vec![4, 1, 2, 3, 4, 5, 6]
+        }
+    );
+    session.send(&Frame::PivSetupDone { ok: true }).unwrap();
     let blocked = session.clone();
     let (done_tx, done_rx) = mpsc::channel();
     let reader = std::thread::spawn(move || {

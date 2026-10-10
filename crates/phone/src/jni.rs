@@ -188,6 +188,15 @@ pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_read(
                     &[JValue::Int(state.into())],
                 )?;
             }
+            Frame::SetupPiv { uid } => {
+                let bytes = env.byte_array_from_slice(&uid)?;
+                env.call_method(
+                    &callbacks,
+                    "setupPiv",
+                    "([B)V",
+                    &[JValue::Object(bytes.as_ref())],
+                )?;
+            }
             _ => return Err("invalid host frame".into()),
         }
         Ok(())
@@ -209,16 +218,34 @@ pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_card(
     generation: jlong,
     atr: JByteArray,
     max_apdu: jint,
+    uid: JByteArray,
 ) {
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         let atr = env.convert_byte_array(atr)?;
+        let uid = env.convert_byte_array(uid)?;
         unsafe { session(handle)? }.send(&Frame::Card {
             generation: generation as u64,
             atr,
             max_apdu: max_apdu as u32,
+            uid,
         })?;
         Ok(())
     })();
+    if let Err(error) = result {
+        report(&mut env, error);
+    }
+}
+
+/// The PIV setup the host asked for (`SetupPiv`) finished.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_pivSetupDone(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    ok: jboolean,
+) {
+    let result =
+        unsafe { session(handle) }.and_then(|s| s.send(&Frame::PivSetupDone { ok: ok != 0 }));
     if let Err(error) = result {
         report(&mut env, error);
     }

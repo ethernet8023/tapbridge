@@ -149,6 +149,7 @@ async fn card(h: &Harness, generation: u64, atr: &[u8]) {
             generation,
             atr: atr.to_vec(),
             max_apdu: 261,
+            uid: vec![],
         })
         .await
         .unwrap();
@@ -254,6 +255,7 @@ async fn shutdown_returns_promptly_with_active_client_and_phone_traffic() {
                 generation: 1_000_000 + i,
                 atr: ATR.to_vec(),
                 max_apdu: 261,
+                uid: vec![],
             })
             .await;
     }

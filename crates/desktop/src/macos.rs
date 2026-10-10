@@ -533,6 +533,7 @@ mod tests {
                     generation: 1,
                     atr: atr.clone(),
                     max_apdu: 512,
+                    uid: vec![],
                 },
             )
             .await
