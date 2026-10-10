@@ -17,3 +17,12 @@ pub mod usb;
 pub mod usbip;
 
 pub use reader::serve;
+
+/// Isolates the macOS keychain item for one test; on other platforms state
+/// lives only in the test's temp dir, so there is nothing to isolate.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn test_session() -> keychain::TestSession {
+    keychain::TestSession::begin()
+}
+#[cfg(all(test, not(target_os = "macos")))]
+pub(crate) fn test_session() {}

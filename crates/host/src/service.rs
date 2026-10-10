@@ -999,7 +999,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn pairing_persists_name_and_token_and_accepted_carries_host_name() {
         let dir = tempfile::tempdir().unwrap();
-        let _session = crate::keychain::TestSession::begin();
+        let _session = crate::test_session();
         let (handle, _collector, phone) =
             paired_service(dir.path(), "Pixel 9", Some("fcm-token-1")).await;
         assert!(handle.status().paired);
@@ -1017,7 +1017,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn request_tap_on_fresh_service_reports_not_paired() {
         let dir = tempfile::tempdir().unwrap();
-        let _session = crate::keychain::TestSession::begin();
+        let _session = crate::test_session();
         let handle = crate::service::start(settings(dir.path(), false))
             .await
             .unwrap();
@@ -1028,7 +1028,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn request_tap_without_token_reports_no_push_once_paired() {
         let dir = tempfile::tempdir().unwrap();
-        let _session = crate::keychain::TestSession::begin();
+        let _session = crate::test_session();
         let (handle, mut collector, phone) = paired_service(dir.path(), "Pixel", None).await;
         transport::close(&phone.conn);
         collector
@@ -1042,7 +1042,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn auth_state_reaches_the_connected_phone() {
         let dir = tempfile::tempdir().unwrap();
-        let _session = crate::keychain::TestSession::begin();
+        let _session = crate::test_session();
         let (handle, _collector, phone) = paired_service(dir.path(), "Pixel", Some("tok")).await;
         let mut phone = phone;
         handle.send_auth_state(wire::auth::SUCCESS);
@@ -1067,7 +1067,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn status_exposes_the_card_generation_of_each_tap() {
         let dir = tempfile::tempdir().unwrap();
-        let _session = crate::keychain::TestSession::begin();
+        let _session = crate::test_session();
         let (handle, mut collector, phone) = paired_service(dir.path(), "Pixel", None).await;
         let mut phone = phone;
         for generation in [7u64, 8] {
@@ -1097,7 +1097,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn request_tap_sends_read_card_on_live_session() {
         let dir = tempfile::tempdir().unwrap();
-        let _session = crate::keychain::TestSession::begin();
+        let _session = crate::test_session();
         let (handle, _collector, phone) = paired_service(dir.path(), "Pixel", Some("tok")).await;
         let mut phone = phone;
         assert_eq!(handle.request_tap(), TapOutcome::ReadCardSent);
@@ -1114,7 +1114,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn request_tap_without_session_returns_stored_token_and_hint() {
         let dir = tempfile::tempdir().unwrap();
-        let _session = crate::keychain::TestSession::begin();
+        let _session = crate::test_session();
         let (handle, mut collector, phone) =
             paired_service(dir.path(), "Pixel", Some("fcm-token-1")).await;
         let expected_hint = Hint::from_endpoint_addr(&handle.endpoint_addr().unwrap());
@@ -1139,7 +1139,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn paired_phone_scanning_a_fresh_code_completes_pairing() {
         let dir = tempfile::tempdir().unwrap();
-        let _session = crate::keychain::TestSession::begin();
+        let _session = crate::test_session();
         let (handle, mut collector, phone) = paired_service(dir.path(), "Pixel", None).await;
         let host_addr = handle.endpoint_addr().unwrap();
         transport::close(&phone.conn);
@@ -1209,7 +1209,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn forget_phone_revokes_pairing_and_rejects_reconnect() {
         let dir = tempfile::tempdir().unwrap();
-        let _session = crate::keychain::TestSession::begin();
+        let _session = crate::test_session();
         let (handle, _collector, phone) = paired_service(dir.path(), "Pixel", None).await;
         handle.forget_phone();
         handle.shutdown();
@@ -1221,7 +1221,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn paired_phone_redialing_replaces_its_stale_session() {
         let dir = tempfile::tempdir().unwrap();
-        let _session = crate::keychain::TestSession::begin();
+        let _session = crate::test_session();
         let (handle, mut collector, phone) = paired_service(dir.path(), "Pixel", None).await;
         let host_addr = handle.endpoint_addr().unwrap();
         // The old session is still open on the host (the phone app was killed
@@ -1267,7 +1267,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn second_connection_while_session_live_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let _session = crate::keychain::TestSession::begin();
+        let _session = crate::test_session();
         let (handle, _collector, paired) = paired_service(dir.path(), "Pixel", None).await;
         let host_addr = handle.endpoint_addr().unwrap();
         // A different identity while the paired phone's session is live:
@@ -1316,7 +1316,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_tapped_card_is_remembered_by_uid_and_random_uids_are_not() {
         let dir = tempfile::tempdir().unwrap();
-        let _session = crate::keychain::TestSession::begin();
+        let _session = crate::test_session();
         let (handle, mut collector, mut phone) = paired_service(dir.path(), "Pixel", None).await;
         send_card(&mut phone, 1, &IMPLANT).await;
         collector
@@ -1353,7 +1353,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn setup_piv_reaches_the_phone_and_its_answer_comes_back() {
         let dir = tempfile::tempdir().unwrap();
-        let _session = crate::keychain::TestSession::begin();
+        let _session = crate::test_session();
         let (handle, mut collector, mut phone) = paired_service(dir.path(), "Pixel", None).await;
         assert!(handle.setup_piv(IMPLANT.to_vec()));
         let frame = tokio::time::timeout(Duration::from_secs(5), wire::read_frame(&mut phone.recv))
@@ -1389,7 +1389,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn piv_traffic_from_the_mac_marks_the_card_capabilities() {
         let dir = tempfile::tempdir().unwrap();
-        let _session = crate::keychain::TestSession::begin();
+        let _session = crate::test_session();
         let (handle, mut collector, mut phone) = paired_service(dir.path(), "Pixel", None).await;
         send_card(&mut phone, 3, &IMPLANT).await;
         collector
