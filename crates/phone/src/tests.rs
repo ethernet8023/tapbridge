@@ -13,6 +13,7 @@ fn builder() -> iroh::endpoint::Builder {
 #[test]
 fn actual_phone_session_relays_frames_and_close_unblocks_reader() {
     let (address_tx, address_rx) = mpsc::channel();
+    let (got_tx, got_rx) = mpsc::channel();
     let host = std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -58,6 +59,9 @@ fn actual_phone_session_relays_frames_and_close_unblocks_reader() {
                 wire::read_frame(&mut recv).await.unwrap(),
                 Frame::PivSetupDone { ok: true }
             );
+            // Only now may the phone close: a close racing the last frame
+            // would lose it (QUIC drops unread stream data on close).
+            got_tx.send(()).unwrap();
             tokio::time::timeout(Duration::from_secs(5), conn.closed())
                 .await
                 .unwrap();
@@ -107,6 +111,7 @@ fn actual_phone_session_relays_frames_and_close_unblocks_reader() {
         }
     );
     session.send(&Frame::PivSetupDone { ok: true }).unwrap();
+    got_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let blocked = session.clone();
     let (done_tx, done_rx) = mpsc::channel();
     let reader = std::thread::spawn(move || {
