@@ -27,7 +27,7 @@ jobs:
   macos:
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
@@ -46,7 +46,7 @@ jobs:
         run: crates/desktop/ifd_shim/build.sh
       - name: Build pkg
         run: scripts/build-pkg.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: tapbridge-macos
           path: dist/*.pkg
@@ -66,7 +66,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
@@ -98,7 +98,7 @@ jobs:
           $usbip = & scripts\fetch-usbip.ps1 -Arch ${{ matrix.arch }}
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppArch=${{ matrix.arch }}" "/DAppVersion=$version" "/DUsbipFile=$usbip" installer\tapbridge.iss
           if ($LASTEXITCODE -ne 0) { throw "iscc failed" }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: tapbridge-windows-${{ matrix.arch }}
           path: |
@@ -111,8 +111,8 @@ jobs:
     env:
       NDK_VERSION: 27.2.12479018
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
@@ -164,13 +164,13 @@ jobs:
           fi
       - name: Unit tests + debug APK
         run: scripts/build-android.sh testDebugUnitTest assembleDebug --console=plain
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: always()
         with:
           name: tapbridge-android-test-results
           path: android/app/build/reports/tests/
           if-no-files-found: ignore
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: tapbridge-android
           path: android/app/build/outputs/apk/debug/app-debug.apk

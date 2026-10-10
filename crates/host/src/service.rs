@@ -703,6 +703,8 @@ async fn run_inner(
                         Some(Ok(frame @ (Frame::Card { .. } | Frame::Response { .. } | Frame::Failed { .. }))) => {
                             if let Some(line) = tracer.as_mut().and_then(|t| t.observe(&frame)) { let _ = events.send(Event::Trace(line)); }
                             if let Frame::Card { generation, atr, uid, .. } = &frame {
+                                #[cfg(not(target_os = "macos"))]
+                                let _ = generation;
                                 card_present = !atr.is_empty();
                                 probe.reset();
                                 card_uid = if card_present && uid_stable(uid) { uid.clone() } else { Vec::new() };
