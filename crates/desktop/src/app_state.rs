@@ -6,7 +6,9 @@
 #[cfg(target_os = "macos")]
 use crate::macos;
 use crate::{
-    autostart, hostname, logging,
+    autostart,
+    card_tasks::{CardTask, Effect},
+    hostname, logging,
     tray::{MenuAction, Tray, TrayState},
     ui, wake,
 };
@@ -14,11 +16,15 @@ use crate::{
 use crate::{prompt_watch, single, usbip};
 use gpui::{App, AsyncApp, BorrowAppContext, Global, KeyBinding, WindowHandle};
 use std::{
+    collections::HashSet,
     path::PathBuf,
     sync::mpsc,
     time::{Duration, Instant},
 };
-use tapbridge_host::service::{self, ServiceHandle, TapOutcome};
+use tapbridge_host::{
+    cards::KnownCard,
+    service::{self, ServiceHandle, TapOutcome},
+};
 
 const USBIP_ADDR: &str = "127.0.0.1:3240";
 
@@ -54,6 +60,9 @@ enum UiEvent {
     #[cfg(not(windows))]
     WakeRequested,
     Woke(wake::WakeResult),
+    /// "Use for Mac login" finished: (ok, message).
+    #[cfg(target_os = "macos")]
+    MacLoginDone(bool, String),
 }
 
 #[cfg(windows)]
@@ -84,6 +93,12 @@ struct Shell {
     /// Set when a tap was requested (wake sent or phone reminded); cleared by
     /// a card, an error or [`TAP_WAIT`]. Drives the animated tray icon.
     waiting_since: Option<Instant>,
+    /// Known cards, re-read from the service when they change.
+    cards: Vec<KnownCard>,
+    /// The card action running in Preferences, if any.
+    card_task: Option<CardTask>,
+    /// Cards the phone set up as smart cards this run: offer Mac login.
+    setup_ok: HashSet<Vec<u8>>,
     // Held for their Drop / process-lifetime handles.
     _anchor: WindowHandle<ui::Anchor>,
     #[cfg(windows)]
@@ -158,6 +173,27 @@ pub fn preview_ui() {
             phone: Some("Pixel 9 Pro XL".into()),
             phone_connected: true,
             autostart: true,
+            cards: vec![
+                crate::ui::CardRow {
+                    uid: vec![4, 1, 2, 3, 4, 5, 6],
+                    label: "Implant".into(),
+                    last_seen: "now".into(),
+                    passkey: true,
+                    smart_card: true,
+                    offer_mac_login: cfg!(target_os = "macos"),
+                    ..Default::default()
+                },
+                crate::ui::CardRow {
+                    uid: vec![4, 9, 9, 9, 9, 9, 9],
+                    label: "Card 2".into(),
+                    last_seen: "3 days ago".into(),
+                    passkey: true,
+                    task: Some("Finish the setup on your phone.".into()),
+                    task_dismissable: true,
+                    ..Default::default()
+                },
+            ],
+            card_busy: true,
             details: vec![
                 "Host: iris".into(),
                 "Reader: tapbridge virtual reader".into(),
@@ -214,6 +250,9 @@ fn shell_setup(
         notice: None,
         service_error: None,
         waiting_since: None,
+        cards: Vec::new(),
+        card_task: None,
+        setup_ok: HashSet::new(),
         #[cfg(windows)]
         watcher,
         _instance: Shell::instance_guard(instance),
@@ -338,17 +377,41 @@ fn tick(inbox: &mpsc::Receiver<UiEvent>, cx: &mut App) {
             logging::log(&format!("apdu: {line}"));
             continue;
         }
-        logging::log(&format!("service: {event:?}"));
+        // Never log card UIDs.
+        match &event {
+            service::Event::CardPresent { present, .. } => {
+                logging::log(&format!("service: CardPresent {{ present: {present} }}"))
+            }
+            other => logging::log(&format!("service: {other:?}")),
+        }
         if let service::Event::PairingCompleted { name } = &event
             && let Some(window) = cx.global::<Shell>().pairing
         {
             ui::complete_pairing(window, name.clone(), cx);
+        }
+        match &event {
+            service::Event::CardsChanged => {
+                cx.update_global::<Shell, _>(|shell, _| shell.reload_cards());
+            }
+            service::Event::PivSetupDone { ok } => {
+                let ok = *ok;
+                cx.update_global::<Shell, _>(|shell, _| {
+                    if let Some(task) = shell.card_task.as_mut() {
+                        task.setup_done(ok);
+                        if ok {
+                            shell.setup_ok.insert(task.uid.clone());
+                        }
+                    }
+                });
+            }
+            _ => {}
         }
         cx.update_global::<Shell, _>(|shell, _| {
             shell.notice = None;
             shell.refresh_tray();
         });
     }
+    card_tick(cx);
     // An unused invitation expired while its window is open: show a fresh one.
     if let Some(window) = cx.global::<Shell>().pairing {
         match ui::pairing_expired(window, cx) {
@@ -395,6 +458,7 @@ fn handle_event(event: UiEvent, cx: &mut App) {
         UiEvent::ServiceStarted(handle) => {
             cx.update_global::<Shell, _>(|shell, _| {
                 shell.service = Some(handle);
+                shell.reload_cards();
                 #[cfg(windows)]
                 if shell.usbip != Usbip::Missing {
                     let events = shell.events.clone();
@@ -463,9 +527,117 @@ fn handle_event(event: UiEvent, cx: &mut App) {
             cx.update_global::<Shell, _>(|shell, _| {
                 if notice.is_some() {
                     shell.waiting_since = None;
+                    if let Some(task) = shell.card_task.as_mut() {
+                        task.unreachable();
+                    }
                 }
                 shell.notice = notice;
                 shell.refresh_tray();
+            });
+        }
+        #[cfg(target_os = "macos")]
+        UiEvent::MacLoginDone(ok, text) => {
+            logging::log(&format!("mac login: pairing finished, ok={ok}"));
+            cx.update_global::<Shell, _>(|shell, _| {
+                if let Some(task) = shell.card_task.as_mut() {
+                    task.paired(ok, text);
+                }
+            });
+        }
+    }
+}
+
+/// Drives the card action in Preferences and the pairing window's
+/// test-tap step from the current service status.
+fn card_tick(cx: &mut App) {
+    let shell = cx.global::<Shell>();
+    let pairing = shell.pairing;
+    if shell.card_task.is_none() && pairing.is_none() {
+        return;
+    }
+    let Some(status) = shell.service.as_ref().map(ServiceHandle::status) else {
+        return;
+    };
+    let effect = cx.update_global::<Shell, _>(|shell, _| {
+        shell
+            .card_task
+            .as_mut()
+            .and_then(|task| task.tick(Instant::now(), status.phone_connected, &status.card_uid))
+    });
+    if let Some(effect) = effect {
+        run_card_effect(effect, cx);
+    }
+    if let Some(window) = pairing {
+        if ui::pairing_test_tick(window, status.phone_connected, cx) == Some(true) {
+            logging::log("pairing: asking the phone for a test card");
+            request_tap(cx);
+        }
+        if status.card_present && ui::pairing_test_waiting(window, cx) {
+            let label = cx
+                .global::<Shell>()
+                .service
+                .as_ref()
+                .map(ServiceHandle::known_cards)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|card| !status.card_uid.is_empty() && card.uid == status.card_uid)
+                .map_or_else(|| "your card".to_owned(), |card| card.label);
+            ui::pairing_test_card(window, label, cx);
+            cx.update_global::<Shell, _>(|shell, _| shell.reload_cards());
+        }
+    }
+}
+
+/// Carries out what the card action asks for next.
+fn run_card_effect(effect: Effect, cx: &mut App) {
+    match effect {
+        Effect::SendSetup => {
+            let next = cx.update_global::<Shell, _>(|shell, _| {
+                let service = shell.service.as_ref()?;
+                let task = shell.card_task.as_mut()?;
+                let sent = service.setup_piv(task.uid.clone());
+                logging::log(&format!(
+                    "cards: smart-card setup sent to the phone: {sent}"
+                ));
+                task.setup_sent(sent, Instant::now())
+            });
+            if let Some(next) = next {
+                run_card_effect(next, cx);
+            }
+        }
+        Effect::RequestTap => {
+            if !request_tap(cx) {
+                cx.update_global::<Shell, _>(|shell, _| {
+                    if let Some(task) = shell.card_task.as_mut() {
+                        task.unreachable();
+                    }
+                });
+            }
+        }
+        Effect::RunPairing => {
+            #[cfg(target_os = "macos")]
+            {
+                let events = cx.global::<Shell>().events.clone();
+                logging::log("mac login: pairing the card on the phone");
+                std::thread::spawn(move || {
+                    use crate::mac_login;
+                    let outcome = match mac_login::current_user() {
+                        Some(user) => mac_login::pair_present_card(
+                            &mac_login::SystemRunner,
+                            &user,
+                            6,
+                            Duration::from_secs(1),
+                        ),
+                        None => mac_login::Outcome::Failed("unknown user".into()),
+                    };
+                    let _ = events.send(UiEvent::MacLoginDone(outcome.ok(), outcome.message()));
+                });
+            }
+            #[cfg(not(target_os = "macos"))]
+            cx.update_global::<Shell, _>(|shell, _| {
+                if let Some(task) = shell.card_task.as_mut() {
+                    task.paired(false, "Only available on a Mac.".into());
+                }
             });
         }
     }
@@ -530,17 +702,87 @@ fn settings_action(action: ui::SettingsAction, cx: &mut App) {
             logging::log(&format!("start at login -> {enabled}: {result:?}"));
             cx.update_global::<Shell, _>(|shell, _| shell.autostart = autostart::is_enabled());
         }
+        ui::SettingsAction::RenameCard(uid, label) => {
+            cx.update_global::<Shell, _>(|shell, _| {
+                if let Some(service) = shell.service.as_ref() {
+                    service.rename_card(uid, label);
+                }
+                shell.reload_cards();
+            });
+        }
+        ui::SettingsAction::ForgetCard(uid) => {
+            logging::log("cards: forgetting a card");
+            cx.update_global::<Shell, _>(|shell, _| {
+                if let Some(service) = shell.service.as_ref() {
+                    service.forget_card(uid.clone());
+                }
+                if shell
+                    .card_task
+                    .as_ref()
+                    .is_some_and(|task| task.uid == uid && task.dismissable())
+                {
+                    shell.card_task = None;
+                }
+                shell.setup_ok.remove(&uid);
+                shell.reload_cards();
+            });
+        }
+        ui::SettingsAction::SetUpCard(uid) => {
+            if cx
+                .global::<Shell>()
+                .card_task
+                .as_ref()
+                .is_some_and(CardTask::busy)
+            {
+                return;
+            }
+            logging::log("cards: smart-card setup requested");
+            let (task, effect) = CardTask::setup(uid);
+            cx.update_global::<Shell, _>(|shell, _| shell.card_task = Some(task));
+            run_card_effect(effect, cx);
+        }
+        #[cfg(target_os = "macos")]
+        ui::SettingsAction::MacLogin(uid) => {
+            if cx
+                .global::<Shell>()
+                .card_task
+                .as_ref()
+                .is_some_and(CardTask::busy)
+            {
+                return;
+            }
+            let status = cx
+                .global::<Shell>()
+                .service
+                .as_ref()
+                .map(ServiceHandle::status)
+                .unwrap_or_default();
+            let present = status.card_present && status.card_uid == uid;
+            let (task, effect) = CardTask::mac_login(uid, present, Instant::now());
+            cx.update_global::<Shell, _>(|shell, _| shell.card_task = Some(task));
+            run_card_effect(effect, cx);
+        }
+        #[cfg(not(target_os = "macos"))]
+        ui::SettingsAction::MacLogin(_) => {}
+        ui::SettingsAction::DismissCardTask => {
+            cx.update_global::<Shell, _>(|shell, _| {
+                if shell.card_task.as_ref().is_some_and(CardTask::dismissable) {
+                    shell.card_task = None;
+                }
+            });
+        }
     }
 }
 
-/// Asks the phone for a tap. Automatic only: Windows runs it when a WebAuthn
-/// ceremony starts, macOS when PC/SC wants the card and no phone is
-/// connected.
-fn request_tap(cx: &mut App) {
+/// Asks the phone for a tap: Windows runs it when a WebAuthn ceremony
+/// starts, macOS when PC/SC wants the card and no phone is connected, and
+/// the card actions and pairing test when they need the phone. Returns
+/// whether the request went out.
+fn request_tap(cx: &mut App) -> bool {
     cx.update_global::<Shell, _>(|shell, _| {
         let Some(service) = shell.service.as_ref() else {
             logging::log("wake: service not running");
-            return;
+            return false;
         };
         let notice = match service.request_tap() {
             TapOutcome::ReadCardSent => {
@@ -573,9 +815,11 @@ fn request_tap(cx: &mut App) {
                 Some("Open tapbridge on your phone once to enable wake".to_owned())
             }
         };
+        let sent = notice.is_none();
         shell.notice = notice;
         shell.refresh_tray();
-    });
+        sent
+    })
 }
 
 fn open_pairing(cx: &mut App) {
@@ -616,6 +860,38 @@ fn quit(cx: &mut App) {
 }
 
 impl Shell {
+    fn reload_cards(&mut self) {
+        if let Some(service) = self.service.as_ref() {
+            self.cards = service.known_cards();
+        }
+    }
+
+    fn card_rows(&self, status: &service::Status) -> Vec<ui::CardRow> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        self.cards
+            .iter()
+            .map(|card| {
+                let present = status.card_present && status.card_uid == card.uid;
+                let task = self.card_task.as_ref().filter(|task| task.uid == card.uid);
+                ui::CardRow {
+                    uid: card.uid.clone(),
+                    label: card.label.clone(),
+                    last_seen: crate::card_tasks::last_seen_text(now, card.last_seen, present),
+                    passkey: card.has_fido,
+                    smart_card: card.has_piv,
+                    task: task.map(CardTask::text),
+                    task_failed: task.is_some_and(CardTask::failed),
+                    task_finished: task.is_some_and(|task| !task.busy()),
+                    task_dismissable: task.is_some_and(CardTask::dismissable),
+                    offer_mac_login: cfg!(target_os = "macos")
+                        && (card.piv_certs || self.setup_ok.contains(&card.uid)),
+                }
+            })
+            .collect()
+    }
+
     fn refresh_tray(&mut self) {
         let status = self.service.as_ref().map(ServiceHandle::status);
         if let Some(since) = self.waiting_since
@@ -702,6 +978,8 @@ impl Shell {
             }),
             phone_connected: status.phone_connected,
             autostart: self.autostart,
+            cards: self.card_rows(&status),
+            card_busy: self.card_task.as_ref().is_some_and(CardTask::busy),
             details: self.status_lines(),
         }
     }

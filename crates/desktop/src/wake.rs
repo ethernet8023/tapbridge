@@ -203,7 +203,10 @@ mod tests {
     fn builds_without_the_env_var_use_the_hosted_relay() {
         let dir = tempfile::tempdir().unwrap();
         let expected = option_env!("TAPBRIDGE_RELAY_URL").unwrap_or(DEFAULT_RELAY);
-        assert_eq!(relay_url(dir.path()).as_deref(), Some(expected.trim_end_matches('/')));
+        assert_eq!(
+            relay_url(dir.path()).as_deref(),
+            Some(expected.trim_end_matches('/'))
+        );
     }
 
     #[test]

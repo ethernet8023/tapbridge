@@ -1,5 +1,6 @@
 //! gpui windows: the pairing QR window and the Settings window. Only these
 //! surfaces use gpui; the tray and all orchestration live beside them.
+use crate::card_tasks::TestTap;
 use crate::glass;
 #[cfg(windows)]
 use crate::passkeys;
@@ -22,8 +23,6 @@ const QR_TARGET: f32 = 340.0;
 
 /// QR quiet zone in modules (ISO/IEC 18004 asks for 4).
 const QUIET_ZONE: u16 = 4;
-/// How long the "Phone paired" confirmation stays up before the window closes.
-const PAIRED_CLOSE_DELAY: Duration = Duration::from_millis(2800);
 
 #[cfg(windows)]
 const PANEL_2: u32 = 0x221A30;
@@ -45,6 +44,8 @@ pub struct PairingView {
     dimension: u16,
     /// Set when pairing completes: the phone's display name.
     paired: Option<String>,
+    /// The "tap a card to test" step after pairing.
+    test: Option<TestTap>,
     /// When the invitation stops working (the host gate uses the same TTL).
     expires: Instant,
     /// Re-renders once a second for the countdown; dropped with the view.
@@ -66,6 +67,7 @@ impl PairingView {
             dark: dark.into(),
             dimension,
             paired: None,
+            test: None,
             expires: Instant::now() + INVITATION_TTL,
             _ticker: ticker,
         }
@@ -113,26 +115,14 @@ impl Render for PairingView {
                         .text_color(rgb(GOOD))
                         .child("Pairing successful"),
                 )
-                .child(
-                    div()
-                        .size(stage)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(success_badge(150.0)),
-                )
+                .child(success_badge(96.0))
                 .child(
                     div()
                         .text_size(px(22.0))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child(format!("{phone} is ready")),
+                        .child(format!("Paired with {phone}")),
                 )
-                .child(
-                    div()
-                        .text_size(px(13.0))
-                        .text_color(rgb(ACCENT_SOFT))
-                        .child("You can sign in with your key from this PC now."),
-                );
+                .child(self.render_test(cx));
         }
 
         // One canvas paints every dark module: the QR costs one element per
@@ -202,6 +192,80 @@ impl Render for PairingView {
                 }))
                 .child(countdown(remaining)),
         )
+    }
+}
+
+impl PairingView {
+    /// The test-tap step under the pairing confirmation.
+    fn render_test(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        fn close(
+            _: &mut PairingView,
+            _: &gpui::ClickEvent,
+            window: &mut Window,
+            _: &mut Context<PairingView>,
+        ) {
+            window.remove_window();
+        }
+        let (title, detail, color) = match &self.test {
+            Some(TestTap::Works { label }) => (
+                format!("It works: {label}"),
+                "You can sign in with your card from this computer now.",
+                GOOD,
+            ),
+            Some(TestTap::TimedOut) => (
+                "No card arrived".to_owned(),
+                "Open tapbridge on your phone and hold a card to it.",
+                WARN,
+            ),
+            _ => (
+                "Tap a card on your phone to test".to_owned(),
+                "Hold your card to the back of the phone.",
+                TEXT,
+            ),
+        };
+        let mut buttons = div().flex().flex_row().gap(px(10.0));
+        buttons = match &self.test {
+            Some(TestTap::Works { .. }) | None => buttons
+                .child(button("test-done", "Done", ACCENT, 0.6, cx).on_click(cx.listener(close))),
+            Some(TestTap::TimedOut) => buttons
+                .child(
+                    button("test-retry", "Try again", ACCENT, 0.6, cx).on_click(cx.listener(
+                        |view, _: &gpui::ClickEvent, _, cx| {
+                            view.test = Some(TestTap::start(Instant::now()));
+                            cx.notify();
+                        },
+                    )),
+                )
+                .child(
+                    button("test-skip", "Skip", 0xFFFFFF, 0.06, cx).on_click(cx.listener(close)),
+                ),
+            Some(TestTap::Waiting { .. }) => buttons.child(
+                button("test-skip", "Skip", 0xFFFFFF, 0.06, cx).on_click(cx.listener(close)),
+            ),
+        };
+        glass::panel("test-card", 14.0, cx)
+            .w(px(380.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(8.0))
+            .p(px(16.0))
+            .child(
+                div()
+                    .text_size(px(15.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(rgb(color))
+                    .child(title),
+            )
+            .child(
+                div()
+                    .text_size(px(12.5))
+                    .text_color(rgb(ACCENT_SOFT))
+                    .text_center()
+                    .child(detail),
+            )
+            .child(div().h(px(4.0)))
+            .child(buttons)
     }
 }
 
@@ -285,20 +349,54 @@ pub fn pairing_expired(handle: WindowHandle<PairingView>, cx: &mut App) -> Optio
     handle.update(cx, |view, _, _| view.expired()).ok()
 }
 
-/// Shows the pairing-successful screen, then closes the window.
+/// Shows the pairing-successful screen with its test-tap step.
 pub fn complete_pairing(handle: WindowHandle<PairingView>, phone: String, cx: &mut App) {
-    let shown = handle.update(cx, |view, _window, cx| {
+    let _ = handle.update(cx, |view, _window, cx| {
         view.paired = Some(phone);
+        view.test = Some(TestTap::start(Instant::now()));
         cx.notify();
     });
-    if shown.is_err() {
-        return;
-    }
-    cx.spawn(async move |cx| {
-        cx.background_executor().timer(PAIRED_CLOSE_DELAY).await;
-        let _ = handle.update(cx, |_, window, _| window.remove_window());
-    })
-    .detach();
+}
+
+/// Advances the test-tap step. `Some(true)`: ask the phone for a card now.
+/// `None` when the window is closed.
+pub fn pairing_test_tick(
+    handle: WindowHandle<PairingView>,
+    connected: bool,
+    cx: &mut App,
+) -> Option<bool> {
+    handle
+        .update(cx, |view, _, cx| {
+            let before = view.test.clone();
+            let ask = view
+                .test
+                .as_mut()
+                .is_some_and(|test| test.tick(Instant::now(), connected));
+            if view.test != before {
+                cx.notify();
+            }
+            ask
+        })
+        .ok()
+}
+
+/// Whether the pairing window is waiting for a test card.
+pub fn pairing_test_waiting(handle: WindowHandle<PairingView>, cx: &mut App) -> bool {
+    handle
+        .update(cx, |view, _, _| {
+            matches!(view.test, Some(TestTap::Waiting { .. }))
+        })
+        .unwrap_or(false)
+}
+
+/// A card arrived during the test-tap step.
+pub fn pairing_test_card(handle: WindowHandle<PairingView>, label: String, cx: &mut App) {
+    let _ = handle.update(cx, |view, _, cx| {
+        if let Some(test) = view.test.as_mut() {
+            test.card(label);
+            cx.notify();
+        }
+    });
 }
 
 /// Invisible window that keeps the app alive. gpui on Windows quits the
@@ -726,6 +824,32 @@ pub enum SettingsAction {
     Pair,
     Forget,
     SetAutostart(bool),
+    RenameCard(Vec<u8>, String),
+    ForgetCard(Vec<u8>),
+    SetUpCard(Vec<u8>),
+    MacLogin(Vec<u8>),
+    /// Close the status of the card action (or stop waiting for it).
+    DismissCardTask,
+}
+
+/// One known card as the Cards section shows it.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct CardRow {
+    pub uid: Vec<u8>,
+    pub label: String,
+    /// "now", "2 days ago"...
+    pub last_seen: String,
+    pub passkey: bool,
+    pub smart_card: bool,
+    /// Status line of the action in progress on this card.
+    pub task: Option<String>,
+    pub task_failed: bool,
+    /// The action's result is showing: offer "OK" to clear it.
+    pub task_finished: bool,
+    /// The action can be closed or stopped (not while sc_auth runs).
+    pub task_dismissable: bool,
+    /// macOS: offer "Use for Mac login".
+    pub offer_mac_login: bool,
 }
 
 /// The overall state shown at the top of Settings (mirrors the tray icon).
@@ -747,6 +871,10 @@ pub struct SettingsSnapshot {
     pub phone: Option<String>,
     pub phone_connected: bool,
     pub autostart: bool,
+    /// Known cards, shown once a phone is paired.
+    pub cards: Vec<CardRow>,
+    /// A card action is running: no new one can start.
+    pub card_busy: bool,
     /// Diagnostic lines (host, reader, relay...).
     pub details: Vec<String>,
 }
@@ -758,6 +886,10 @@ pub struct SettingsView {
     on_action: OnSettingsAction,
     /// "Forget phone" asks once more before revoking the pairing.
     confirm_forget: bool,
+    /// "Forget" on a card asks once more, too.
+    confirm_forget_card: Option<Vec<u8>>,
+    /// Card being renamed and the label typed so far.
+    editing: Option<(Vec<u8>, String)>,
     focus: FocusHandle,
     #[cfg(windows)]
     passkeys: Entity<PasskeyView>,
@@ -773,6 +905,8 @@ impl SettingsView {
             snapshot,
             on_action,
             confirm_forget: false,
+            confirm_forget_card: None,
+            editing: None,
             focus: cx.focus_handle(),
             #[cfg(windows)]
             passkeys: cx.new(|_| PasskeyView::new()),
@@ -784,6 +918,17 @@ impl SettingsView {
             if snapshot.phone.is_none() {
                 self.confirm_forget = false;
             }
+            let known = |uid: &Vec<u8>| snapshot.cards.iter().any(|card| &card.uid == uid);
+            if self.editing.as_ref().is_some_and(|(uid, _)| !known(uid)) {
+                self.editing = None;
+            }
+            if self
+                .confirm_forget_card
+                .as_ref()
+                .is_some_and(|uid| !known(uid))
+            {
+                self.confirm_forget_card = None;
+            }
             self.snapshot = snapshot;
             cx.notify();
         }
@@ -793,6 +938,256 @@ impl SettingsView {
         let on_action = self.on_action.clone();
         cx.defer(move |cx| on_action(action, cx));
     }
+
+    /// Typing into the rename field: Return saves, Escape cancels.
+    fn edit_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        let Some((uid, text)) = self.editing.as_mut() else {
+            return;
+        };
+        let keystroke = &event.keystroke;
+        match keystroke.key.as_str() {
+            "enter" => {
+                let (uid, text) = (uid.clone(), text.clone());
+                self.editing = None;
+                if !text.trim().is_empty() {
+                    self.act(SettingsAction::RenameCard(uid, text), cx);
+                }
+            }
+            "escape" => self.editing = None,
+            "backspace" => {
+                text.pop();
+            }
+            _ if !keystroke.modifiers.platform && !keystroke.modifiers.control => {
+                if let Some(typed) = &keystroke.key_char
+                    && text.chars().count() < tapbridge_host::cards::MAX_LABEL
+                {
+                    text.extend(typed.chars().filter(|c| !c.is_control()));
+                }
+            }
+            _ => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn render_cards(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let snapshot = &self.snapshot;
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .child(section_title("Cards"));
+        if snapshot.cards.is_empty() {
+            section = section.child(
+                glass::panel("cards-empty", 14.0, cx)
+                    .p(px(14.0))
+                    .text_size(px(12.5))
+                    .text_color(rgb(ACCENT_SOFT))
+                    .child("Tap a card on your phone and it shows up here."),
+            );
+        }
+        for (index, card) in snapshot.cards.iter().enumerate() {
+            section = section.child(self.render_card(index, card, cx));
+        }
+        section
+    }
+
+    fn render_card(&self, index: usize, card: &CardRow, cx: &mut Context<Self>) -> gpui::Div {
+        let editing = self
+            .editing
+            .as_ref()
+            .filter(|(uid, _)| *uid == card.uid)
+            .map(|(_, text)| text.clone());
+        let title = match &editing {
+            Some(text) => div()
+                .px(px(8.0))
+                .py(px(3.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(rgb(ACCENT))
+                .text_size(px(15.0))
+                .child(format!("{text}|")),
+            None => div()
+                .text_size(px(15.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .child(card.label.clone()),
+        };
+        let mut badges = div().flex().flex_row().gap(px(6.0));
+        for (shown, text) in [(card.passkey, "Passkey"), (card.smart_card, "Smart card")] {
+            if shown {
+                badges = badges.child(
+                    div()
+                        .px(px(8.0))
+                        .py(px(2.0))
+                        .rounded_full()
+                        .bg(rgba(0x7C5CFF40))
+                        .text_size(px(11.0))
+                        .text_color(rgb(ACCENT_SOFT))
+                        .child(text),
+                );
+            }
+        }
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(title)
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(rgb(ACCENT_SOFT))
+                            .child(format!("Last seen {}", card.last_seen)),
+                    ),
+            )
+            .child(badges);
+        let uid = card.uid.clone();
+        let mut buttons = div().flex().flex_row().flex_wrap().gap(px(8.0));
+        if editing.is_some() {
+            buttons = buttons
+                .child(
+                    card_button("card-save", index, "Save", ACCENT, 0.6, cx).on_click(cx.listener(
+                        |view, _: &gpui::ClickEvent, _, cx| {
+                            if let Some((uid, text)) = view.editing.take()
+                                && !text.trim().is_empty()
+                            {
+                                view.act(SettingsAction::RenameCard(uid, text), cx);
+                            }
+                            cx.notify();
+                        },
+                    )),
+                )
+                .child(
+                    card_button("card-cancel", index, "Cancel", 0xFFFFFF, 0.06, cx).on_click(
+                        cx.listener(|view, _: &gpui::ClickEvent, _, cx| {
+                            view.editing = None;
+                            cx.notify();
+                        }),
+                    ),
+                );
+        } else {
+            let label = card.label.clone();
+            let rename_uid = uid.clone();
+            buttons = buttons.child(
+                card_button("card-rename", index, "Rename", 0xFFFFFF, 0.06, cx).on_click(
+                    cx.listener(move |view, _: &gpui::ClickEvent, window, cx| {
+                        view.editing = Some((rename_uid.clone(), label.clone()));
+                        view.confirm_forget_card = None;
+                        view.focus.focus(window, cx);
+                        cx.notify();
+                    }),
+                ),
+            );
+            let confirming = self.confirm_forget_card.as_ref() == Some(&card.uid);
+            let forget_uid = uid.clone();
+            buttons = buttons.child(
+                card_button(
+                    "card-forget",
+                    index,
+                    if confirming {
+                        "Click again to forget"
+                    } else {
+                        "Forget"
+                    },
+                    if confirming { 0xE0455A } else { 0xFFFFFF },
+                    if confirming { 0.55 } else { 0.06 },
+                    cx,
+                )
+                .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
+                    if view.confirm_forget_card.as_ref() == Some(&forget_uid) {
+                        view.confirm_forget_card = None;
+                        view.act(SettingsAction::ForgetCard(forget_uid.clone()), cx);
+                    } else {
+                        view.confirm_forget_card = Some(forget_uid.clone());
+                    }
+                    cx.notify();
+                })),
+            );
+            if !self.snapshot.card_busy {
+                let setup_uid = uid.clone();
+                buttons = buttons.child(
+                    card_button(
+                        "card-setup",
+                        index,
+                        "Set up as smart card",
+                        0xFFFFFF,
+                        0.06,
+                        cx,
+                    )
+                    .on_click(cx.listener(
+                        move |view, _: &gpui::ClickEvent, _, cx| {
+                            view.act(SettingsAction::SetUpCard(setup_uid.clone()), cx)
+                        },
+                    )),
+                );
+                if card.offer_mac_login {
+                    let login_uid = uid.clone();
+                    buttons = buttons.child(
+                        card_button("card-login", index, "Use for Mac login", ACCENT, 0.6, cx)
+                            .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
+                                view.act(SettingsAction::MacLogin(login_uid.clone()), cx)
+                            })),
+                    );
+                }
+            }
+        }
+        let mut panel = glass::panel(&format!("card-{index}"), 14.0, cx)
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .p(px(14.0))
+            .child(header);
+        if let Some(task) = &card.task {
+            let mut line = div().flex().flex_row().items_center().gap(px(10.0)).child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_size(px(12.5))
+                    .text_color(rgb(if card.task_failed { WARN } else { TEXT }))
+                    .child(task.clone()),
+            );
+            let dismiss = if card.task_finished { "OK" } else { "Cancel" };
+            if card.task_dismissable {
+                line = line.child(
+                    card_button("card-dismiss", index, dismiss, 0xFFFFFF, 0.06, cx).on_click(
+                        cx.listener(|view, _: &gpui::ClickEvent, _, cx| {
+                            view.act(SettingsAction::DismissCardTask, cx)
+                        }),
+                    ),
+                );
+            }
+            panel = panel.child(line);
+        }
+        panel.child(buttons)
+    }
+}
+
+/// A button inside a card row; `index` keeps ids and glass keys unique.
+fn card_button(
+    id: &'static str,
+    index: usize,
+    label: impl Into<gpui::SharedString>,
+    tint: u32,
+    opacity: f32,
+    cx: &mut App,
+) -> gpui::Stateful<gpui::Div> {
+    glass::capsule(&format!("{id}-{index}"), tint, opacity, cx)
+        .id((id, index))
+        .flex_none()
+        .px(px(14.0))
+        .py(px(6.0))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgba(0xFFFFFF14)))
+        .text_size(px(12.5))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .child(label.into())
 }
 
 fn section_title(title: &str) -> impl IntoElement {
@@ -973,6 +1368,9 @@ impl Render for SettingsView {
             .pt(px(TITLEBAR_INSET + 14.0))
             .child(header)
             .child(phone)
+            .when(snapshot.phone.is_some(), |column| {
+                column.child(self.render_cards(cx))
+            })
             .child(general);
         #[cfg(windows)]
         let column = column.child(self.passkeys.clone());
@@ -986,6 +1384,9 @@ impl Render for SettingsView {
                 div()
                     .id("settings")
                     .track_focus(&self.focus)
+                    .on_key_down(cx.listener(|view, event: &gpui::KeyDownEvent, _, cx| {
+                        view.edit_key(event, cx)
+                    }))
                     .absolute()
                     .inset_0()
                     .overflow_y_scroll()
@@ -1020,7 +1421,7 @@ pub fn open_settings_window(
         }
     }
     let on_action: OnSettingsAction = Rc::new(on_action);
-    let height = if cfg!(windows) { 720.0 } else { 520.0 };
+    let height = if cfg!(windows) { 720.0 } else { 640.0 };
     let bounds = Bounds::centered(None, size(px(480.0), px(height)), cx);
     let window = cx
         .open_window(

@@ -6,6 +6,8 @@
 //! same service stack backs a PC/SC reader (see `macos`), with PIV/cert
 //! flows only — WebAuthn is Track B.
 #[cfg(target_os = "macos")]
+mod mac_login;
+#[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
 mod security_key;
@@ -13,6 +15,7 @@ mod security_key;
 mod app_state;
 mod assets;
 mod autostart;
+mod card_tasks;
 mod glass;
 mod hostname;
 mod logging;
