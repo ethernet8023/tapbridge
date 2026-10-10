@@ -78,6 +78,13 @@ object RegisteredKeys {
     fun uidStable(uid: ByteArray): Boolean =
         uid.isNotEmpty() && !(uid.size == 4 && uid[0] == 0x08.toByte())
 
+    /** Longest UID the card frame carries (ISO 14443: 4, 7 or 10 bytes). */
+    const val MAX_WIRE_UID = 10
+
+    /** The UID the card frame reports: the stable one, or empty for none. */
+    fun wireUid(uid: ByteArray?): ByteArray =
+        uid?.takeIf { uidStable(it) && it.size <= MAX_WIRE_UID }?.copyOf() ?: byteArrayOf()
+
     /**
      * Gate matching: a discovered (uid, aaguid) pair matches a registered
      * record when the stable UID is equal; otherwise when the AAGUID is equal.

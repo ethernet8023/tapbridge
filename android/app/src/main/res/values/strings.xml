@@ -13,4 +13,7 @@
     <string name="removed_title">Card removed</string>
     <string name="removed_body">Tap again to finish signing in on your PC</string>
     <string name="removed_body_named">Tap again to finish signing in on %1$s</string>
+    <string name="setup_piv_title">Set up your smart card</string>
+    <string name="setup_piv_body">Your computer asked to set up a card. Open tapbridge to continue.</string>
+    <string name="setup_piv_body_named">%1$s asked to set up a card. Open tapbridge to continue.</string>
 </resources>

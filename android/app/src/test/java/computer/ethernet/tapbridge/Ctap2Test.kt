@@ -52,6 +52,15 @@ class Ctap2Test {
 
 /** UID stability rule and record matching (DESIGN "Registered keys"). */
 class RegisteredKeysTest {
+    @Test fun wireUidSendsOnlyStableUidsThatFitTheFrame() {
+        val implant = byteArrayOf(0x04, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66)
+        assertArrayEquals(implant, RegisteredKeys.wireUid(implant))
+        assertArrayEquals(byteArrayOf(), RegisteredKeys.wireUid(byteArrayOf(0x08, 1, 2, 3)))
+        assertArrayEquals(byteArrayOf(), RegisteredKeys.wireUid(null))
+        assertArrayEquals(byteArrayOf(), RegisteredKeys.wireUid(ByteArray(11) { 4 }))
+        assertArrayEquals(ByteArray(10) { 4 }, RegisteredKeys.wireUid(ByteArray(10) { 4 }))
+    }
+
     @Test fun fourByteUidStarting08IsRandom() {
         assertFalse(RegisteredKeys.uidStable(byteArrayOf(0x08.toByte(), 1, 2, 3)))
         assertTrue(RegisteredKeys.uidStable(byteArrayOf(0x08.toByte(), 1, 2, 3, 4)))

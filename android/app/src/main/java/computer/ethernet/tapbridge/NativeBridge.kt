@@ -7,7 +7,7 @@ package computer.ethernet.tapbridge
  * takes the read lock, release() takes the write lock and must wait until no
  * calls are in flight.
  *
- * Wire contract v2: connect dials a wake hint (HOSTID[;r=..][;d=..]) and sends
+ * Wire contract v3: connect dials a wake hint (HOSTID[;r=..][;d=..]) and sends
  * Hello { name, push } first; the host replies Accepted { name }.
  */
 object NativeBridge {
@@ -48,8 +48,14 @@ object NativeBridge {
      */
     @JvmStatic external fun read(handle: Long, callbacks: Any): Boolean
 
-    /** Report a newly discovered card to the host. */
-    @JvmStatic external fun card(handle: Long, generation: Long, atr: ByteArray, maxApdu: Int)
+    /**
+     * Report a newly discovered card to the host. [uid] is the tag's stable
+     * NFC UID (RegisteredKeys.wireUid), empty when absent or random.
+     */
+    @JvmStatic external fun card(handle: Long, generation: Long, atr: ByteArray, maxApdu: Int, uid: ByteArray)
+
+    /** The smart-card setup the host asked for (Callbacks.setupPiv) finished. */
+    @JvmStatic external fun pivSetupDone(handle: Long, ok: Boolean)
 
     /** Send an APDU response to the host. */
     @JvmStatic external fun response(handle: Long, id: Long, generation: Long, data: ByteArray)
@@ -71,5 +77,7 @@ object NativeBridge {
         /** Host's sign-in state (wire `auth` constants: 0 idle, 1 working,
          *  2 success, 3 card removed mid-auth, 4 PIN entry, 5 failed). */
         fun authState(state: Int)
+        /** The PC asks to set up the card with this UID as a smart card. */
+        fun setupPiv(uid: ByteArray)
     }
 }

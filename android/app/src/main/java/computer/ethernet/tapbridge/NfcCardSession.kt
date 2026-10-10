@@ -107,10 +107,11 @@ class NfcCardSession(private val gate: NativeGate) {
             val historical = iso.historicalBytes ?: byteArrayOf()
             val atr = Atr.fromHistorical(historical)
             val maximum = iso.maxTransceiveLength.coerceAtMost(65536)
+            val uid = RegisteredKeys.wireUid(discovered.id)
             synchronized(lock) {
                 if (generation != epoch || paused) { iso.close(); return }
                 tag = iso
-                reportCard(epoch, atr, maximum)
+                reportCard(epoch, atr, maximum, uid)
             }
             presence.start()
         } catch (error: Exception) { runCatching { iso.close() }; throw error }
@@ -157,10 +158,19 @@ class NfcCardSession(private val gate: NativeGate) {
         }
     }
 
-    private fun reportCard(gen: Long, atr: ByteArray, maximum: Int) {
+    private fun reportCard(gen: Long, atr: ByteArray, maximum: Int, uid: ByteArray = byteArrayOf()) {
         val h = boundHandle
         writer.execute {
-            runCatching { gate.withHandle(h) { NativeBridge.card(it, gen, atr, maximum) } }
+            runCatching { gate.withHandle(h) { NativeBridge.card(it, gen, atr, maximum, uid) } }
+        }
+    }
+
+    /** Tells the host how the smart-card setup it asked for ended. Queued
+     *  behind any card report, like every other host-bound write. */
+    fun reportPivSetup(ok: Boolean) {
+        val h = boundHandle
+        writer.execute {
+            runCatching { gate.withHandle(h) { NativeBridge.pivSetupDone(it, ok) } }
         }
     }
 

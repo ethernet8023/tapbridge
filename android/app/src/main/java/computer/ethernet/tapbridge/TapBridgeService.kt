@@ -72,6 +72,8 @@ class TapBridgeService : Service() {
             )
         }
         const val FOREGROUND_ID = 1
+        /** After WakeService.WAKE_NOTIFICATION_ID (2). */
+        const val PIV_SETUP_NOTIFICATION_ID = 3
         const val IDLE_TIMEOUT_MS = 60_000L
         const val WAKE_WINDOW_MS = 120_000L
         /** How long the success / failure art stays before returning to idle. */
@@ -88,6 +90,8 @@ class TapBridgeService : Service() {
         fun onTapRequested(requested: Boolean) {}
         /** The PC's sign-in state changed (Auth frame, or a local timeout). */
         fun onAuthState(state: AuthState) {}
+        /** The PC asks to set up the card with this UID as a smart card. */
+        fun onSetupPiv(uid: ByteArray) {}
     }
     inner class LocalBinder : Binder() { val service get() = this@TapBridgeService }
     private val binder = LocalBinder()
@@ -440,6 +444,22 @@ class TapBridgeService : Service() {
                 val value = AuthState.fromWire(state)
                 main.post { if (requested.get() == attempt) setAuthState(value) }
             }
+            override fun setupPiv(uid: ByteArray) {
+                bumpActivity()
+                main.post {
+                    if (requested.get() != attempt) return@post
+                    val ui = listener
+                    if (visible && ui != null) {
+                        ui.onSetupPiv(uid)
+                    } else {
+                        // The setup runs in the app, and Android won't let a
+                        // service open it: ask with a notification and keep
+                        // the request for when the app comes up.
+                        pendingPivSetup = uid
+                        notifyPivSetup()
+                    }
+                }
+            }
             override fun readCard() {
                 bumpActivity()
                 main.post {
@@ -509,6 +529,46 @@ class TapBridgeService : Service() {
                 }
             }
         } catch (_: RejectedExecutionException) { session.close() }
+    }
+
+    /** A PC's smart-card setup request the app hasn't shown yet. Main thread. */
+    private var pendingPivSetup: ByteArray? = null
+
+    /** Hands the app a waiting smart-card setup request once. Main thread. */
+    fun takePendingPivSetup(): ByteArray? {
+        val uid = pendingPivSetup ?: return null
+        pendingPivSetup = null
+        getSystemService(NotificationManager::class.java)?.cancel(PIV_SETUP_NOTIFICATION_ID)
+        return uid
+    }
+
+    private fun notifyPivSetup() {
+        ensureChannels(this)
+        val launch = PendingIntent.getActivity(
+            this, 1,
+            Intent(this, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val pc = targetHost?.let { IdentityStore.hostById(this, it)?.name }
+        val notification = Notification.Builder(this, CHANNEL_TAP_REQUEST)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(getString(R.string.setup_piv_title))
+            .setContentText(
+                pc?.let { getString(R.string.setup_piv_body_named, it) } ?: getString(R.string.setup_piv_body),
+            )
+            .setContentIntent(launch)
+            .setAutoCancel(true)
+            .setTimeoutAfter(WAKE_WINDOW_MS)
+            .build()
+        runCatching {
+            getSystemService(NotificationManager::class.java)?.notify(PIV_SETUP_NOTIFICATION_ID, notification)
+        }
+    }
+
+    /** The PC-requested smart-card setup ended (the app's PIV flow). */
+    fun reportPivSetup(ok: Boolean) {
+        if (status == Status.CONNECTED) session.reportPivSetup(ok)
     }
 
     fun resumeTagDiscovery() { session.paused = false }

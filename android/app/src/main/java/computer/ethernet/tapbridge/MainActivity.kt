@@ -119,6 +119,9 @@ class MainActivity : ComponentActivity() {
         override fun onAuthState(state: AuthState) {
             runOnUiThread { this@MainActivity.state?.let { it.authState = state } }
         }
+        override fun onSetupPiv(uid: ByteArray) {
+            runOnUiThread { startHostPivSetup(uid) }
+        }
     }
 
     private val conn = object : ServiceConnection {
@@ -136,6 +139,7 @@ class MainActivity : ComponentActivity() {
             state?.authState = service?.authState ?: AuthState.IDLE
             state?.connectedHost = service?.takeIf { it.status == TapBridgeService.Status.CONNECTED }?.targetHost
             deliverForwardedTag()
+            if (resumed) service?.takePendingPivSetup()?.let { startHostPivSetup(it) }
         }
         override fun onServiceDisconnected(name: ComponentName?) {
             service = null
@@ -187,7 +191,34 @@ class MainActivity : ComponentActivity() {
 
     /** Your keys -> "Set up smart-card login": any key, any time. */
     internal fun startPivSetup() {
+        hostPivUid = null
         state?.pivPrompt = PivPrompt.Scan
+    }
+
+    /**
+     * Stable UID of the card a PC asked to set up (Frame::SetupPiv); null
+     * when the setup was started on the phone. Its outcome goes back to
+     * the PC once, through [finishHostPiv].
+     */
+    private var hostPivUid: ByteArray? = null
+
+    /** The PC asked to set up this card: the same flow as Your keys. */
+    private fun startHostPivSetup(uid: ByteArray) {
+        val ui = state ?: return
+        // Never interrupt a setup or key registration already on screen.
+        if (ui.pivPrompt != null || ui.addKeyMode || ui.pendingRecord != null) {
+            service?.reportPivSetup(false)
+            return
+        }
+        hostPivUid = uid
+        ui.pivPrompt = PivPrompt.Scan
+    }
+
+    /** Reports a PC-requested setup's outcome, once. Main thread. */
+    private fun finishHostPiv(ok: Boolean) {
+        if (hostPivUid == null) return
+        hostPivUid = null
+        service?.reportPivSetup(ok)
     }
 
     /**
@@ -206,12 +237,21 @@ class MainActivity : ComponentActivity() {
         } finally {
             runCatching { iso?.close() }
         }
+        val wanted = hostPivUid
+        val tapped = tag.id?.takeIf { RegisteredKeys.uidStable(it) }
         val next = when {
+            wanted != null && tapped != null && !tapped.contentEquals(wanted) ->
+                PivPrompt.Failed("That's a different card from the one you picked on your computer.")
             iso == null -> PivPrompt.Failed("That isn't a smart card.")
             status == null -> PivPrompt.Failed("This key has no smart-card (PIV) applet, or it moved away too soon.")
             else -> PivPrompt.Form(status.copy(missing = Piv.SETUP_SLOTS), slots = Piv.SETUP_SLOTS)
         }
-        runOnUiThread { if (state?.pivPrompt == PivPrompt.Scan) state?.pivPrompt = next }
+        runOnUiThread {
+            if (state?.pivPrompt == PivPrompt.Scan) {
+                state?.pivPrompt = next
+                if (next is PivPrompt.Failed) finishHostPiv(false)
+            }
+        }
     }
 
     internal fun declinePiv() {
@@ -220,6 +260,8 @@ class MainActivity : ComponentActivity() {
     }
 
     internal fun endPiv() {
+        // Closed before it finished: the PC stops waiting.
+        finishHostPiv(state?.pivPrompt is PivPrompt.Done)
         state?.pivPrompt = null
     }
 
@@ -283,7 +325,14 @@ class MainActivity : ComponentActivity() {
         } finally {
             runCatching { iso?.close() }
         }
-        runOnUiThread { state?.pivPrompt = next }
+        runOnUiThread {
+            state?.pivPrompt = next
+            when (next) {
+                is PivPrompt.Done -> finishHostPiv(true)
+                is PivPrompt.Failed -> finishHostPiv(false)
+                else -> {}
+            }
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -427,6 +476,7 @@ class MainActivity : ComponentActivity() {
         }
         service?.resumeTagDiscovery()
         service?.onAppVisibility(true)
+        service?.takePendingPivSetup()?.let { startHostPivSetup(it) }
         // DESIGN: opening the app while paired connects immediately (to the
         // last-used host).
         if (IdentityStore.pairedHosts(this).isNotEmpty()) {
