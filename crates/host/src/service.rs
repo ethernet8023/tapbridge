@@ -5,7 +5,11 @@
 //! runtime (the desktop drives it from one dedicated runtime thread). The
 //! returned [`ServiceHandle`] is fully synchronous — plain `std` channels —
 //! so the gpui UI thread calls it directly without crossing into tokio.
-use crate::{state::Store, trace::Tracer};
+use crate::{
+    cards::{CapabilityProbe, KnownCard, KnownCards, uid_stable},
+    state::Store,
+    trace::Tracer,
+};
 use iroh::{
     Endpoint,
     endpoint::{Connection, SendStream},
@@ -45,8 +49,20 @@ pub enum Event {
         name: String,
     },
     PhoneDisconnected,
+    /// `uid` is the card's stable NFC UID; empty when absent, unknown or
+    /// random.
     CardPresent {
         present: bool,
+        uid: Vec<u8>,
+    },
+    /// The known-cards list changed (a card was seen, renamed, forgotten,
+    /// or showed a new capability). Re-read it with
+    /// [`ServiceHandle::known_cards`].
+    CardsChanged,
+    /// The phone finished the smart-card setup asked for with
+    /// [`ServiceHandle::setup_piv`].
+    PivSetupDone {
+        ok: bool,
     },
     /// A phone completed pairing with the outstanding invitation: a new phone,
     /// or the already paired phone scanning a fresh code.
@@ -72,6 +88,9 @@ pub struct Status {
     /// powers the card up afresh, which regenerates its CTAP PIN key
     /// agreement key: the security key uses this to notice a re-tap.
     pub card_generation: u64,
+    /// Stable NFC UID of the current card; empty when absent, unknown or
+    /// random.
+    pub card_uid: Vec<u8>,
 }
 
 /// What happened after a [`ServiceHandle::request_tap`].
@@ -96,6 +115,21 @@ enum Command {
     /// ([`wire::auth`]); dropped silently when no session is live.
     AuthState(u8),
     Status(std::sync::mpsc::SyncSender<Status>),
+    KnownCards(std::sync::mpsc::SyncSender<Vec<KnownCard>>),
+    RenameCard {
+        uid: Vec<u8>,
+        label: String,
+        reply: std::sync::mpsc::SyncSender<bool>,
+    },
+    ForgetCard {
+        uid: Vec<u8>,
+        reply: std::sync::mpsc::SyncSender<bool>,
+    },
+    /// Ask the connected phone to open its PIV setup for this card.
+    SetupPiv {
+        uid: Vec<u8>,
+        reply: std::sync::mpsc::SyncSender<bool>,
+    },
     EndpointAddr(std::sync::mpsc::SyncSender<iroh::EndpointAddr>),
     /// macOS PIV path: relay one APDU to the phone card and reply with the
     /// R-APDU. Mirrors the usbip reader's single-in-flight model.
@@ -186,6 +220,32 @@ impl ServiceHandle {
         {
             let _ = sender.send(Command::AuthState(state));
         }
+    }
+
+    /// Every card seen through the phone, oldest first.
+    pub fn known_cards(&self) -> Vec<KnownCard> {
+        self.reply(Command::KnownCards)
+    }
+
+    /// Renames a known card; `false` when unknown or the label is blank.
+    pub fn rename_card(&self, uid: Vec<u8>, label: String) -> bool {
+        self.reply_option(|reply| Command::RenameCard { uid, label, reply })
+            .unwrap_or(false)
+    }
+
+    /// Drops a known card; it is added again the next time it is tapped.
+    pub fn forget_card(&self, uid: Vec<u8>) -> bool {
+        self.reply_option(|reply| Command::ForgetCard { uid, reply })
+            .unwrap_or(false)
+    }
+
+    /// Asks the connected phone to open its smart-card setup for the card
+    /// `uid`. `false` when no phone session is live (wake it first) or the
+    /// UID is not a stable one. The answer arrives as
+    /// [`Event::PivSetupDone`].
+    pub fn setup_piv(&self, uid: Vec<u8>) -> bool {
+        self.reply_option(|reply| Command::SetupPiv { uid, reply })
+            .unwrap_or(false)
     }
 
     /// macOS PIV path: relays one APDU to the phone card, blocking until the
@@ -362,6 +422,11 @@ async fn run_inner(
     let (received_tx, mut received) = tokio_mpsc::channel::<io::Result<Frame>>(8);
     let mut active: Option<(Connection, SendStream, tokio::task::JoinHandle<()>)> = None;
     let mut card_present = false;
+    // The current card's stable UID (empty: none), the remembered cards and
+    // the passive capability probe over the PC's own APDUs.
+    let mut card_uid: Vec<u8> = Vec::new();
+    let mut known = KnownCards::open(&settings.state_dir);
+    let mut probe = CapabilityProbe::default();
     // Latest card state for the macOS IFD path: generation + ATR
     // (latest-wins, like the reader's `Shared::latest_card`).
     #[cfg(target_os = "macos")]
@@ -450,7 +515,39 @@ async fn run_inner(
                                 card_generation,
                                 #[cfg(not(target_os = "macos"))]
                                 card_generation: 0,
+                                card_uid: if card_present { card_uid.clone() } else { Vec::new() },
                             });
+                        },
+                        Command::KnownCards(reply) => {
+                            let _ = reply.send(known.list().to_vec());
+                        },
+                        Command::RenameCard { uid, label, reply } => {
+                            let changed = known.rename(&uid, &label);
+                            if changed {
+                                let _ = known.save();
+                                let _ = events.send(Event::CardsChanged);
+                            }
+                            let _ = reply.send(changed);
+                        },
+                        Command::ForgetCard { uid, reply } => {
+                            let changed = known.forget(&uid);
+                            if changed {
+                                let _ = known.save();
+                                let _ = events.send(Event::CardsChanged);
+                            }
+                            let _ = reply.send(changed);
+                        },
+                        Command::SetupPiv { uid, reply } => {
+                            // Checked here: an invalid frame would fail the
+                            // write and drop the session.
+                            let sent = active.is_some()
+                                && uid_stable(&uid)
+                                && uid.len() <= wire::MAX_UID
+                                && send_frame(
+                                    &mut active, &mut received, &to_reader, &events,
+                                    &mut card_present, Frame::SetupPiv { uid }, tracer.as_mut(),
+                                ).await?;
+                            let _ = reply.send(sent);
                         },
                         #[cfg(target_os = "macos")]
                         Command::PivTransmit { apdu, deadline, reply } => {
@@ -473,6 +570,7 @@ async fn run_inner(
                                 None => {
                                     let apdu_id = piv_ids;
                                     piv_ids = piv_ids.wrapping_add(1);
+                                    probe.request(apdu_id, &apdu);
                                     let frame = Frame::Apdu { id: apdu_id, generation: card_generation, data: apdu };
                                     let sent = send_frame(
                                         &mut active, &mut received, &to_reader, &events,
@@ -512,6 +610,9 @@ async fn run_inner(
                 // Reader asked to put a frame on the phone stream (Apdu, ReadCard).
                 frame = from_reader.recv() => {
                     let Some(frame) = frame else { break };
+                    if let Frame::Apdu { id, data, .. } = &frame {
+                        probe.request(*id, data);
+                    }
                     let _ = send_frame(
                         &mut active, &mut received, &to_reader, &events,
                         &mut card_present, frame, tracer.as_mut(),
@@ -595,20 +696,26 @@ async fn run_inner(
                     });
                     active = Some((conn, send, reader));
                     let _ = events.send(Event::PhoneConnected { name: name.clone() });
-                    let _ = events.send(Event::CardPresent { present: false });
+                    let _ = events.send(Event::CardPresent { present: false, uid: Vec::new() });
                 },
                 event = received.recv(), if active.is_some() => {
                     match event {
                         Some(Ok(frame @ (Frame::Card { .. } | Frame::Response { .. } | Frame::Failed { .. }))) => {
                             if let Some(line) = tracer.as_mut().and_then(|t| t.observe(&frame)) { let _ = events.send(Event::Trace(line)); }
-                            if let Frame::Card { generation, atr, .. } = &frame {
+                            if let Frame::Card { generation, atr, uid, .. } = &frame {
                                 card_present = !atr.is_empty();
+                                probe.reset();
+                                card_uid = if card_present && uid_stable(uid) { uid.clone() } else { Vec::new() };
+                                if card_present && known.see(&card_uid, atr, unix_now()) {
+                                    let _ = known.save();
+                                    let _ = events.send(Event::CardsChanged);
+                                }
                                 #[cfg(target_os = "macos")]
                                 {
                                     card_generation = *generation;
                                     latest_atr.clone_from(atr);
                                 }
-                                let _ = events.send(Event::CardPresent { present: card_present });
+                                let _ = events.send(Event::CardPresent { present: card_present, uid: card_uid.clone() });
                                 // Card absence/replacement retires a pending
                                 // PIV APDU (never carried to the next tag),
                                 // mirroring the reader.
@@ -620,6 +727,17 @@ async fn run_inner(
                                         piv_in_flight = Some(inf);
                                     }
                                 }
+                            }
+                            match &frame {
+                                Frame::Response { id, data, .. } => {
+                                    let seen = probe.response(*id, data);
+                                    if seen.any() && known.note(&card_uid, seen) {
+                                        let _ = known.save();
+                                        let _ = events.send(Event::CardsChanged);
+                                    }
+                                }
+                                Frame::Failed { id, .. } => probe.failed(*id),
+                                _ => {}
                             }
                             #[cfg(target_os = "macos")]
                             if let Frame::Response { id, generation, data } = &frame
@@ -639,6 +757,9 @@ async fn run_inner(
                                 result = to_reader.send(frame) => result.map_err(|_| io::Error::other("reader stopped"))?,
                                 _ = shutdown.changed() => break,
                             }
+                        },
+                        Some(Ok(Frame::PivSetupDone { ok })) => {
+                            let _ = events.send(Event::PivSetupDone { ok });
                         },
                         _ => disconnect(&mut active, &mut received, &to_reader, &events, &mut card_present).await?,
                     }
@@ -661,6 +782,12 @@ async fn run_inner(
     while handshakes.join_next().await.is_some() {}
     endpoint.close().await;
     result
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// The tap outcome when no session is live.
@@ -703,7 +830,10 @@ async fn disconnect(
     .map_err(|_| io::Error::other("reader stalled"))?
     .map_err(|_| io::Error::other("reader stopped"))?;
     *card_present = false;
-    let _ = events.send(Event::CardPresent { present: false });
+    let _ = events.send(Event::CardPresent {
+        present: false,
+        uid: Vec::new(),
+    });
     let _ = events.send(Event::PhoneDisconnected);
     Ok(())
 }
@@ -951,7 +1081,7 @@ mod tests {
             .await
             .unwrap();
             collector
-                .wait(|event| matches!(event, Event::CardPresent { present: true }))
+                .wait(|event| matches!(event, Event::CardPresent { present: true, .. }))
                 .await;
             let status = handle.status();
             assert!(status.card_present);
@@ -991,7 +1121,7 @@ mod tests {
             .wait(|event| matches!(event, Event::PhoneDisconnected))
             .await;
         collector
-            .wait(|event| matches!(event, Event::CardPresent { present: false }))
+            .wait(|event| matches!(event, Event::CardPresent { present: false, .. }))
             .await;
         assert_eq!(
             handle.request_tap(),
@@ -1163,5 +1293,153 @@ mod tests {
         transport::close(&paired.conn);
         drop(paired);
         drop(phone);
+    }
+
+    async fn send_card(phone: &mut PhoneSide, generation: u64, uid: &[u8]) {
+        wire::write_frame(
+            &mut phone.send,
+            &Frame::Card {
+                generation,
+                atr: vec![0x3B, 0x80, 0x80, 0x01, 0x01],
+                max_apdu: 255,
+                uid: uid.to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    const IMPLANT: [u8; 7] = [0x04, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tapped_card_is_remembered_by_uid_and_random_uids_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let _session = crate::keychain::TestSession::begin();
+        let (handle, mut collector, mut phone) = paired_service(dir.path(), "Pixel", None).await;
+        send_card(&mut phone, 1, &IMPLANT).await;
+        collector
+            .wait(|event| matches!(event, Event::CardPresent { present: true, uid } if uid == &IMPLANT))
+            .await;
+        collector
+            .wait(|event| matches!(event, Event::CardsChanged))
+            .await;
+        assert_eq!(handle.status().card_uid, IMPLANT);
+        let cards = handle.known_cards();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].label, "Card 1");
+        // A random UID is reported as none and not stored.
+        send_card(&mut phone, 2, &[0x08, 1, 2, 3]).await;
+        collector
+            .wait(|event| matches!(event, Event::CardPresent { present: true, uid } if uid.is_empty()))
+            .await;
+        assert!(handle.status().card_uid.is_empty());
+        assert_eq!(handle.known_cards().len(), 1);
+        // Rename and forget persist.
+        assert!(handle.rename_card(IMPLANT.to_vec(), "Implant".into()));
+        assert_eq!(
+            crate::cards::KnownCards::open(dir.path()).list()[0].label,
+            "Implant"
+        );
+        assert!(handle.forget_card(IMPLANT.to_vec()));
+        assert!(handle.known_cards().is_empty());
+        assert!(crate::cards::KnownCards::open(dir.path()).list().is_empty());
+        handle.shutdown();
+        transport::close(&phone.conn);
+        drop(phone.endpoint);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn setup_piv_reaches_the_phone_and_its_answer_comes_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let _session = crate::keychain::TestSession::begin();
+        let (handle, mut collector, mut phone) = paired_service(dir.path(), "Pixel", None).await;
+        assert!(handle.setup_piv(IMPLANT.to_vec()));
+        let frame = tokio::time::timeout(Duration::from_secs(5), wire::read_frame(&mut phone.recv))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            frame,
+            Frame::SetupPiv {
+                uid: IMPLANT.to_vec()
+            }
+        );
+        wire::write_frame(&mut phone.send, &Frame::PivSetupDone { ok: true })
+            .await
+            .unwrap();
+        collector
+            .wait(|event| matches!(event, Event::PivSetupDone { ok: true }))
+            .await;
+        // Still connected: the frame is not a protocol error.
+        assert!(handle.status().phone_connected);
+        transport::close(&phone.conn);
+        collector
+            .wait(|event| matches!(event, Event::PhoneDisconnected))
+            .await;
+        assert!(!handle.setup_piv(IMPLANT.to_vec()));
+        handle.shutdown();
+        drop(phone.endpoint);
+    }
+
+    /// macOS: the PIV token's own SELECT and certificate read mark the
+    /// card, without the service sending anything of its own.
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn piv_traffic_from_the_mac_marks_the_card_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let _session = crate::keychain::TestSession::begin();
+        let (handle, mut collector, mut phone) = paired_service(dir.path(), "Pixel", None).await;
+        send_card(&mut phone, 3, &IMPLANT).await;
+        collector
+            .wait(|event| matches!(event, Event::CardPresent { present: true, .. }))
+            .await;
+        let exchanges: [(Vec<u8>, Vec<u8>); 2] = [
+            (
+                vec![0x00, 0xA4, 0x04, 0x00, 5, 0xA0, 0, 0, 3, 8, 0],
+                vec![0x61, 0x11],
+            ),
+            (
+                vec![0x00, 0xCB, 0x3F, 0xFF, 5, 0x5C, 3, 0x5F, 0xC1, 0x05, 0],
+                vec![0x53, 0x01, 0x00, 0x90, 0x00],
+            ),
+        ];
+        for (apdu, answer) in exchanges {
+            let worker = {
+                let handle = handle.clone();
+                let apdu = apdu.clone();
+                std::thread::spawn(move || handle.piv_transmit(apdu))
+            };
+            let frame =
+                tokio::time::timeout(Duration::from_secs(5), wire::read_frame(&mut phone.recv))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let Frame::Apdu {
+                id,
+                generation,
+                data,
+            } = frame
+            else {
+                panic!("expected an APDU, got {frame:?}");
+            };
+            // Only the Mac's own command goes to the card.
+            assert_eq!(data, apdu);
+            wire::write_frame(
+                &mut phone.send,
+                &Frame::Response {
+                    id,
+                    generation,
+                    data: answer.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(worker.join().unwrap().unwrap(), answer);
+        }
+        let card = handle.known_cards().remove(0);
+        assert!(card.has_piv && card.piv_certs && !card.has_fido);
+        handle.shutdown();
+        transport::close(&phone.conn);
+        drop(phone.endpoint);
     }
 }
