@@ -828,6 +828,8 @@ pub enum SettingsAction {
     RenameCard(Vec<u8>, String),
     ForgetCard(Vec<u8>),
     SetUpCard(Vec<u8>),
+    /// macOS only: pair the card's login certificate with this Mac.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     MacLogin(Vec<u8>),
     /// Close the status of the card action (or stop waiting for it).
     DismissCardTask,

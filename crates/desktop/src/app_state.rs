@@ -45,7 +45,8 @@ const TAP_FRAME: Duration = Duration::from_millis(400);
 #[derive(Default)]
 pub struct NoopInstance;
 
-enum UiEvent {
+/// Everything the shell's event loop reacts to.
+pub enum UiEvent {
     ServiceStarted(ServiceHandle),
     ServiceFailed(String),
     /// Windows started a WebAuthn ceremony.
