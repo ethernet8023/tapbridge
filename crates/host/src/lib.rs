@@ -1,5 +1,6 @@
 //! tapbridge-host: USB/IP CCID reader plus the phone session service.
 
+pub mod cards;
 pub mod ccid;
 pub mod ctap_nfc;
 pub mod ctap_pin;
