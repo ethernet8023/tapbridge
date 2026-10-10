@@ -10,7 +10,6 @@ name = "tapbridge"
 path = "src/main.rs"
 
 [dependencies]
-unicode-segmentation = "1"
 tapbridge-host = { path = "../host" }
 tapbridge-core = { path = "../core" }
 tokio.workspace = true
@@ -22,6 +21,7 @@ tray-icon = "0.26"
 qrcode = { version = "0.14.1", default-features = false, features = ["image"] }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 png = "0.18"
+unicode-segmentation = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
