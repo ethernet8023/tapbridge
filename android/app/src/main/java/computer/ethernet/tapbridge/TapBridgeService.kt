@@ -106,6 +106,10 @@ class TapBridgeService : Service() {
         // Presence loss, transceive failure or cancel dropped the tag: the
         // host already has the absent Card frame; update the UI and notice.
         s.onTagLost = { main.post { onCardGone() } }
+        s.onCardRead = { uid, read -> Cards.noteRead(this, uid, read.caps) }
+        // Only cards whose features aren't known yet (new, or never read):
+        // the read delays the PC's first APDU, so not on every sign-in.
+        s.wantsRead = { uid -> Cards.get(this, uid)?.let { it.caps == 0 } ?: true }
     }
     private val connectivity = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {

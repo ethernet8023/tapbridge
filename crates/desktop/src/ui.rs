@@ -1248,7 +1248,13 @@ impl SettingsView {
     ) -> gpui::Div {
         let busy = self.snapshot.card_busy;
         let uid = card.uid.clone();
-        let mut list = div().flex().flex_col().gap(px(14.0));
+        let mut list = div().flex().flex_col().gap(px(14.0)).child(
+            div()
+                .text_size(px(15.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(rgb(TEXT))
+                .child("Log into your computer with this card"),
+        );
 
         // 1. Applet.
         let applet_detail = match checklist.applet {

@@ -157,6 +157,22 @@ object Cards {
     fun noteCaps(ctx: Context, uid: ByteArray, seen: Int): CardInfo? =
         change(ctx, uid) { old -> old?.let { noteCaps(it, seen, now()) }?.takeIf { it != old } }
 
+    /**
+     * Caps read from cards that weren't known yet (hex UID -> caps): a PC
+     * may add the card right after the tap, and its record gets them then.
+     */
+    private val unclaimedReads = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
+    /** A tap's [CardRead]: updates a known card, or holds it for when one is added. */
+    fun noteRead(ctx: Context, uid: ByteArray, caps: Int) {
+        if (get(ctx, uid) != null) {
+            setCaps(ctx, uid, caps)
+        } else {
+            if (unclaimedReads.size > 16) unclaimedReads.clear()
+            unclaimedReads[hex(uid)] = caps
+        }
+    }
+
     /** Replaces the caps with a full read of the card (FIDO and PIV both read). */
     fun setCaps(ctx: Context, uid: ByteArray, caps: Int): CardInfo? =
         change(ctx, uid) { it?.takeIf { c -> c.caps != caps }?.copy(caps = caps, capsAt = now()) }
@@ -173,6 +189,11 @@ object Cards {
         var merged: CardInfo? = null
         change(ctx, theirs.uid, create = true, fromPc = true, includeDeleted = true) { old ->
             (old?.merge(theirs) ?: theirs).also { merged = it }.takeIf { it != old }
+        }
+        // A card this phone read before the PC added it: the read is newer.
+        // (setCaps announces the change, which sends it to the PC.)
+        unclaimedReads.remove(hex(theirs.uid))?.let { caps ->
+            if (merged?.deleted == false && setCaps(ctx, theirs.uid, caps) != null) return null
         }
         return merged?.takeIf { it != theirs }
     }

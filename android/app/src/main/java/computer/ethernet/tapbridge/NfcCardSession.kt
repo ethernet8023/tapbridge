@@ -53,6 +53,16 @@ class NfcCardSession(private val gate: NativeGate) {
      */
     @Volatile var onTagLost: (() -> Unit)? = null
 
+    /**
+     * What a fresh tap showed the card supports ([CardRead]), read before
+     * the host hears of the card so it never interleaves with the PC's own
+     * APDUs. Called on the NFC worker; must not block.
+     */
+    @Volatile var onCardRead: ((uid: ByteArray, result: CardRead.Result) -> Unit)? = null
+
+    /** Whether a tap of this card should be read first (it costs a moment). */
+    @Volatile var wantsRead: ((uid: ByteArray) -> Boolean)? = null
+
     private val presenceTimer = ScheduledThreadPoolExecutor(1) { r ->
         Thread(r, "nfc-presence").apply { isDaemon = true }
     }.apply { removeOnCancelPolicy = true }
@@ -103,11 +113,17 @@ class NfcCardSession(private val gate: NativeGate) {
         val epoch = synchronized(lock) { generation }
         try {
             iso.connect()
+            val uid = Cards.wireUid(discovered.id)
+            // Read-only: FIDO SELECT and the PIV probe. Done before the Card
+            // report, so the PC hasn't started talking to the card yet.
+            if (uid.isNotEmpty() && wantsRead?.invoke(uid) == true) {
+                iso.timeout = 5000
+                runCatching { CardRead.read(iso) }.getOrNull()?.let { onCardRead?.invoke(uid, it) }
+            }
             iso.timeout = 15000
             val historical = iso.historicalBytes ?: byteArrayOf()
             val atr = Atr.fromHistorical(historical)
             val maximum = iso.maxTransceiveLength.coerceAtMost(65536)
-            val uid = Cards.wireUid(discovered.id)
             synchronized(lock) {
                 if (generation != epoch || paused) { iso.close(); return }
                 tag = iso
