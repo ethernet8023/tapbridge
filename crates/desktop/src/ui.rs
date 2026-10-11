@@ -1779,14 +1779,6 @@ impl SettingsView {
                     .child(if is_new { "NEW CARD" } else { "SET UP LOGIN" }),
             )
             .child(name);
-        if is_new {
-            sheet = sheet.child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(rgb(ACCENT_SOFT))
-                    .child("Name this card. Return saves."),
-            );
-        }
         if crate::login::SUPPORTED {
             sheet = sheet.child(capability_marks(
                 card.passkey,
