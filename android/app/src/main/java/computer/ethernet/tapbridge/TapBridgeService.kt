@@ -107,9 +107,10 @@ class TapBridgeService : Service() {
         // host already has the absent Card frame; update the UI and notice.
         s.onTagLost = { main.post { onCardGone() } }
         s.onCardRead = { uid, read -> Cards.noteRead(this, uid, read.caps) }
-        // Only cards whose features aren't known yet (new, or never read):
-        // the read delays the PC's first APDU, so not on every sign-in.
-        s.wantsRead = { uid -> Cards.get(this, uid)?.let { it.caps == 0 } ?: true }
+        // Once per card per app run: the read delays the PC's first APDU,
+        // so not on every sign-in, but often enough that a card whose caps
+        // were learned partially (e.g. only its PIV side) gets them all.
+        s.wantsRead = { uid -> readThisRun.add(Cards.hex(uid)) }
     }
     private val connectivity = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
@@ -160,6 +161,9 @@ class TapBridgeService : Service() {
     /** The PC on the live session can pair a card with its OS login. */
     @Volatile var hostPivLogin: Boolean = false
         private set
+
+    /** Cards read on a tap since the app started (hex UID). */
+    private val readThisRun: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
 
     /** Local card edits go to the PC on the live session (PC edits came from it). */
     private val cardSync = Cards.Listener { card, fromPc ->
