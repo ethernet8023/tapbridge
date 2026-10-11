@@ -6,14 +6,13 @@ import android.content.Context
 import android.content.Intent
 import android.nfc.NfcAdapter
 import android.nfc.Tag
-import android.nfc.tech.IsoDep
 import android.os.Bundle
 import java.io.IOException
 
 /**
  * Translucent no-UI activity behind the disabled `TapGate` activity-alias.
  * Enabled only during a wake window; on dispatch it identifies the card
- * against registered keys and forwards a matched Tag to MainActivity
+ * against the user's cards and forwards a matched Tag to MainActivity
  * (singleTask, so no new task stack), or finishes silently otherwise.
  *
  * Matching happens here, not in the session: a foreign card must never reach
@@ -57,26 +56,13 @@ class TapGateActivity : Activity() {
         }, "tapbridge-gate").start()
     }
 
-    /** True when the card matches a registered key; closes IsoDep either way. */
+    /**
+     * True when the tag is one of the user's cards with "open tapbridge when
+     * tapped" on. Matched by stable NFC UID alone: nothing is sent to the card.
+     */
     private fun identifyAndForward(tag: Tag): Boolean {
-        val iso = IsoDep.get(tag) ?: return false
-        val uid = tag.id
-        var aaguid: ByteArray? = null
-        try {
-            iso.connect()
-            iso.timeout = 5000
-            if (Ctap2.selectFido(iso)) {
-                val info = Ctap2.getInfoResponse(iso)
-                if (info != null) aaguid = Ctap2.aaguidFromInfo(info)
-            }
-        } catch (_: Exception) {
-            aaguid = null
-        } finally {
-            // Close IsoDep to release the card; never replay APDUs later.
-            runCatching { iso.close() }
-        }
-        val records = RegisteredKeys.list(this)
-        return RegisteredKeys.anyMatch(records, uid.takeIf { RegisteredKeys.uidStable(it) }, aaguid) != null
+        val uid = tag.id?.takeIf { Cards.uidStable(it) } ?: return false
+        return Cards.get(this, uid)?.wake == true
     }
 
     companion object {

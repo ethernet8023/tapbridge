@@ -152,7 +152,7 @@ object Piv {
             val (data, sw) = send(card, apdu(0x00, 0xCB, 0x3F, 0xFF, objectTag(slot.objectId), le = true))
             when (sw) {
                 0x9000 -> if (holdsCertificate(data)) {
-                    certificates[slot] = RegisteredKeys.hex(MessageDigest.getInstance("SHA-256").digest(data))
+                    certificates[slot] = Cards.hex(MessageDigest.getInstance("SHA-256").digest(data))
                     false
                 } else {
                     true
@@ -331,11 +331,11 @@ object Piv {
     /** Hex management key (spaces/colons allowed); null unless 16, 24 or 32 bytes. */
     fun parseManagementKey(text: String): ByteArray? {
         val hex = text.filterNot { it.isWhitespace() || it == ':' }
-        val bytes = RegisteredKeys.hexBytes(hex) ?: return null
+        val bytes = Cards.hexBytes(hex) ?: return null
         return bytes.takeIf { it.size in setOf(16, 24, 32) }
     }
 
-    val DEFAULT_MANAGEMENT_KEY_HEX: String = RegisteredKeys.hex(DEFAULT_MANAGEMENT_KEY)
+    val DEFAULT_MANAGEMENT_KEY_HEX: String = Cards.hex(DEFAULT_MANAGEMENT_KEY)
 
     private fun crypt(algorithm: Int, key: ByteArray, mode: Int, block: ByteArray): ByteArray {
         val expected = when (algorithm) {

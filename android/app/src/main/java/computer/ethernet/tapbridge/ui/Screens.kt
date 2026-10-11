@@ -18,7 +18,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import computer.ethernet.tapbridge.Invitation
-import computer.ethernet.tapbridge.RegisteredKeys
 
 /** Pair screen: animated QR scan viewfinder plus a paste fallback. */
 @Composable
@@ -98,118 +97,6 @@ fun PairScreen(
                 .fillMaxWidth()
                 .padding(top = 12.dp),
         ) { Text("Pair") }
-    }
-}
-
-/** Keys screen: registered security keys with add/rename/remove. */
-@Composable
-fun KeysScreen(
-    keys: List<RegisteredKeys.KeyRecord>,
-    onAddKey: () -> Unit,
-    onRename: (RegisteredKeys.KeyRecord, String) -> Unit,
-    onRemove: (RegisteredKeys.KeyRecord) -> Unit,
-    onSetUpPiv: () -> Unit,
-    onBack: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    var renaming by remember { mutableStateOf<RegisteredKeys.KeyRecord?>(null) }
-    var renameText by remember { mutableStateOf("") }
-    Column(
-        modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(20.dp),
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) {
-                Icon(Icons.Filled.ArrowBack, contentDescription = "Back")
-            }
-            Text("Your keys", style = MaterialTheme.typography.headlineSmall)
-        }
-        Spacer(Modifier.height(8.dp))
-        Text(
-            "Register the keys you want this phone to accept when the PC wakes it.",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Spacer(Modifier.height(16.dp))
-        keys.forEach { record ->
-            ListItem(
-                headlineContent = { Text(record.label, fontWeight = FontWeight.Medium) },
-                supportingContent = {
-                    Text(
-                        when {
-                            record.uid != null -> "NFC UID · " + RegisteredKeys.hex(record.uid)
-                            record.aaguid != null -> "AAGUID · " + RegisteredKeys.hex(record.aaguid)
-                            else -> "No identifiers stored"
-                        }
-                    )
-                },
-                trailingContent = {
-                    Row {
-                        IconButton(onClick = {
-                            renaming = record
-                            renameText = record.label
-                        }) {
-                            Icon(Icons.Filled.Edit, contentDescription = "Rename ${record.label}")
-                        }
-                        IconButton(onClick = { onRemove(record) }) {
-                            Icon(Icons.Filled.Delete, contentDescription = "Remove ${record.label}")
-                        }
-                    }
-                },
-            )
-        }
-        TextButton(
-            onClick = onSetUpPiv,
-            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-        ) {
-            Icon(Icons.Filled.Badge, contentDescription = null, modifier = Modifier.size(18.dp))
-            Spacer(Modifier.width(6.dp))
-            Text("Set up smart-card login")
-        }
-        if (keys.isEmpty()) {
-            Text(
-                "No keys registered yet.",
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(vertical = 24.dp),
-            )
-        }
-        Button(
-            onClick = onAddKey,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 12.dp),
-        ) {
-            Icon(Icons.Filled.Add, contentDescription = null)
-            Spacer(Modifier.width(8.dp))
-            Text("Add a key")
-        }
-    }
-    if (renaming != null) {
-        AlertDialog(
-            onDismissRequest = { renaming = null },
-            title = { Text("Rename key") },
-            text = {
-                OutlinedTextField(
-                    value = renameText,
-                    onValueChange = { renameText = it },
-                    singleLine = true,
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    val record = renaming
-                    if (record != null && renameText.isNotBlank()) {
-                        onRename(record, renameText.trim())
-                    }
-                    renaming = null
-                }) { Text("Save") }
-            },
-            dismissButton = {
-                TextButton(onClick = { renaming = null }) { Text("Cancel") }
-            },
-        )
     }
 }
 
@@ -387,59 +274,6 @@ fun SettingsScreen(
             dismissButton = {
                 TextButton(onClick = { forgetting = null }) { Text("Cancel") }
             },
-        )
-    }
-}
-
-/** Add-key flow, shown above whatever screen is open: tap prompt, then name. */
-@Composable
-fun AddKeyDialogs(
-    reading: Boolean,
-    readError: String?,
-    pending: RegisteredKeys.KeyRecord?,
-    onCancelRead: () -> Unit,
-    onSave: (RegisteredKeys.KeyRecord) -> Unit,
-    onDiscard: () -> Unit,
-) {
-    if (reading && pending == null) {
-        AlertDialog(
-            onDismissRequest = onCancelRead,
-            title = { Text("Add a key") },
-            text = {
-                Column {
-                    KeyReaderOverlay(null)
-                    if (readError != null) {
-                        Text(
-                            readError,
-                            color = MaterialTheme.colorScheme.error,
-                            modifier = Modifier.padding(top = 12.dp),
-                        )
-                    }
-                }
-            },
-            confirmButton = { TextButton(onClick = onCancelRead) { Text("Cancel") } },
-        )
-    }
-    pending?.let { record ->
-        var name by remember(record) { mutableStateOf("") }
-        AlertDialog(
-            onDismissRequest = onDiscard,
-            title = { Text("Name this key") },
-            text = {
-                OutlinedTextField(
-                    value = name,
-                    onValueChange = { name = it.take(40) },
-                    placeholder = { Text("e.g. Blue key") },
-                    singleLine = true,
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    enabled = name.isNotBlank(),
-                    onClick = { onSave(record.copy(label = name.trim())) },
-                ) { Text("Save") }
-            },
-            dismissButton = { TextButton(onClick = onDiscard) { Text("Cancel") } },
         )
     }
 }

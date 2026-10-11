@@ -66,7 +66,7 @@ fun HomeScreen(
             Spacer(Modifier.weight(1f))
             if (paired) {
                 IconButton(onClick = onKeys) {
-                    Icon(Icons.Filled.Key, contentDescription = "Your keys")
+                    Icon(Icons.Filled.Key, contentDescription = "Your cards")
                 }
             }
             IconButton(onClick = onSettings) {

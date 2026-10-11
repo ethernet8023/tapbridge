@@ -107,7 +107,7 @@ class NfcCardSession(private val gate: NativeGate) {
             val historical = iso.historicalBytes ?: byteArrayOf()
             val atr = Atr.fromHistorical(historical)
             val maximum = iso.maxTransceiveLength.coerceAtMost(65536)
-            val uid = RegisteredKeys.wireUid(discovered.id)
+            val uid = Cards.wireUid(discovered.id)
             synchronized(lock) {
                 if (generation != epoch || paused) { iso.close(); return }
                 tag = iso
@@ -165,12 +165,29 @@ class NfcCardSession(private val gate: NativeGate) {
         }
     }
 
-    /** Tells the host how the smart-card setup it asked for ended. Queued
-     *  behind any card report, like every other host-bound write. */
-    fun reportPivSetup(ok: Boolean) {
+    /** Sends a card record to the host. Queued in order with every other
+     *  host-bound write, so a record sent before a card report arrives first. */
+    fun sendCardInfo(card: CardInfo) {
         val h = boundHandle
+        if (h == 0L) return
         writer.execute {
-            runCatching { gate.withHandle(h) { NativeBridge.pivSetupDone(it, ok) } }
+            runCatching {
+                gate.withHandle(h) {
+                    NativeBridge.cardInfo(
+                        it, card.uid, card.label, card.labelAt, card.wake, card.wakeAt,
+                        card.caps, card.capsAt, card.macLogin, card.macLoginAt, card.deletedAt,
+                    )
+                }
+            }
+        }
+    }
+
+    /** A card action request ([done] false) or its outcome ([done] true). */
+    fun sendCardAction(uid: ByteArray, action: Int, done: Boolean, ok: Boolean) {
+        val h = boundHandle
+        if (h == 0L) return
+        writer.execute {
+            runCatching { gate.withHandle(h) { NativeBridge.cardAction(it, uid, action, done, ok) } }
         }
     }
 

@@ -44,15 +44,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.view.WindowCompat
 import computer.ethernet.tapbridge.ui.HomeScreen
-import computer.ethernet.tapbridge.ui.KeysScreen
-import computer.ethernet.tapbridge.ui.AddKeyDialogs
+import computer.ethernet.tapbridge.ui.AddCardDialogs
+import computer.ethernet.tapbridge.ui.CardsScreen
+import computer.ethernet.tapbridge.ui.MacLink
+import computer.ethernet.tapbridge.ui.PendingCard
 import computer.ethernet.tapbridge.ui.PairScreen
 import computer.ethernet.tapbridge.ui.PivPrompt
 import computer.ethernet.tapbridge.ui.PivSetupDialogs
 import computer.ethernet.tapbridge.ui.SettingsScreen
 import computer.ethernet.tapbridge.ui.theme.LocalReducedMotion
 import computer.ethernet.tapbridge.ui.theme.TapBridgeTheme
-import java.util.UUID
 import java.util.concurrent.Executors
 
 /**
@@ -84,15 +85,28 @@ class MainActivity : ComponentActivity() {
         var dndGranted by mutableStateOf(false)
         var addKeyMode by mutableStateOf(false)
         var addKeyError by mutableStateOf<String?>(null)
-        var pendingRecord by mutableStateOf<RegisteredKeys.KeyRecord?>(null)
+        /** A tapped card that isn't one of the user's yet, being named. */
+        var pendingCard by mutableStateOf<PendingCard?>(null)
+        /** The user's cards (Cards.list), refreshed on every change. */
+        var cards by mutableStateOf<List<CardInfo>>(emptyList())
+        /** OS of the PC on the live session (NativeBridge.PLATFORM_*), -1 without one. */
+        var hostPlatform by mutableStateOf(-1)
+        /** Hex UID of the card whose Mac login is running on the Mac. */
+        var macLoginBusy by mutableStateOf<String?>(null)
+        /** How the last Mac login request ended, shown once. */
+        var macLoginResult by mutableStateOf<String?>(null)
         /** Phone-side PIV setup offer/flow; null when none is showing. */
         var pivPrompt by mutableStateOf<PivPrompt?>(null)
         /** A pairing code opened as a tapbridge: link, waiting for "Pair". */
         var linkInvitation by mutableStateOf<String?>(null)
     }
 
-    /** Keys whose PIV offer was turned down this run (stable UID hex). */
-    private val pivDeclined = HashSet<String>()
+    /** A new card's PIV state, offered for setup once the card is named. */
+    private var pendingPiv: Piv.Status? = null
+
+    private val cardsListener = Cards.Listener { _, _ ->
+        runOnUiThread { state?.cards = Cards.list(this) }
+    }
     private val pivWorker = Executors.newSingleThreadExecutor { r -> Thread(r, "piv").apply { isDaemon = true } }
 
     private var state: UiState? = null
@@ -107,8 +121,10 @@ class MainActivity : ComponentActivity() {
                 state?.let {
                     it.status = status
                     it.error = error
-                    it.connectedHost =
-                        if (status == TapBridgeService.Status.CONNECTED) service?.targetHost else null
+                    val connected = status == TapBridgeService.Status.CONNECTED
+                    it.connectedHost = if (connected) service?.targetHost else null
+                    it.hostPlatform = if (connected) service?.hostPlatform ?: -1 else -1
+                    if (!connected) it.macLoginBusy = null
                 }
             }
         }
@@ -121,8 +137,17 @@ class MainActivity : ComponentActivity() {
         override fun onAuthState(state: AuthState) {
             runOnUiThread { this@MainActivity.state?.let { it.authState = state } }
         }
-        override fun onSetupPiv(uid: ByteArray) {
+        override fun onSetupCerts(uid: ByteArray) {
             runOnUiThread { startHostPivSetup(uid) }
+        }
+        override fun onMacLoginDone(uid: ByteArray, ok: Boolean) {
+            runOnUiThread {
+                val ui = state ?: return@runOnUiThread
+                if (ui.macLoginBusy != Cards.hex(uid)) return@runOnUiThread
+                ui.macLoginBusy = null
+                val name = Cards.get(this@MainActivity, uid)?.label ?: "The card"
+                ui.macLoginResult = if (ok) "\u201C$name\u201D now unlocks your Mac." else "Mac login wasn't set up. Check your Mac for details."
+            }
         }
     }
 
@@ -140,6 +165,7 @@ class MainActivity : ComponentActivity() {
             state?.tapRequested = service?.tapRequested == true
             state?.authState = service?.authState ?: AuthState.IDLE
             state?.connectedHost = service?.takeIf { it.status == TapBridgeService.Status.CONNECTED }?.targetHost
+            state?.hostPlatform = service?.takeIf { it.status == TapBridgeService.Status.CONNECTED }?.hostPlatform ?: -1
             deliverForwardedTag()
             if (resumed) service?.takePendingPivSetup()?.let { startHostPivSetup(it) }
         }
@@ -154,73 +180,105 @@ class MainActivity : ComponentActivity() {
         when {
             ui?.pivPrompt is PivPrompt.Waiting -> pivWorker.execute { runPivSetup(tag) }
             ui?.pivPrompt is PivPrompt.Scan -> pivWorker.execute { scanPiv(tag) }
-            ui?.addKeyMode == true -> runOnUiThread { handleRegistrationTag(tag) }
-            // No PC is using the key: look for an unconfigured PIV applet
-            // before handing the tag on. Never during a PC request, where
-            // extra SELECTs would disturb the PC's session with the card.
-            ui != null && ui.pivPrompt == null && !ui.tapRequested &&
+            ui?.addKeyMode == true -> pivWorker.execute { handleRegistrationTag(tag) }
+            // No PC is using the card: read what it supports (and offer to
+            // add it when it's new) before handing the tag on. Never during
+            // a PC session, where extra SELECTs would disturb the PC's
+            // exchange with the card.
+            ui != null && ui.pivPrompt == null && ui.pendingCard == null && !ui.tapRequested &&
                 ui.status != TapBridgeService.Status.CONNECTED -> pivWorker.execute {
-                    probePiv(tag)
+                    readIdle(tag)
                     service?.onTagDiscovered(tag)
                 }
             else -> service?.onTagDiscovered(tag)
         }
     }
 
-    /** Offers PIV setup when the tapped key has PIV with empty login slots. */
-    private fun probePiv(tag: Tag) {
-        val uid = tag.id?.takeIf { RegisteredKeys.uidStable(it) }?.let { RegisteredKeys.hex(it) }
-        if (uid != null && uid in pivDeclined) return
-        val iso = android.nfc.tech.IsoDep.get(tag) ?: return
-        val status = try {
+    /**
+     * Reads what the tapped card supports. A known card's caps are updated
+     * (and so synced); a new one is offered to add.
+     */
+    private fun readIdle(tag: Tag) {
+        val uid = tag.id?.takeIf { Cards.uidStable(it) && it.size <= Cards.MAX_UID } ?: return
+        val read = readCard(tag) ?: return
+        if (Cards.get(this, uid) != null) {
+            Cards.setCaps(this, uid, read.caps)
+            return
+        }
+        runOnUiThread {
+            val ui = state ?: return@runOnUiThread
+            if (ui.pendingCard != null || ui.pivPrompt != null || ui.addKeyMode) return@runOnUiThread
+            pendingPiv = read.piv
+            ui.pendingCard = PendingCard(uid, read.caps, Cards.defaultLabel(this))
+        }
+    }
+
+    /** [CardRead] on its own connection; null when the card moved away. */
+    private fun readCard(tag: Tag): CardRead.Result? {
+        val iso = android.nfc.tech.IsoDep.get(tag) ?: return null
+        return try {
             iso.connect()
             iso.timeout = 5000
-            Piv.probe { iso.transceive(it) }
+            CardRead.read(iso)
         } catch (_: Exception) {
             null
         } finally {
             runCatching { iso.close() }
         }
-        if (status?.needsSetup == true) {
-            runOnUiThread {
-                state?.let { if (it.pivPrompt == null) it.pivPrompt = PivPrompt.Offer(status) }
-                pivOfferedUid = uid
-            }
-        }
     }
 
-    private var pivOfferedUid: String? = null
+    /** Stores a fresh PIV probe in the card's caps (FIDO bit kept). */
+    private fun notePiv(uid: ByteArray?, status: Piv.Status?) {
+        val card = uid?.let { Cards.get(this, it) } ?: return
+        Cards.setCaps(this, card.uid, CardRead.withPiv(card.caps, status))
+    }
 
-    /** Your keys -> "Set up smart-card login": any key, any time. */
-    internal fun startPivSetup() {
-        hostPivUid = null
+    /** Your cards -> "Set up" certificates for this card. */
+    internal fun startPivSetup(card: CardInfo) {
+        pivUid = card.uid
+        pivFromPc = false
         state?.pivPrompt = PivPrompt.Scan
     }
 
-    /**
-     * Stable UID of the card a PC asked to set up (Frame::SetupPiv); null
-     * when the setup was started on the phone. Its outcome goes back to
-     * the PC once, through [finishHostPiv].
-     */
-    private var hostPivUid: ByteArray? = null
+    /** Your cards -> "Set up" Mac login: the Mac pairs it. */
+    internal fun requestMacLogin(card: CardInfo) {
+        val ui = state ?: return
+        if (service?.requestMacLogin(card.uid) == true) {
+            ui.macLoginBusy = Cards.hex(card.uid)
+        } else {
+            ui.macLoginResult = "Connect to your Mac first."
+        }
+    }
 
-    /** The PC asked to set up this card: the same flow as Your keys. */
+    /**
+     * Stable UID of the card being set up, when the setup is for one card
+     * (asked by a PC, or picked in Your cards). [pivFromPc]: a PC asked
+     * (CardAction), so its outcome goes back to the PC once, through
+     * [finishHostPiv].
+     */
+    private var pivUid: ByteArray? = null
+    private var pivFromPc = false
+
+    /** A PC asked to set up this card's certificates: the same flow as Your cards. */
     private fun startHostPivSetup(uid: ByteArray) {
         val ui = state ?: return
-        // Never interrupt a setup or key registration already on screen.
-        if (ui.pivPrompt != null || ui.addKeyMode || ui.pendingRecord != null) {
-            service?.reportPivSetup(false)
+        // Never interrupt a setup or card naming already on screen.
+        if (ui.pivPrompt != null || ui.addKeyMode || ui.pendingCard != null) {
+            service?.reportSetupCerts(uid, false)
             return
         }
-        hostPivUid = uid
+        pivUid = uid
+        pivFromPc = true
         ui.pivPrompt = PivPrompt.Scan
     }
 
     /** Reports a PC-requested setup's outcome, once. Main thread. */
     private fun finishHostPiv(ok: Boolean) {
-        if (hostPivUid == null) return
-        hostPivUid = null
-        service?.reportPivSetup(ok)
+        val uid = pivUid
+        val fromPc = pivFromPc
+        pivUid = null
+        pivFromPc = false
+        if (fromPc && uid != null) service?.reportSetupCerts(uid, ok)
     }
 
     /**
@@ -239,15 +297,18 @@ class MainActivity : ComponentActivity() {
         } finally {
             runCatching { iso?.close() }
         }
-        val wanted = hostPivUid
-        val tapped = tag.id?.takeIf { RegisteredKeys.uidStable(it) }
+        val wanted = pivUid
+        val tapped = tag.id?.takeIf { Cards.uidStable(it) }
         val next = when {
-            wanted != null && tapped != null && !tapped.contentEquals(wanted) ->
-                PivPrompt.Failed("That's a different card from the one you picked on your computer.")
+            wanted != null && (tapped == null || !tapped.contentEquals(wanted)) ->
+                PivPrompt.Failed(
+                    if (pivFromPc) "That's a different card from the one you picked on your computer."
+                    else "That's a different card from \u201C${Cards.get(this, wanted)?.label ?: "the one you picked"}\u201D.",
+                )
             iso == null -> PivPrompt.Failed("That isn't a smart card.")
             status == null -> PivPrompt.Failed("This key has no smart-card (PIV) applet, or it moved away too soon.")
             else -> {
-                tapped?.let { PivCache.save(this, it, status) }
+                notePiv(tapped, status)
                 PivPrompt.Review(status)
             }
         }
@@ -257,11 +318,6 @@ class MainActivity : ComponentActivity() {
                 if (next is PivPrompt.Failed) finishHostPiv(false)
             }
         }
-    }
-
-    internal fun declinePiv() {
-        pivOfferedUid?.let { pivDeclined.add(it) }
-        endPiv()
     }
 
     internal fun endPiv() {
@@ -318,13 +374,11 @@ class MainActivity : ComponentActivity() {
                 slots = form.slots, managementKey = key,
                 replace = form.replace, expected = form.status,
             )
-            tag.id?.takeIf { RegisteredKeys.uidStable(it) }?.let { uid ->
-                runCatching { Piv.probe(transport) }.getOrNull()?.let { PivCache.save(this, uid, it) }
-            }
+            runCatching { Piv.probe(transport) }.getOrNull()?.let { notePiv(tag.id, it) }
             if (result.slots.isEmpty()) PivPrompt.Failed("This key already has its certificates.")
             else PivPrompt.Done(result.slots)
         } catch (changed: Piv.SetupChanged) {
-            tag.id?.takeIf { RegisteredKeys.uidStable(it) }?.let { PivCache.save(this, it, changed.status) }
+            notePiv(tag.id, changed.status)
             PivPrompt.Changed(changed.status)
         } catch (wrong: Piv.WrongPin) {
             val status = form.status.copy(pinRetries = wrong.retries)
@@ -367,6 +421,8 @@ class MainActivity : ComponentActivity() {
         val ui = UiState()
         state = ui
         ui.notificationsGranted = hasNotifications()
+        ui.cards = Cards.list(this)
+        Cards.addListener(cardsListener)
 
         setContent {
             val reducedMotion = remember {
@@ -454,47 +510,49 @@ class MainActivity : ComponentActivity() {
     internal fun stopTapService() {
         startService(Intent(this, TapBridgeService::class.java).setAction(TapBridgeService.ACTION_STOP))
     }
-    /** Add-key flow: read UID (stable only) + AAGUID from a tapped card. */
+    /** Add-card flow (worker thread): read the tapped card, then ask for a name. */
     private fun handleRegistrationTag(tag: Tag) {
-        val iso = android.nfc.tech.IsoDep.get(tag)
-        var uid: ByteArray? = null
-        var aaguid: ByteArray? = null
-        if (iso != null) {
-            try {
-                iso.connect()
-                iso.timeout = 5000
-                uid = tag.id?.takeIf { RegisteredKeys.uidStable(it) }
-                if (Ctap2.selectFido(iso)) {
-                    Ctap2.getInfoResponse(iso)?.let { info ->
-                        aaguid = Ctap2.aaguidFromInfo(info)
-                    }
+        val uid = tag.id?.takeIf { Cards.uidStable(it) && it.size <= Cards.MAX_UID }
+        val read = uid?.let { readCard(tag) }
+        val known = uid?.let { Cards.get(this, it) }
+        runOnUiThread {
+            val ui = state ?: return@runOnUiThread
+            if (!ui.addKeyMode) return@runOnUiThread
+            when {
+                uid == null -> ui.addKeyError = "This card has no stable ID, so tapbridge can't tell it apart. Try another card."
+                read == null -> ui.addKeyError = "Couldn't read the card. Hold it still and try again."
+                known != null -> {
+                    Cards.setCaps(this, uid, read.caps)
+                    ui.addKeyError = "That's \u201C${known.label}\u201D, already one of your cards."
                 }
-                // Offered once the key is named (the dialog waits for that).
-                runCatching { Piv.probe { iso.transceive(it) } }.getOrNull()
-                    ?.takeIf { it.needsSetup }
-                    ?.let { state?.pivPrompt = PivPrompt.Offer(it) }
-            } catch (e: Exception) {
-                state?.let { it.addKeyError = "Could not read the key: ${e.message ?: "card error"}" }
-            } finally {
-                runCatching { iso.close() }
+                else -> {
+                    pendingPiv = read.piv
+                    ui.pendingCard = PendingCard(uid, read.caps, Cards.defaultLabel(this))
+                    ui.addKeyMode = false
+                }
             }
         }
-        if (uid == null && aaguid == null) {
-            state?.let {
-                it.addKeyError = "This card has no stable identifier; it can't be registered"
-                it.addKeyMode = false
-            }
-            return
+    }
+
+    /** Adds the named card; offers the smart-card setup when it has empty slots. */
+    internal fun savePendingCard(card: PendingCard, label: String) {
+        val ui = state ?: return
+        Cards.add(this, card.uid, label, card.caps)
+        ui.pendingCard = null
+        ui.addKeyMode = false
+        val piv = pendingPiv
+        pendingPiv = null
+        if (piv?.needsSetup == true && piv.contactlessBlocked != true && ui.pivPrompt == null) {
+            pivUid = card.uid
+            pivFromPc = false
+            ui.pivPrompt = PivPrompt.Offer(piv)
         }
-        state?.let {
-            it.pendingRecord = RegisteredKeys.KeyRecord(
-                id = UUID.randomUUID().toString(),
-                label = "",
-                uid = uid,
-                aaguid = aaguid,
-            )
-            it.addKeyMode = false
-        }
+    }
+
+    internal fun discardPendingCard() {
+        pendingPiv = null
+        state?.pendingCard = null
+        state?.addKeyMode = false
     }
 
     override fun onResume() {
@@ -538,6 +596,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        Cards.removeListener(cardsListener)
         pivWorker.shutdownNow()
         if (bound) {
             service?.listener = null
@@ -557,7 +616,6 @@ class MainActivity : ComponentActivity() {
 private fun App(ui: MainActivity.UiState, activity: MainActivity) {
     val context = LocalContext.current
     var screen by rememberSaveable { mutableStateOf("home") }
-    var keys by remember { mutableStateOf(RegisteredKeys.list(context)) }
     var hosts by remember { mutableStateOf(IdentityStore.pairedHosts(context)) }
 
     // Pairing from the in-app scanner or a confirmed tapbridge: link.
@@ -610,18 +668,17 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
                     onBack = { screen = "home" },
                     Modifier.fillMaxSize(),
                 )
-                "keys" -> KeysScreen(
-                    keys = keys,
-                    onAddKey = { ui.addKeyError = null; ui.addKeyMode = true },
-                    onRename = { record, label ->
-                        RegisteredKeys.upsert(context, record.copy(label = label))
-                        keys = RegisteredKeys.list(context)
-                    },
-                    onRemove = { record ->
-                        RegisteredKeys.remove(context, record.id)
-                        keys = RegisteredKeys.list(context)
-                    },
-                    onSetUpPiv = { activity.startPivSetup() },
+                "cards" -> CardsScreen(
+                    cards = ui.cards,
+                    mac = if (ui.hostPlatform == NativeBridge.PLATFORM_MACOS) MacLink.CONNECTED else MacLink.NONE,
+                    showMacLogin = Cards.seenMac(context) || ui.cards.any { it.macLogin },
+                    macLoginBusy = ui.macLoginBusy,
+                    onAddCard = { ui.addKeyError = null; ui.addKeyMode = true },
+                    onRename = { card, label -> Cards.rename(context, card.uid, label) },
+                    onForget = { card -> Cards.forget(context, card.uid) },
+                    onWake = { card, wake -> Cards.setWake(context, card.uid, wake) },
+                    onSetUpCerts = { card -> activity.startPivSetup(card) },
+                    onMacLogin = { card -> activity.requestMacLogin(card) },
                     onBack = { screen = "home" },
                     Modifier.fillMaxSize(),
                 )
@@ -663,7 +720,7 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
                 else -> HomeScreen(
                     ui = ui,
                     onStartPair = { screen = "pair" },
-                    onKeys = { keys = RegisteredKeys.list(context); screen = "keys" },
+                    onKeys = { screen = "cards" },
                     // Pairing completes in the background after the scan,
                     // so read the list fresh each time Settings opens.
                     onSettings = { hosts = IdentityStore.pairedHosts(context); screen = "settings" },
@@ -674,21 +731,24 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
     }
     // Dialogs live above the navigation, so they open over whichever screen
     // started them (they used to belong to home and opened behind Keys).
-    AddKeyDialogs(
+    AddCardDialogs(
         reading = ui.addKeyMode,
         readError = ui.addKeyError,
-        pending = ui.pendingRecord,
+        pending = ui.pendingCard,
         onCancelRead = { ui.addKeyMode = false; ui.addKeyError = null },
-        onSave = { record ->
-            RegisteredKeys.upsert(context, record)
-            ui.pendingRecord = null
-            ui.addKeyMode = false
-            keys = RegisteredKeys.list(context)
-        },
-        onDiscard = { ui.pendingRecord = null; ui.addKeyMode = false },
+        onSave = { card, label -> activity.savePendingCard(card, label) },
+        onDiscard = { activity.discardPendingCard() },
     )
-    // After the add-key dialogs, so a newly registered key is named first.
-    if (ui.pendingRecord == null && !ui.addKeyMode) {
+    ui.macLoginResult?.let { text ->
+        AlertDialog(
+            onDismissRequest = { ui.macLoginResult = null },
+            title = { Text("Mac login") },
+            text = { Text(text) },
+            confirmButton = { TextButton(onClick = { ui.macLoginResult = null }) { Text("OK") } },
+        )
+    }
+    // After the add-card dialogs, so a new card is named first.
+    if (ui.pendingCard == null && !ui.addKeyMode) {
         PivSetupDialogs(
             prompt = ui.pivPrompt,
             defaultName = IdentityStore.phoneName(context).let { "$it PIV" },
@@ -705,9 +765,7 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
                     status, pin = defaultPin(status), slots = Piv.SETUP_SLOTS, replace = true,
                 )
             },
-            onDismiss = {
-                if (ui.pivPrompt is PivPrompt.Offer) activity.declinePiv() else activity.endPiv()
-            },
+            onDismiss = { activity.endPiv() },
         )
     }
 }

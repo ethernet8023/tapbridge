@@ -25,12 +25,12 @@ import computer.ethernet.tapbridge.Piv
 
 /** Steps of the phone-side PIV setup (see Piv.kt). */
 sealed class PivPrompt {
-    /** Started from Your keys: waiting for a key to read its PIV state. */
+    /** Started from Your cards: waiting for a key to read its PIV state. */
     object Scan : PivPrompt()
     /** A tapped key has a PIV applet with empty login slots. */
     data class Offer(val status: Piv.Status) : PivPrompt()
     /**
-     * Started from Your keys and the tap is read: what the card holds now,
+     * Started from Your cards and the tap is read: what the card holds now,
      * with "create the missing certificates" or "replace certificates".
      */
     data class Review(val status: Piv.Status) : PivPrompt()

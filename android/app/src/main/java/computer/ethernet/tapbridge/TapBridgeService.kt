@@ -90,8 +90,10 @@ class TapBridgeService : Service() {
         fun onTapRequested(requested: Boolean) {}
         /** The PC's sign-in state changed (Auth frame, or a local timeout). */
         fun onAuthState(state: AuthState) {}
-        /** The PC asks to set up the card with this UID as a smart card. */
-        fun onSetupPiv(uid: ByteArray) {}
+        /** The PC asks to set up the certificates of the card with this UID. */
+        fun onSetupCerts(uid: ByteArray) {}
+        /** The Mac login the phone asked a PC for ended. */
+        fun onMacLoginDone(uid: ByteArray, ok: Boolean) {}
     }
     inner class LocalBinder : Binder() { val service get() = this@TapBridgeService }
     private val binder = LocalBinder()
@@ -148,6 +150,19 @@ class TapBridgeService : Service() {
         private set
     @Volatile var wakeHint: String? = null
         private set
+    /** OS of the PC on the live session (NativeBridge.PLATFORM_*); -1 without one. */
+    @Volatile var hostPlatform: Int = -1
+        private set
+
+    /** Local card edits go to the PC on the live session (PC edits came from it). */
+    private val cardSync = Cards.Listener { card, fromPc ->
+        if (!fromPc && status == Status.CONNECTED) session.sendCardInfo(card)
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        Cards.addListener(cardSync)
+    }
     private var retryAttempt = 0
 
     override fun onBind(intent: Intent?) = binder
@@ -333,12 +348,16 @@ class TapBridgeService : Service() {
                     NativeBridge.hostName(pointer) ?: "PC",
                 )
                 targetHost = acceptedHost
+                hostPlatform = NativeBridge.hostPlatform(pointer)
+                if (hostPlatform == NativeBridge.PLATFORM_MACOS) Cards.markSeenMac(this@TapBridgeService)
                 NativeBridge.usedHint(pointer)?.let {
                     IdentityStore.saveHint(this@TapBridgeService, acceptedHost, it)
                 }
                 val epoch = gate.install(pointer)
                 pointer = 0L
                 session.bindHandle(epoch)
+                // Sync: every record, forgotten ones too, before anything else.
+                Cards.records(this@TapBridgeService).forEach { session.sendCardInfo(it) }
                 show(Status.CONNECTED)
                 retryAttempt = 0
                 // Arm the idle timeout now: a wake nobody answers must not
@@ -444,13 +463,29 @@ class TapBridgeService : Service() {
                 val value = AuthState.fromWire(state)
                 main.post { if (requested.get() == attempt) setAuthState(value) }
             }
-            override fun setupPiv(uid: ByteArray) {
+            override fun cardInfo(
+                uid: ByteArray, label: String, labelAt: Long,
+                wake: Boolean, wakeAt: Long, caps: Int, capsAt: Long,
+                macLogin: Boolean, macLoginAt: Long, deletedAt: Long,
+            ) {
+                val theirs = CardInfo(uid, label, labelAt, wake, wakeAt, caps, capsAt, macLogin, macLoginAt, deletedAt)
+                Cards.merge(this@TapBridgeService, theirs)?.let { session.sendCardInfo(it) }
+            }
+            override fun cardActionDone(uid: ByteArray, action: Int, ok: Boolean) {
+                if (action != NativeBridge.ACTION_MAC_LOGIN) return
+                main.post { listener?.onMacLoginDone(uid, ok) }
+            }
+            override fun cardAction(uid: ByteArray, action: Int) {
                 bumpActivity()
+                if (action != NativeBridge.ACTION_SETUP_CERTS) {
+                    session.sendCardAction(uid, action, done = true, ok = false)
+                    return
+                }
                 main.post {
                     if (requested.get() != attempt) return@post
                     val ui = listener
                     if (visible && ui != null) {
-                        ui.onSetupPiv(uid)
+                        ui.onSetupCerts(uid)
                     } else {
                         // The setup runs in the app, and Android won't let a
                         // service open it: ask with a notification and keep
@@ -566,9 +601,16 @@ class TapBridgeService : Service() {
         }
     }
 
-    /** The PC-requested smart-card setup ended (the app's PIV flow). */
-    fun reportPivSetup(ok: Boolean) {
-        if (status == Status.CONNECTED) session.reportPivSetup(ok)
+    /** The PC-requested certificate setup for [uid] ended (the app's PIV flow). */
+    fun reportSetupCerts(uid: ByteArray, ok: Boolean) {
+        if (status == Status.CONNECTED) session.sendCardAction(uid, NativeBridge.ACTION_SETUP_CERTS, done = true, ok = ok)
+    }
+
+    /** Asks the PC on the live session to pair [uid] with its Mac login. False without a Mac. */
+    fun requestMacLogin(uid: ByteArray): Boolean {
+        if (status != Status.CONNECTED || hostPlatform != NativeBridge.PLATFORM_MACOS) return false
+        session.sendCardAction(uid, NativeBridge.ACTION_MAC_LOGIN, done = false, ok = false)
+        return true
     }
 
     fun resumeTagDiscovery() { session.paused = false }
@@ -691,6 +733,7 @@ class TapBridgeService : Service() {
     }
 
     override fun onDestroy() {
+        Cards.removeListener(cardSync)
         destroyed = true
         stopSession()
         listener = null

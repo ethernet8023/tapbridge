@@ -51,53 +51,20 @@ class Ctap2Test {
 }
 
 /** UID stability rule and record matching (DESIGN "Registered keys"). */
-class RegisteredKeysTest {
+class CardUidTest {
     @Test fun wireUidSendsOnlyStableUidsThatFitTheFrame() {
         val implant = byteArrayOf(0x04, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66)
-        assertArrayEquals(implant, RegisteredKeys.wireUid(implant))
-        assertArrayEquals(byteArrayOf(), RegisteredKeys.wireUid(byteArrayOf(0x08, 1, 2, 3)))
-        assertArrayEquals(byteArrayOf(), RegisteredKeys.wireUid(null))
-        assertArrayEquals(byteArrayOf(), RegisteredKeys.wireUid(ByteArray(11) { 4 }))
-        assertArrayEquals(ByteArray(10) { 4 }, RegisteredKeys.wireUid(ByteArray(10) { 4 }))
+        assertArrayEquals(implant, Cards.wireUid(implant))
+        assertArrayEquals(byteArrayOf(), Cards.wireUid(byteArrayOf(0x08, 1, 2, 3)))
+        assertArrayEquals(byteArrayOf(), Cards.wireUid(null))
+        assertArrayEquals(byteArrayOf(), Cards.wireUid(ByteArray(11) { 4 }))
+        assertArrayEquals(ByteArray(10) { 4 }, Cards.wireUid(ByteArray(10) { 4 }))
     }
 
     @Test fun fourByteUidStarting08IsRandom() {
-        assertFalse(RegisteredKeys.uidStable(byteArrayOf(0x08.toByte(), 1, 2, 3)))
-        assertTrue(RegisteredKeys.uidStable(byteArrayOf(0x08.toByte(), 1, 2, 3, 4)))
-        assertTrue(RegisteredKeys.uidStable(byteArrayOf(0x04.toByte(), 1, 2, 3)))
-        assertFalse(RegisteredKeys.uidStable(byteArrayOf()))
-    }
-
-    @Test fun stableUidMatchAndAaguidFallback() {
-        val uid = byteArrayOf(0x04, 1, 2, 3, 4)
-        val aaguid = ByteArray(16) { 7 }
-        val record = RegisteredKeys.KeyRecord("id1", "Yubikey", uid, aaguid)
-        assertTrue(RegisteredKeys.matches(record, uid, null))
-        assertTrue(RegisteredKeys.matches(record, null, aaguid))
-        // UID equal wins; a different UID with the right AAGUID still matches
-        // per DESIGN ("stable UID equal, otherwise AAGUID equal").
-        assertTrue(RegisteredKeys.matches(record, byteArrayOf(9), aaguid))
-        assertFalse(RegisteredKeys.matches(record, byteArrayOf(9), ByteArray(16) { 9 }))
-        // Random UID (not stored) never blocks an AAGUID match.
-        val random = RegisteredKeys.KeyRecord("id1", "Yubikey", null, aaguid)
-        assertTrue(RegisteredKeys.matches(random, byteArrayOf(0x08.toByte(), 1, 2, 3), aaguid))
-        assertFalse(RegisteredKeys.matches(random, null, ByteArray(16) { 9 }))
-    }
-
-    @Test fun storeFormatRoundTripKeepsRecords() {
-        val uid = byteArrayOf(0x04, 1, 2, 3, 4)
-        val aaguid = ByteArray(16) { 3 }
-        val record = RegisteredKeys.KeyRecord("k1", "Backup key", uid, aaguid)
-        val encoded = listOf("k1", "Backup key", RegisteredKeys.hex(uid), RegisteredKeys.hex(aaguid))
-            .joinToString("|")
-        assertEquals(listOf(record), RegisteredKeys.decode(encoded))
-        // Absent identifiers decode to null.
-        assertEquals(
-            listOf(RegisteredKeys.KeyRecord("k2", "Tag-only", null, null)),
-            RegisteredKeys.decode("k2|Tag-only||"),
-        )
-        // Corrupt store behaves as empty; registration can be redone.
-        assertEquals(emptyList<RegisteredKeys.KeyRecord>(), RegisteredKeys.decode("not|valid"))
-        assertEquals(emptyList<RegisteredKeys.KeyRecord>(), RegisteredKeys.decode(""))
+        assertFalse(Cards.uidStable(byteArrayOf(0x08.toByte(), 1, 2, 3)))
+        assertTrue(Cards.uidStable(byteArrayOf(0x08.toByte(), 1, 2, 3, 4)))
+        assertTrue(Cards.uidStable(byteArrayOf(0x04.toByte(), 1, 2, 3)))
+        assertFalse(Cards.uidStable(byteArrayOf()))
     }
 }

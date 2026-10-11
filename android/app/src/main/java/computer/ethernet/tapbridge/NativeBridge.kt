@@ -7,8 +7,8 @@ package computer.ethernet.tapbridge
  * takes the read lock, release() takes the write lock and must wait until no
  * calls are in flight.
  *
- * Wire contract v3: connect dials a wake hint (HOSTID[;r=..][;d=..]) and sends
- * Hello { name, push } first; the host replies Accepted { name }.
+ * Wire contract v4: connect dials a wake hint (HOSTID[;r=..][;d=..]) and sends
+ * Hello { name, push } first; the host replies Accepted { name, platform }.
  */
 object NativeBridge {
     init {
@@ -38,6 +38,9 @@ object NativeBridge {
     /** Host display name from the Accepted reply (null on error). */
     @JvmStatic external fun hostName(handle: Long): String?
 
+    /** Host OS from the Accepted reply ([PLATFORM_MACOS] etc.; -1 on error). */
+    @JvmStatic external fun hostPlatform(handle: Long): Int
+
     /** Hint text actually used for the dial (for caching reconnect addresses). */
     @JvmStatic external fun usedHint(handle: Long): String?
 
@@ -50,12 +53,22 @@ object NativeBridge {
 
     /**
      * Report a newly discovered card to the host. [uid] is the tag's stable
-     * NFC UID (RegisteredKeys.wireUid), empty when absent or random.
+     * NFC UID (Cards.wireUid), empty when absent or random.
      */
     @JvmStatic external fun card(handle: Long, generation: Long, atr: ByteArray, maxApdu: Int, uid: ByteArray)
 
-    /** The smart-card setup the host asked for (Callbacks.setupPiv) finished. */
-    @JvmStatic external fun pivSetupDone(handle: Long, ok: Boolean)
+    /** Send one synced card record ([CardInfo]) to the host. */
+    @JvmStatic external fun cardInfo(
+        handle: Long, uid: ByteArray, label: String, labelAt: Long,
+        wake: Boolean, wakeAt: Long, caps: Int, capsAt: Long,
+        macLogin: Boolean, macLoginAt: Long, deletedAt: Long,
+    )
+
+    /**
+     * Ask the host to do [action] for a card ([done] false), or report how
+     * an action the host asked for ended ([done] true, [ok]).
+     */
+    @JvmStatic external fun cardAction(handle: Long, uid: ByteArray, action: Int, done: Boolean, ok: Boolean)
 
     /** Send an APDU response to the host. */
     @JvmStatic external fun response(handle: Long, id: Long, generation: Long, data: ByteArray)
@@ -77,7 +90,24 @@ object NativeBridge {
         /** Host's sign-in state (wire `auth` constants: 0 idle, 1 working,
          *  2 success, 3 card removed mid-auth, 4 PIN entry, 5 failed). */
         fun authState(state: Int)
-        /** The PC asks to set up the card with this UID as a smart card. */
-        fun setupPiv(uid: ByteArray)
+        /** The PC's copy of a card record (merge it; reply if ours is newer). */
+        fun cardInfo(
+            uid: ByteArray, label: String, labelAt: Long,
+            wake: Boolean, wakeAt: Long, caps: Int, capsAt: Long,
+            macLogin: Boolean, macLoginAt: Long, deletedAt: Long,
+        )
+        /** The PC asks the phone to do [action] for a card. */
+        fun cardAction(uid: ByteArray, action: Int)
+        /** An action the phone asked the PC for ended. */
+        fun cardActionDone(uid: ByteArray, action: Int, ok: Boolean)
     }
+
+    /** wire::platform */
+    const val PLATFORM_OTHER = 0
+    const val PLATFORM_MACOS = 1
+    const val PLATFORM_WINDOWS = 2
+
+    /** wire::action */
+    const val ACTION_SETUP_CERTS = 1
+    const val ACTION_MAC_LOGIN = 2
 }
