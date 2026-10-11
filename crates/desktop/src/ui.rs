@@ -276,13 +276,12 @@ impl PairingView {
             }
             Some(TestTap::Waiting { .. }) | None => buttons,
         };
-        glass::panel("test-card", 14.0, cx)
+        div()
             .w(px(380.0))
             .flex()
             .flex_col()
             .items_center()
             .gap(px(8.0))
-            .p(px(16.0))
             .child(
                 div()
                     .text_size(px(15.0))
