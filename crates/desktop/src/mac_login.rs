@@ -11,6 +11,7 @@ use std::{io, time::Duration};
 
 const SC_AUTH: &str = "/usr/sbin/sc_auth";
 const OSASCRIPT: &str = "/usr/bin/osascript";
+const LAUNCHCTL: &str = "/bin/launchctl";
 
 /// One identity line from `sc_auth identities`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,7 +180,9 @@ pub fn classify_pair(succeeded: bool, output: &str, now_paired: bool) -> Outcome
     if output.contains("successfully paired") || now_paired {
         return Outcome::Paired { keychain };
     }
-    if output.contains("CryptoTokenKit error") {
+    // -8 is the card going away mid-operation. Other CryptoTokenKit
+    // errors (e.g. -7, token not visible) are real failures.
+    if output.contains("CryptoTokenKit error -8") {
         return Outcome::CardLeft;
     }
     // osascript: "User canceled. (-128)"
@@ -200,10 +203,16 @@ pub fn classify_pair(succeeded: bool, output: &str, now_paired: bool) -> Outcome
 
 /// The AppleScript that runs `sc_auth pair` as admin. Both values are
 /// validated, so they need no quoting inside the script.
-pub fn pair_script(user: &str, hash: &str) -> Option<String> {
+///
+/// The admin shell runs in the system context, where CryptoTokenKit's
+/// system `ctkd` can't see the card's token (it lives in the user's
+/// session): `sc_auth` then fails with error -7, "missing tokenID".
+/// `launchctl asuser` runs it, still as root, in the user's session, which
+/// is what `sudo` from Terminal gets for free.
+pub fn pair_script(user: &str, uid: u32, hash: &str) -> Option<String> {
     (valid_user(user) && valid_hash(hash)).then(|| {
         format!(
-            "do shell script \"{SC_AUTH} pair -u {user} -h {hash} 2>&1\" \
+            "do shell script \"{LAUNCHCTL} asuser {uid} {SC_AUTH} pair -u {user} -h {hash} 2>&1\" \
              with administrator privileges"
         )
     })
@@ -258,7 +267,7 @@ pub fn pair_present_card(
         Pick::NoIdentity => return Outcome::NoIdentity,
         Pick::Ambiguous => return Outcome::Ambiguous,
     };
-    let Some(script) = pair_script(user, &hash) else {
+    let Some(script) = pair_script(user, current_uid(), &hash) else {
         return Outcome::Failed("unexpected account name".into());
     };
     let (succeeded, output) = match runner.run(OSASCRIPT, &["-e", &script]) {
@@ -300,6 +309,15 @@ pub fn present_card_paired(runner: &dyn Runner, attempts: u32, pause: Duration) 
         }
     }
     None
+}
+
+/// The app's user id (the logged-in user: the app runs in their session).
+fn current_uid() -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    // The home directory is owned by the user; no libc needed.
+    std::env::var_os("HOME")
+        .and_then(|home| std::fs::metadata(home).ok())
+        .map_or(501, |meta| meta.uid())
 }
 
 /// The logged-in user's short name.
@@ -397,6 +415,10 @@ mod tests {
             Outcome::CardLeft
         );
         assert_eq!(
+            classify_pair(false, "Error pairing (CryptoTokenKit error -7.)", false),
+            Outcome::Failed("Error pairing (CryptoTokenKit error -7.)".into())
+        );
+        assert_eq!(
             classify_pair(false, "0:89: execution error: User canceled. (-128)", false),
             Outcome::Cancelled
         );
@@ -414,16 +436,16 @@ mod tests {
     #[test]
     fn pair_script_refuses_unsafe_values() {
         assert_eq!(
-            pair_script("ethernet", HASH).unwrap(),
+            pair_script("ethernet", 501, HASH).unwrap(),
             format!(
-                "do shell script \"/usr/sbin/sc_auth pair -u ethernet -h {HASH} 2>&1\" \
+                "do shell script \"/bin/launchctl asuser 501 /usr/sbin/sc_auth pair -u ethernet -h {HASH} 2>&1\" \
                  with administrator privileges"
             )
         );
-        assert!(pair_script("eth\"; say hi", HASH).is_none());
-        assert!(pair_script("-u", HASH).is_none());
-        assert!(pair_script("ethernet", "806D").is_none());
-        assert!(pair_script("ethernet", &format!("{}\"", &HASH[..39])).is_none());
+        assert!(pair_script("eth\"; say hi", 501, HASH).is_none());
+        assert!(pair_script("-u", 501, HASH).is_none());
+        assert!(pair_script("ethernet", 501, "806D").is_none());
+        assert!(pair_script("ethernet", 501, &format!("{}\"", &HASH[..39])).is_none());
     }
 
     /// Replays canned answers and records every command.
