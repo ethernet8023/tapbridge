@@ -245,8 +245,8 @@ impl PairingView {
         }
         let (title, detail, color) = match &self.test {
             Some(TestTap::Works { label }) => (
-                format!("It works: {label}"),
-                Some("You can sign in with your card from this computer now."),
+                format!("It works! {label} was tapped."),
+                Some("tapbridge will notify your phone when a website requests a security key."),
                 GOOD,
             ),
             Some(TestTap::TimedOut) => (
