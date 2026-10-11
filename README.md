@@ -1,61 +1,78 @@
 # tapbridge
 
-Use your Android phone as the NFC reader for your Windows PC. You tap your FIDO security key (card) on the phone, and Windows signs you in as if the key were plugged into the PC. The key does all the cryptography. tapbridge only carries the card commands, unchanged, over an encrypted connection.
+**Use your phone as the card reader for your computer.**
 
-## How it works
+Some security keys and smart cards come as NFC cards, rings or implants: you use them by tapping them on something. Computers almost never have a place to tap. Phones do.
 
-- **PC:** the tapbridge tray app makes Windows see a smart-card reader (USB/IP, loopback only). When Windows asks for a security key, the app wakes your phone.
-- **Phone:** the app is closed until it is needed. A push message (FCM) wakes it. It connects to your PC, shows "Tap your key", and sends the card commands both ways.
-- **Relay:** a small Cloudflare Worker sends the push message. It sees only "wake phone X for PC Y", never card data.
+With tapbridge you tap your card on your Android phone, and your computer acts as if the card were plugged right in. Use it to sign in to websites with a passkey. On a Mac you can even log in to the computer itself with your card.
 
-Nothing stays connected while you are not signing in, so tapbridge does not drain the phone battery.
+Your card does all the secret work. Your phone and computer only pass messages between each other, over a private, encrypted connection. Nothing stays connected while you aren't using it, so it won't drain your phone's battery.
 
-## Install
+![The tapbridge pairing window, showing a card and its login setup steps](docs/screenshot.png)
 
-1. On the PC, run `tapbridge-<version>-<arch>-setup.exe` (arm64 or x64). It also installs the usbip-win2 USB/IP driver if it is missing. tapbridge starts at login and shows a tray icon.
-2. On the phone, install tapbridge from Google Play.
-3. On the PC, select tray icon → **Pair phone...**. On the phone, scan the QR code. The code works once and expires after 5 minutes.
-4. On the phone, open **Keys** → **Add key** and tap your security key. Only registered keys open the app when the PC asks for a tap.
+## Features
 
-## Use
+- **Tap to sign in.** When a website asks for a security key, your phone asks for your card. Hold it to the back of the phone and you're in.
+- **Wakes your phone for you.** The phone app doesn't need to be open. Your computer sends a notification when it needs your card.
+- **Log in to your Mac with your card.** tapbridge walks you through it step by step: check the card, create its login certificate on your phone, then link it to your Mac account.
+- **Your cards stay in sync.** Name a card on your phone or your computer and both know it. Both show what each card can do.
+- **Easy pairing.** Scan a code on your computer with your phone, then tap a card to check that everything works.
+- **One phone, many computers.** Pair the same phone with your desktop and your laptop.
+- **Careful with your card.** tapbridge never replaces certificates already on your card unless you clearly ask it to, and it never guesses your PIN.
+- **Works on macOS and Windows.** The phone app is for Android phones with NFC.
 
-1. Start a sign-in that asks for a security key (passkey) on the PC.
-2. Your phone shows "Tap your security key". Unlock the phone (most phones turn NFC off while locked).
-3. Hold the key against the back of the phone until Windows finishes.
+## Development
 
-You can also open the phone app first.
+tapbridge has these parts:
 
-## Security
+| Part | Where | What it is |
+|---|---|---|
+| Desktop app | `crates/desktop` | Menu bar / tray app (Rust, gpui) |
+| Phone app | `android/`, `crates/phone` | Android app (Kotlin) with a Rust library |
+| Shared code | `crates/core`, `crates/host` | Connection, pairing, card records, the host service |
+| Wake relay | `relay/` | Small Cloudflare Worker that sends the wake-up push message |
 
-- Each PC and phone has its own identity key. The PC key is protected by Windows DPAPI. The phone key is wrapped by Android Keystore and is not backed up.
-- One phone can be paired with several PCs at once (say a desktop and a laptop). Each PC still accepts exactly one phone: to pair a PC with a different phone, open **Settings… (⌘, / Ctrl+,)** from the tray icon on that PC and select **Forget phone** first. On the phone, Settings → **Paired PCs** lists every paired PC with per-PC rename and **Forget**.
-- The iroh connection is end-to-end encrypted. Public iroh relays and the wake relay see connection metadata only.
-- Logs never contain keys, invitations, push tokens, PINs or card data.
+`DESIGN.md` explains how it fits together; `VERIFICATION.md` lists what has been tested.
 
-## Limits
+### Setup (macOS and Linux)
 
-- Windows PCs only (usbip-win2). Android phones with NFC only.
-- NFC-A ISO-DEP keys are supported. NFC-B is not.
-- Android shows the tap request as a notification. It cannot open an app over the lockscreen by itself.
-- A wake needs Google Play services on the phone. Without it, open the app before you sign in.
-- PIN-protected keys: on the tested key, Windows PIN flows fail with `PIN_AUTH_INVALID` after the PIN is accepted (cause not proven). Workaround: register the key with the phone's browser, then sign in from Windows.
+The Nix flake provides everything: Rust, the Android SDK and NDK, JDK 17 and adb.
 
-## Build
+```sh
+nix develop
+```
 
-Requirements: Rust 1.91+, LLVM clang and the MSVC build tools (arm64 and x64 libraries), Inno Setup 6, JDK 17, Android SDK 36 with NDK 27.2.12479018, cargo-ndk, and Node.js for the relay.
+### Common tasks
 
 | What | Command |
 |---|---|
-| Rust tests, clippy, fmt | `powershell -File scripts\check.ps1` |
-| Desktop installers (`dist\`) | `$env:TAPBRIDGE_RELAY_URL='https://...'; powershell -File scripts\build-desktop.ps1 -Arch both` |
-| macOS pkg (`dist/tapbridge-<version>-macos.pkg`) | `cargo build --release -p tapbridge-desktop && crates/desktop/ifd_shim/build.sh && scripts/build-pkg.sh [--sign "Developer ID Installer: NAME (TEAMID)"]` |
-| Debug APK on macOS/Linux (Nix dev shell: Rust + Android target, JDK 17, SDK 36, NDK 27.2, adb) | `nix develop -c scripts/build-android.sh`, then `adb install -r android/app/build/outputs/apk/debug/app-debug.apk` |
-| Android tests, lint, debug APK | in `android\`: `gradlew.bat testDebugUnitTest lintDebug assembleDebug` |
-| Play bundle (AAB) | in `android\`: `gradlew.bat bundleRelease` |
-| Relay | see `relay\README.md` |
+| Rust tests | `cargo test --workspace` |
+| Lints | `cargo clippy --workspace --all-targets -- -D warnings` |
+| Build, install and launch the Mac app | `build-and-run-macos-pkg` (asks for your password to install) |
+| Build the Mac installer only | `build-and-run-macos-pkg --no-install` → `dist/tapbridge-<version>-macos.pkg` |
+| Desktop windows with sample data | `cargo run -p tapbridge-desktop -- --preview-ui` (set `TAPBRIDGE_PREVIEW_DIALOG` to `new`, `paired` or `about` for other screens) |
+| Android tests and debug APK | `build-android testDebugUnitTest assembleDebug` |
+| Install the APK on a phone | `adb install -r android/app/build/outputs/apk/debug/app-debug.apk` |
+| Play bundle (AAB) | in `android/`: `./gradlew bundleRelease` |
 
-Release signing reads `TAPBRIDGE_UPLOAD_*` from your user `~/.gradle/gradle.properties`. A release build fails without `android/app/google-services.json`. Neither file is in the repository.
+### Windows
 
-`tapbridge.exe --trace-apdu` logs one line per card command (command name and status only, never payload bytes) for debugging.
+You need Rust 1.91+, LLVM clang, the MSVC build tools (x64 and arm64 libraries) and Inno Setup 6.
 
-See `DESIGN.md` for the protocol and design, and `VERIFICATION.md` for what was tested and what was not.
+| What | Command |
+|---|---|
+| Tests, lints, formatting | `powershell -File scripts\check.ps1` |
+| Installers (into `dist\`) | `$env:TAPBRIDGE_RELAY_URL='https://...'; powershell -File scripts\build-desktop.ps1 -Arch both` |
+
+`tapbridge.exe --trace-apdu` logs one line per card command (command name and status only, never card data).
+
+### Secrets and signing
+
+- Wake-up notifications need `android/app/google-services.json` (Firebase). It is not in the repository. Debug builds fall back to a placeholder, so wake-ups won't work; release builds fail without it.
+- Android release signing reads `TAPBRIDGE_UPLOAD_*` from `~/.gradle/gradle.properties`.
+- To sign the Mac installer, pass `--sign "Developer ID Installer: NAME (TEAMID)"` to the build.
+- To deploy the wake relay, see `relay/README.md`.
+
+### CI
+
+`.github/workflows/build.yml` runs the tests and builds the Mac installer, the Windows installers (x64 and arm64) and the Android APK on every push.
