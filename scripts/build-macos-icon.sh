@@ -16,7 +16,9 @@ cd "$(dirname "$0")/.."
 RES="${1:?usage: $0 <App.app/Contents/Resources>}"
 # actool resolves relative input paths against its own daemon, not $PWD.
 ICON="$PWD/assets/brand/macos/tapbridge.icon"
-DEV="$(xcode-select -p)"
+# The real Xcode, even inside the Nix dev shell (whose DEVELOPER_DIR is
+# the Nix Apple SDK, without actool or Icon Composer).
+DEV="$(env -u DEVELOPER_DIR /usr/bin/xcode-select -p)"
 ICTOOL="$DEV/../Applications/Icon Composer.app/Contents/Executables/ictool"
 if [[ ! -x "$ICTOOL" ]]; then
     echo "error: Icon Composer ictool not found; install Xcode 26 or newer" >&2
@@ -29,7 +31,7 @@ mkdir -p "$RES"
 RES="$(cd "$RES" && pwd)"
 
 # Assets.car (+ actool's own small icns, unused: ours covers 512@2x).
-xcrun actool "$ICON" \
+DEVELOPER_DIR="$DEV" /usr/bin/xcrun actool "$ICON" \
     --compile "$WORK" \
     --platform macosx \
     --minimum-deployment-target 13.0 \

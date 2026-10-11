@@ -40,6 +40,16 @@
             targets = [ "aarch64-linux-android" ];
           };
           jdk = pkgs.jdk17;
+          # Dev shell commands; each runs the repo script of the same job.
+          repoScript = name: script: pkgs.writeShellScriptBin name ''
+            root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+            exec "$root/scripts/${script}" "$@"
+          '';
+          commands = [
+            (repoScript "build-android" "build-android.sh")
+          ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+            (repoScript "build-and-run-macos-pkg" "run-macos.sh")
+          ];
         in
         {
           default = pkgs.mkShell {
@@ -49,7 +59,7 @@
               jdk
               android.androidsdk
               android.platform-tools
-            ];
+            ] ++ commands;
             JAVA_HOME = jdk.home;
             ANDROID_HOME = sdk;
             ANDROID_SDK_ROOT = sdk;

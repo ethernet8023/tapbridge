@@ -37,6 +37,14 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- The pairing QR is a tapbridge:1:... link: scanning it with
+                 the phone camera opens the app, which asks before pairing. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="tapbridge" />
+            </intent-filter>
         </activity>
 
         <!--

@@ -87,6 +87,8 @@ class MainActivity : ComponentActivity() {
         var pendingRecord by mutableStateOf<RegisteredKeys.KeyRecord?>(null)
         /** Phone-side PIV setup offer/flow; null when none is showing. */
         var pivPrompt by mutableStateOf<PivPrompt?>(null)
+        /** A pairing code opened as a tapbridge: link, waiting for "Pair". */
+        var linkInvitation by mutableStateOf<String?>(null)
     }
 
     /** Keys whose PIV offer was turned down this run (stable UID hex). */
@@ -382,11 +384,26 @@ class MainActivity : ComponentActivity() {
             }
         }
         handleForwardedTag(intent)
+        handlePairingLink(intent)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleForwardedTag(intent)
+        handlePairingLink(intent)
+    }
+
+    /**
+     * A tapbridge:1:... link (the PC's pairing QR, scanned with the camera).
+     * Never pairs on its own: the user confirms in a dialog first, since any
+     * page or QR could carry such a link. Consumed once, so a recreated
+     * activity doesn't ask again.
+     */
+    private fun handlePairingLink(intent: Intent?) {
+        if (intent?.action != Intent.ACTION_VIEW || intent.data?.scheme != "tapbridge") return
+        val text = intent.dataString
+        intent.data = null
+        if (text != null && Invitation.parse(text) != null) state?.linkInvitation = text
     }
 
     private fun handleForwardedTag(intent: Intent?) {
@@ -543,6 +560,36 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
     var keys by remember { mutableStateOf(RegisteredKeys.list(context)) }
     var hosts by remember { mutableStateOf(IdentityStore.pairedHosts(context)) }
 
+    // Pairing from the in-app scanner or a confirmed tapbridge: link.
+    val pair: (String) -> Unit = { invitation ->
+        PairingState.setPendingInvitation(invitation)
+        activity.startTapService()
+        // Wake alerts need notifications; ask while the user is setting the
+        // app up.
+        if (!ui.notificationsGranted && Build.VERSION.SDK_INT >= 33) {
+            activity.requestPermissionLauncher?.launch(
+                android.Manifest.permission.POST_NOTIFICATIONS,
+            )
+        }
+        screen = "home"
+    }
+    ui.linkInvitation?.let { invitation ->
+        AlertDialog(
+            onDismissRequest = { ui.linkInvitation = null },
+            title = { Text("Pair with this computer?") },
+            text = {
+                Text(
+                    "Only pair with a code shown by tapbridge on your own computer. " +
+                        "A paired computer can ask to use your cards.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { ui.linkInvitation = null; pair(invitation) }) { Text("Pair") }
+            },
+            dismissButton = { TextButton(onClick = { ui.linkInvitation = null }) { Text("Cancel") } },
+        )
+    }
+
     // System back (and predictive back) returns to home from any sub-screen.
     BackHandler(enabled = screen != "home") { screen = "home" }
 
@@ -559,18 +606,7 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
         Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
             when (route) {
                 "pair" -> PairScreen(
-                    onPaired = {
-                        PairingState.setPendingInvitation(it)
-                        activity.startTapService()
-                        // Wake alerts need notifications; ask while the user
-                        // is setting the app up.
-                        if (!ui.notificationsGranted && Build.VERSION.SDK_INT >= 33) {
-                            activity.requestPermissionLauncher?.launch(
-                                android.Manifest.permission.POST_NOTIFICATIONS,
-                            )
-                        }
-                        screen = "home"
-                    },
+                    onPaired = { pair(it) },
                     onBack = { screen = "home" },
                     Modifier.fillMaxSize(),
                 )
