@@ -246,17 +246,17 @@ impl PairingView {
         let (title, detail, color) = match &self.test {
             Some(TestTap::Works { label }) => (
                 format!("It works: {label}"),
-                "You can sign in with your card from this computer now.",
+                Some("You can sign in with your card from this computer now."),
                 GOOD,
             ),
             Some(TestTap::TimedOut) => (
                 "No card arrived".to_owned(),
-                "Open tapbridge on your phone and hold a card to it.",
+                Some("Open tapbridge on your phone and hold a card to it."),
                 WARN,
             ),
             _ => (
-                "Tap a card on your phone to test".to_owned(),
-                "Hold your card to the back of the phone.",
+                "Try it out by tapping your card on your phone".to_owned(),
+                None,
                 TEXT,
             ),
         };
@@ -294,13 +294,13 @@ impl PairingView {
                     .text_color(rgb(color))
                     .child(title),
             )
-            .child(
+            .children(detail.map(|detail| {
                 div()
                     .text_size(px(12.5))
                     .text_color(rgb(ACCENT_SOFT))
                     .text_center()
-                    .child(detail),
-            )
+                    .child(detail)
+            }))
             .child(div().h(px(4.0)))
             .child(buttons)
     }
