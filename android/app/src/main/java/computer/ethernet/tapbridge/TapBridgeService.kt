@@ -106,7 +106,7 @@ class TapBridgeService : Service() {
         // Presence loss, transceive failure or cancel dropped the tag: the
         // host already has the absent Card frame; update the UI and notice.
         s.onTagLost = { main.post { onCardGone() } }
-        s.onCardRead = { uid, read -> Cards.noteRead(this, uid, read.caps) }
+        s.onCardRead = { uid, read -> Cards.noteRead(this, uid, read) }
         // Once per card per app run: the read delays the PC's first APDU,
         // so not on every sign-in, but often enough that a card whose caps
         // were learned partially (e.g. only its PIV side) gets them all.

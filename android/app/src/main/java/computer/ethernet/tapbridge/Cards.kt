@@ -161,15 +161,16 @@ object Cards {
      * Caps read from cards that weren't known yet (hex UID -> caps): a PC
      * may add the card right after the tap, and its record gets them then.
      */
-    private val unclaimedReads = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val unclaimedReads = java.util.concurrent.ConcurrentHashMap<String, CardRead.Result>()
 
     /** A tap's [CardRead]: updates a known card, or holds it for when one is added. */
-    fun noteRead(ctx: Context, uid: ByteArray, caps: Int) {
-        if (get(ctx, uid) != null) {
-            setCaps(ctx, uid, caps)
-        } else {
+    fun noteRead(ctx: Context, uid: ByteArray, read: CardRead.Result) {
+        val card = get(ctx, uid)
+        if (card != null) {
+            setCaps(ctx, uid, CardRead.merged(card.caps, read))
+        } else if (read.known != 0) {
             if (unclaimedReads.size > 16) unclaimedReads.clear()
-            unclaimedReads[hex(uid)] = caps
+            unclaimedReads[hex(uid)] = read
         }
     }
 
@@ -192,8 +193,9 @@ object Cards {
         }
         // A card this phone read before the PC added it: the read is newer.
         // (setCaps announces the change, which sends it to the PC.)
-        unclaimedReads.remove(hex(theirs.uid))?.let { caps ->
-            if (merged?.deleted == false && setCaps(ctx, theirs.uid, caps) != null) return null
+        unclaimedReads.remove(hex(theirs.uid))?.let { read ->
+            val now = merged
+            if (now != null && !now.deleted && setCaps(ctx, theirs.uid, CardRead.merged(now.caps, read)) != null) return null
         }
         return merged?.takeIf { it != theirs }
     }

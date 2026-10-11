@@ -19,6 +19,9 @@ use tapbridge_core::pairing::INVITATION_TTL;
 
 /// The pairing window is square; the QR is sized to fit it, not the reverse.
 const PAIRING_WINDOW: f32 = 480.0;
+/// The pairing window grows to this height once it shows the test card's
+/// checklist, so the steps fit without scrolling.
+const PAIRING_CARD_HEIGHT: f32 = 660.0;
 /// Target QR side including its quiet zone, in logical pixels.
 const QR_TARGET: f32 = 340.0;
 
@@ -542,10 +545,13 @@ pub fn pairing_set_card(
     busy: bool,
     cx: &mut App,
 ) {
-    let _ = handle.update(cx, |view, _, cx| {
+    let _ = handle.update(cx, |view, window, cx| {
         if let Some((_, shown, was_busy)) = view.test_card.as_mut()
             && (*shown != row || *was_busy != busy)
         {
+            if shown.is_none() && row.is_some() {
+                window.resize(size(px(PAIRING_WINDOW), px(PAIRING_CARD_HEIGHT)));
+            }
             *shown = row;
             *was_busy = busy;
             cx.notify();

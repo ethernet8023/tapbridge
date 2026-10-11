@@ -207,7 +207,7 @@ class MainActivity : ComponentActivity() {
         val uid = tag.id?.takeIf { Cards.uidStable(it) && it.size <= Cards.MAX_UID } ?: return
         val read = readCard(tag) ?: return
         if (Cards.get(this, uid) != null) {
-            Cards.setCaps(this, uid, read.caps)
+            Cards.noteRead(this, uid, read)
             return
         }
         runOnUiThread {
@@ -527,7 +527,7 @@ class MainActivity : ComponentActivity() {
                 uid == null -> ui.addKeyError = "This card has no stable ID, so tapbridge can't tell it apart. Try another card."
                 read == null -> ui.addKeyError = "Couldn't read the card. Hold it still and try again."
                 known != null -> {
-                    Cards.setCaps(this, uid, read.caps)
+                    Cards.noteRead(this, uid, read)
                     ui.addKeyError = "That's \u201C${known.label}\u201D, already one of your cards."
                 }
                 else -> {
