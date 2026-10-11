@@ -42,9 +42,11 @@ pub fn parse_identities(text: &str) -> Vec<Token> {
                 identities: Vec::new(),
             });
             paired = None;
-        } else if trimmed == "Unpaired identities:" {
+        } else if trimmed.starts_with("Unpaired identities") {
             paired = Some(false);
-        } else if trimmed == "Paired identities:" {
+        } else if trimmed.starts_with("Paired identities") {
+            // macOS 26 says "Paired identities which are used for
+            // authentication:"; older versions "Paired identities:".
             paired = Some(true);
         } else if let (Some(paired), Some(token)) = (paired, tokens.last_mut()) {
             let (hash, label) = trimmed
@@ -358,6 +360,18 @@ mod tests {
             }]
         );
         assert_eq!(pick(&tokens), Pick::Pair(HASH.into()));
+    }
+
+    /// macOS 26 words the paired section differently.
+    #[test]
+    fn parses_macos_26_paired_heading() {
+        let text = "SmartCard: com.apple.pivtoken:147A799AD94549E587912D573A74BDAC\n\
+            Paired identities which are used for authentication:\n\
+            806D2E7FC2DD43F043BAB139643DC2DA703A110C\tCertificate For PIV Authentication (Pixel 9 Pro XL PIV)\n";
+        let tokens = parse_identities(text);
+        assert!(tokens[0].identities[0].paired);
+        assert_eq!(pick(&tokens), Pick::AlreadyPaired);
+        assert_eq!(login_paired(&tokens), Some(true));
     }
 
     #[test]
