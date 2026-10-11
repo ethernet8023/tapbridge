@@ -217,6 +217,7 @@ pub fn preview_ui() {
                 "Relay: use1-1.relay.iroh.network".into(),
             ],
         };
+        let sample_card = snapshot.cards[0].clone();
         // Preview: links open; every other action is only logged (no service).
         let settings = crate::ui::open_settings_window(
             snapshot,
@@ -227,15 +228,34 @@ pub fn preview_ui() {
             },
             cx,
         );
-        // TAPBRIDGE_PREVIEW_DIALOG=new shows the "New card" dialog.
-        if std::env::var("TAPBRIDGE_PREVIEW_DIALOG").as_deref() == Ok("new") {
-            crate::ui::settings_new_card(settings, vec![4, 9, 9, 9, 9, 9, 9], cx);
-        } else {
-            crate::ui::open_pairing_window(
-                "tapbridge-preview-invitation-0123456789abcdef",
-                None,
-                cx,
-            );
+        let preview_action = |action: crate::ui::SettingsAction, cx: &mut App| match action {
+            crate::ui::SettingsAction::OpenUrl(url) => cx.open_url(&url),
+            other => eprintln!("preview: {}", other.name()),
+        };
+        // TAPBRIDGE_PREVIEW_DIALOG=new shows the "New card" dialog;
+        // =paired the pairing window after its test card came through.
+        match std::env::var("TAPBRIDGE_PREVIEW_DIALOG").as_deref() {
+            Ok("new") => crate::ui::settings_new_card(settings, vec![4, 9, 9, 9, 9, 9, 9], cx),
+            Ok("paired") => {
+                let window = crate::ui::open_pairing_window(
+                    "tapbridge-preview-invitation-0123456789abcdef",
+                    None,
+                    preview_action,
+                    cx,
+                );
+                crate::ui::complete_pairing(window, "Pixel 9 Pro XL".into(), cx);
+                let row = sample_card.clone();
+                crate::ui::pairing_test_card(window, row.uid.clone(), row.label.clone(), cx);
+                crate::ui::pairing_set_card(window, Some(row), false, cx);
+            }
+            _ => {
+                crate::ui::open_pairing_window(
+                    "tapbridge-preview-invitation-0123456789abcdef",
+                    None,
+                    preview_action,
+                    cx,
+                );
+            }
         }
         cx.activate(true);
     });
@@ -698,8 +718,18 @@ fn card_tick(cx: &mut App) {
                 .into_iter()
                 .find(|card| !status.card_uid.is_empty() && card.info.uid == status.card_uid)
                 .map_or_else(|| "your card".to_owned(), |card| card.info.label);
-            ui::pairing_test_card(window, label, cx);
+            ui::pairing_test_card(window, status.card_uid.clone(), label, cx);
             cx.update_global::<Shell, _>(|shell, _| shell.reload_cards());
+        }
+        // Keep the embedded card (and its setup progress) live.
+        if let Some(uid) = ui::pairing_test_uid(window, cx) {
+            let shell = cx.global::<Shell>();
+            let row = shell
+                .card_rows(&status)
+                .into_iter()
+                .find(|row| row.uid == uid);
+            let busy = shell.card_task.as_ref().is_some_and(CardTask::busy);
+            ui::pairing_set_card(window, row, busy, cx);
         }
     }
 }
@@ -997,7 +1027,7 @@ fn open_pairing(cx: &mut App) {
     logging::log("pairing: invitation minted");
     #[cfg(target_os = "macos")]
     macos::dock::bring_to_front();
-    let window = ui::open_pairing_window(&invitation.to_string(), existing, cx);
+    let window = ui::open_pairing_window(&invitation.to_string(), existing, settings_action, cx);
     cx.update_global::<Shell, _>(|shell, _| shell.pairing = Some(window));
 }
 

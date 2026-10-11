@@ -47,6 +47,13 @@ pub struct PairingView {
     paired: Option<String>,
     /// The "tap a card to test" step after pairing.
     test: Option<TestTap>,
+    /// The card that came through the test, as Preferences shows it (kept
+    /// fresh by the shell), and whether a card action is running.
+    test_card: Option<(Vec<u8>, Option<CardRow>, bool)>,
+    /// Carries out the embedded card's buttons (same as Preferences).
+    on_action: OnSettingsAction,
+    /// The embedded card is showing the applet install instructions.
+    show_install: bool,
     /// When the invitation stops working (the host gate uses the same TTL).
     expires: Instant,
     /// "Try again" was pressed on the expired code: the shell mints a new one.
@@ -56,7 +63,7 @@ pub struct PairingView {
 }
 
 impl PairingView {
-    pub fn new(invitation: &str, cx: &mut Context<Self>) -> Self {
+    pub fn new(invitation: &str, on_action: OnSettingsAction, cx: &mut Context<Self>) -> Self {
         let (dark, dimension) = build_qr(invitation).unwrap_or((Vec::new(), 0));
         let ticker = cx.spawn(async move |this, cx| {
             loop {
@@ -71,6 +78,9 @@ impl PairingView {
             dimension,
             paired: None,
             test: None,
+            test_card: None,
+            on_action,
+            show_install: false,
             expires: Instant::now() + INVITATION_TTL,
             retry: false,
             _ticker: ticker,
@@ -115,6 +125,11 @@ impl Render for PairingView {
             .text_color(rgb(TEXT))
             .child(glass::backdrop());
 
+        if let Some(phone) = self.paired.clone()
+            && let Some((_, Some(card), busy)) = self.test_card.clone()
+        {
+            return root.child(self.render_test_card(&phone, &card, busy, cx));
+        }
         if let Some(phone) = &self.paired {
             return root
                 .child(
@@ -232,7 +247,74 @@ impl Render for PairingView {
     }
 }
 
+impl ChecklistHost for PairingView {
+    fn checklist_action(&mut self, action: SettingsAction, cx: &mut Context<Self>) {
+        let on_action = self.on_action.clone();
+        cx.defer(move |cx| on_action(action, cx));
+    }
+
+    fn install_shown(&self, _: &[u8]) -> bool {
+        self.show_install
+    }
+
+    fn toggle_install(&mut self, _: Vec<u8>, cx: &mut Context<Self>) {
+        self.show_install = !self.show_install;
+        cx.notify();
+    }
+}
+
 impl PairingView {
+    /// After the test card came through: the card itself, as Preferences
+    /// shows it (minus rename and forget), so its setup can start here.
+    fn render_test_card(
+        &self,
+        phone: &str,
+        card: &CardRow,
+        busy: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id("pairing-card")
+            .absolute()
+            .inset_0()
+            .pt(px(TITLEBAR_INSET + 20.0))
+            .pb(px(20.0))
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .w(px(400.0))
+                    .mx_auto()
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .text_size(px(13.0))
+                            .text_color(rgb(GOOD))
+                            .child(success_badge(18.0))
+                            .child(format!("Paired with {phone}")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(20.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(card.label.clone()),
+                    )
+                    .child(card_details(self, 0, card, busy, cx))
+                    .child(div().flex().flex_row().justify_end().child(
+                        card_button("test-done", 0, "Done", ACCENT, 0.6, cx).on_click(
+                            cx.listener(|_, _: &gpui::ClickEvent, window, _| {
+                                window.remove_window()
+                            }),
+                        ),
+                    )),
+            )
+    }
+
     /// The test-tap step under the pairing confirmation.
     fn render_test(&self, cx: &mut Context<Self>) -> impl IntoElement {
         fn close(
@@ -341,12 +423,15 @@ fn success_badge(diameter: f32) -> impl IntoElement {
 pub fn open_pairing_window(
     invitation: &str,
     existing: Option<WindowHandle<PairingView>>,
+    on_action: impl Fn(SettingsAction, &mut App) + 'static,
     cx: &mut App,
 ) -> WindowHandle<PairingView> {
+    let on_action: OnSettingsAction = Rc::new(on_action);
     if let Some(handle) = existing {
         let text = invitation.to_owned();
+        let actions = on_action.clone();
         let refreshed = handle.update(cx, |view, window, cx| {
-            *view = PairingView::new(&text, cx);
+            *view = PairingView::new(&text, actions, cx);
             window.activate();
             cx.notify();
         });
@@ -368,7 +453,7 @@ pub fn open_pairing_window(
                 is_resizable: false,
                 ..Default::default()
             },
-            move |_window, cx| cx.new(|cx| PairingView::new(&invitation, cx)),
+            move |_window, cx| cx.new(|cx| PairingView::new(&invitation, on_action, cx)),
         )
         .expect("pairing window");
     window.update(cx, |_, window, _| window.activate()).ok();
@@ -421,11 +506,48 @@ pub fn pairing_test_waiting(handle: WindowHandle<PairingView>, cx: &mut App) -> 
         .unwrap_or(false)
 }
 
-/// A card arrived during the test-tap step.
-pub fn pairing_test_card(handle: WindowHandle<PairingView>, label: String, cx: &mut App) {
+/// A card arrived during the test-tap step. `uid` is empty when the card
+/// has no stable UID (nothing to show beyond its name).
+pub fn pairing_test_card(
+    handle: WindowHandle<PairingView>,
+    uid: Vec<u8>,
+    label: String,
+    cx: &mut App,
+) {
     let _ = handle.update(cx, |view, _, cx| {
         if let Some(test) = view.test.as_mut() {
             test.card(label);
+            if !uid.is_empty() {
+                view.test_card = Some((uid, None, false));
+            }
+            cx.notify();
+        }
+    });
+}
+
+/// The UID of the card the test step showed, while the window is open.
+pub fn pairing_test_uid(handle: WindowHandle<PairingView>, cx: &mut App) -> Option<Vec<u8>> {
+    handle
+        .update(cx, |view, _, _| {
+            view.test_card.as_ref().map(|(uid, ..)| uid.clone())
+        })
+        .ok()
+        .flatten()
+}
+
+/// Refreshes the test card shown in the pairing window.
+pub fn pairing_set_card(
+    handle: WindowHandle<PairingView>,
+    row: Option<CardRow>,
+    busy: bool,
+    cx: &mut App,
+) {
+    let _ = handle.update(cx, |view, _, cx| {
+        if let Some((_, shown, was_busy)) = view.test_card.as_mut()
+            && (*shown != row || *was_busy != busy)
+        {
+            *shown = row;
+            *was_busy = busy;
             cx.notify();
         }
     });
@@ -1234,18 +1356,61 @@ impl SettingsView {
     }
 }
 
-impl SettingsView {
-    /// The three login steps: applet, certificates, OS login. Each button
-    /// runs on the device that does the work: the phone creates
-    /// certificates, this PC pairs its login.
-    fn render_checklist(
-        &self,
-        index: usize,
-        card: &CardRow,
-        checklist: Checklist,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let busy = self.snapshot.card_busy;
+/// A window that shows a card's login checklist and carries out its
+/// buttons: Preferences, and the pairing window's test step.
+trait ChecklistHost: Sized + 'static {
+    fn checklist_action(&mut self, action: SettingsAction, cx: &mut Context<Self>);
+    fn install_shown(&self, uid: &[u8]) -> bool;
+    fn toggle_install(&mut self, uid: Vec<u8>, cx: &mut Context<Self>);
+}
+
+/// What a card can do and its login steps, with the running action's
+/// status: the body of the card dialog, also embedded in the pairing
+/// window once the test card arrives.
+fn card_details<V: ChecklistHost>(
+    host: &V,
+    index: usize,
+    card: &CardRow,
+    busy: bool,
+    cx: &mut Context<V>,
+) -> gpui::Div {
+    let mut details = div().flex().flex_col().gap(px(14.0));
+    if crate::login::SUPPORTED {
+        details = details.child(capability_marks(
+            card.passkey,
+            card.checklist.is_some_and(|c| c.ready()),
+        ));
+    }
+    if let Some(checklist) = card.checklist
+        && crate::login::SUPPORTED
+    {
+        details = details
+            .child(div().h(px(1.0)).bg(rgba(0xFFFFFF1F)))
+            .child(render_checklist(host, index, card, checklist, busy, cx));
+    }
+    if let Some(task) = &card.task {
+        details = details.child(
+            div()
+                .text_size(px(12.5))
+                .text_color(rgb(if card.task_failed { WARN } else { TEXT }))
+                .child(task.clone()),
+        );
+    }
+    details
+}
+
+/// The three login steps: applet, certificates, OS login. Each button
+/// runs on the device that does the work: the phone creates
+/// certificates, this PC pairs its login.
+fn render_checklist<V: ChecklistHost>(
+    host: &V,
+    index: usize,
+    card: &CardRow,
+    checklist: Checklist,
+    busy: bool,
+    cx: &mut Context<V>,
+) -> gpui::Div {
+    {
         let uid = card.uid.clone();
         let mut list = div().flex().flex_col().gap(px(14.0)).child(
             div()
@@ -1264,7 +1429,7 @@ impl SettingsView {
         let mut applet_actions = div().flex().flex_row().flex_wrap().gap(px(8.0));
         if checklist.applet != StepState::Done {
             let install_uid = uid.clone();
-            let showing = self.show_install.contains(&card.uid);
+            let showing = host.install_shown(&card.uid);
             applet_actions = applet_actions.child(
                 card_button(
                     "step-install",
@@ -1279,24 +1444,21 @@ impl SettingsView {
                     cx,
                 )
                 .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
-                    if !view.show_install.remove(&install_uid) {
-                        view.show_install.insert(install_uid.clone());
-                    }
-                    cx.notify();
+                    view.toggle_install(install_uid.clone(), cx);
                 })),
             );
             if !busy {
                 applet_actions = applet_actions.child(
                     card_button("step-check", index, "Check card", ACCENT, 0.6, cx).on_click(
                         cx.listener(|view, _: &gpui::ClickEvent, _, cx| {
-                            view.act(SettingsAction::CheckCard, cx)
+                            view.checklist_action(SettingsAction::CheckCard, cx)
                         }),
                     ),
                 );
             }
         }
         let mut applet_body = div().flex().flex_col().gap(px(8.0)).child(applet_actions);
-        if checklist.applet != StepState::Done && self.show_install.contains(&card.uid) {
+        if checklist.applet != StepState::Done && host.install_shown(&card.uid) {
             let mut how = div()
                 .flex()
                 .flex_col()
@@ -1325,7 +1487,7 @@ impl SettingsView {
             ] {
                 links = links.child(card_button(id, index, label, 0xFFFFFF, 0.06, cx).on_click(
                     cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
-                        view.act(SettingsAction::OpenUrl(url.to_owned()), cx)
+                        view.checklist_action(SettingsAction::OpenUrl(url.to_owned()), cx)
                     }),
                 ));
             }
@@ -1346,7 +1508,7 @@ impl SettingsView {
             certs_body = certs_body.child(
                 card_button("step-certs", index, "Create on phone", ACCENT, 0.6, cx).on_click(
                     cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
-                        view.act(SettingsAction::SetUpCard(setup_uid.clone()), cx)
+                        view.checklist_action(SettingsAction::SetUpCard(setup_uid.clone()), cx)
                     }),
                 ),
             );
@@ -1370,7 +1532,7 @@ impl SettingsView {
             login_body = login_body.child(
                 card_button("step-login", index, "Set up login", ACCENT, 0.6, cx).on_click(
                     cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
-                        view.act(SettingsAction::SetUpLogin(login_uid.clone()), cx)
+                        view.checklist_action(SettingsAction::SetUpLogin(login_uid.clone()), cx)
                     }),
                 ),
             );
@@ -1711,6 +1873,23 @@ impl Render for SettingsView {
     }
 }
 
+impl ChecklistHost for SettingsView {
+    fn checklist_action(&mut self, action: SettingsAction, cx: &mut Context<Self>) {
+        self.act(action, cx);
+    }
+
+    fn install_shown(&self, uid: &[u8]) -> bool {
+        self.show_install.contains(uid)
+    }
+
+    fn toggle_install(&mut self, uid: Vec<u8>, cx: &mut Context<Self>) {
+        if !self.show_install.remove(&uid) {
+            self.show_install.insert(uid);
+        }
+        cx.notify();
+    }
+}
+
 impl SettingsView {
     /// Opens the "New card" dialog for a card seen for the first time,
     /// unless another dialog is up.
@@ -1783,27 +1962,14 @@ impl SettingsView {
                     .text_color(rgb(ACCENT_SOFT))
                     .child(if is_new { "NEW CARD" } else { "SET UP LOGIN" }),
             )
-            .child(name);
-        if crate::login::SUPPORTED {
-            sheet = sheet.child(capability_marks(
-                card.passkey,
-                card.checklist.is_some_and(|c| c.ready()),
+            .child(name)
+            .child(card_details(
+                self,
+                index,
+                &card,
+                self.snapshot.card_busy,
+                cx,
             ));
-        }
-        if let Some(checklist) = card.checklist
-            && crate::login::SUPPORTED
-        {
-            sheet = sheet.child(div().h(px(1.0)).bg(rgba(0xFFFFFF1F)));
-            sheet = sheet.child(self.render_checklist(index, &card, checklist, cx));
-        }
-        if let Some(task) = &card.task {
-            sheet = sheet.child(
-                div()
-                    .text_size(px(12.5))
-                    .text_color(rgb(if card.task_failed { WARN } else { TEXT }))
-                    .child(task.clone()),
-            );
-        }
         let done = if is_new { "Done" } else { "Close" };
         sheet =
             sheet.child(div().flex().flex_row().justify_end().child(
