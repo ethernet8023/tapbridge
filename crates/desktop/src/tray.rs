@@ -1,7 +1,7 @@
 //! Tray icon + menu via tray-icon. The tray is created on the gpui main
 //! thread so its hidden window is pumped by gpui's message loop.
 //!
-//! The menu stays small: a status line, Settings… and Quit. Everything
+//! The menu stays small: a status line, About, Settings… and Quit. Everything
 //! configurable lives in the Settings window.
 use crate::assets;
 use tray_icon::{
@@ -16,6 +16,7 @@ pub enum MenuAction {
     /// The status line, clicked while it offers pairing ("Pair a phone").
     Pair,
     OpenSettings,
+    About,
     Quit,
 }
 
@@ -75,6 +76,7 @@ impl Tray {
             Some(NativeIcon::PreferencesGeneral),
             Some(Accelerator::new(COMMAND, Code::Comma)),
         );
+        let about_item = MenuItem::with_id("about", "About tapbridge", true, None);
         let quit_item = MenuItem::with_id(
             "quit",
             QUIT_TITLE,
@@ -85,6 +87,7 @@ impl Tray {
         menu.append_items(&[
             &status_item,
             &PredefinedMenuItem::separator(),
+            &about_item,
             &settings_item,
             &PredefinedMenuItem::separator(),
             &quit_item,
@@ -156,6 +159,7 @@ impl Tray {
             actions.push(match event.id().0.as_str() {
                 "status" if self.pair_action => MenuAction::Pair,
                 "settings" => MenuAction::OpenSettings,
+                "about" => MenuAction::About,
                 "quit" => MenuAction::Quit,
                 _ => continue,
             });

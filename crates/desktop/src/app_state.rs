@@ -31,7 +31,7 @@ const USBIP_ADDR: &str = "127.0.0.1:3240";
 
 // App-wide commands: bound to ⌘, / ⌘Q (Ctrl on Windows) and, on macOS, the
 // app menu that owns those shortcuts while a tapbridge window is focused.
-gpui::actions!(tapbridge, [OpenSettings, Quit]);
+gpui::actions!(tapbridge, [OpenSettings, OpenAbout, Quit]);
 const TICK: Duration = Duration::from_millis(100);
 /// How long the tray shows "waiting for a tap" after a wake: the phone keeps
 /// its tap gate open this long (DESIGN.md, wake step 4).
@@ -88,6 +88,7 @@ struct Shell {
     usbip: Usbip,
     pairing: Option<WindowHandle<ui::PairingView>>,
     settings: Option<WindowHandle<ui::SettingsView>>,
+    about: Option<WindowHandle<crate::about::AboutView>>,
     /// Start-at-login state, cached: Settings re-renders from it every tick.
     autostart: bool,
     /// Shown in the tray until the next state change (e.g. relay problems).
@@ -211,11 +212,6 @@ pub fn preview_ui() {
                 },
             ],
             card_busy: true,
-            details: vec![
-                "Host: iris".into(),
-                "Reader: tapbridge virtual reader".into(),
-                "Relay: use1-1.relay.iroh.network".into(),
-            ],
         };
         let sample_card = snapshot.cards[0].clone();
         // Preview: links open; every other action is only logged (no service).
@@ -233,8 +229,20 @@ pub fn preview_ui() {
             other => eprintln!("preview: {}", other.name()),
         };
         // TAPBRIDGE_PREVIEW_DIALOG=new shows the "New card" dialog;
-        // =paired the pairing window after its test card came through.
+        // =paired the pairing window after its test card came through;
+        // =about the About window.
         match std::env::var("TAPBRIDGE_PREVIEW_DIALOG").as_deref() {
+            Ok("about") => {
+                crate::about::open_about_window(
+                    vec![
+                        "Host: iris".into(),
+                        "Reader: tapbridge virtual reader".into(),
+                        "Relay: use1-1.relay.iroh.network".into(),
+                    ],
+                    None,
+                    cx,
+                );
+            }
             Ok("new") => crate::ui::settings_new_card(settings, vec![4, 9, 9, 9, 9, 9, 9], cx),
             Ok("paired") => {
                 let window = crate::ui::open_pairing_window(
@@ -301,6 +309,7 @@ fn shell_setup(
         },
         pairing: None,
         settings: None,
+        about: None,
         autostart: autostart::is_enabled(),
         notice: None,
         service_error: None,
@@ -550,11 +559,27 @@ fn tick(inbox: &mpsc::Receiver<UiEvent>, cx: &mut App) {
             cx.update_global::<Shell, _>(|shell, _| shell.settings = None);
         }
     }
+    // Keep About's details live while they're showing; prune it once closed.
+    if let Some(window) = cx.global::<Shell>().about {
+        let lines = cx.global::<Shell>().status_lines();
+        let alive = window
+            .update(cx, |view, _, cx| {
+                if view.expanded() {
+                    view.set_details(lines, cx);
+                }
+            })
+            .is_ok();
+        if !alive {
+            cx.update_global::<Shell, _>(|shell, _| shell.about = None);
+        }
+    }
     // macOS: show the Dock icon only while a visible window is open.
     #[cfg(target_os = "macos")]
     {
         let shell = cx.global::<Shell>();
-        let visible = shell.pairing.is_some() as usize + shell.settings.is_some() as usize;
+        let visible = shell.pairing.is_some() as usize
+            + shell.settings.is_some() as usize
+            + shell.about.is_some() as usize;
         macos::dock::sync(visible);
     }
     let actions = cx
@@ -775,6 +800,7 @@ fn handle_action(action: MenuAction, cx: &mut App) {
     match action {
         MenuAction::Pair => open_pairing(cx),
         MenuAction::OpenSettings => open_settings(cx),
+        MenuAction::About => open_about(cx),
         MenuAction::Quit => quit(cx),
     }
 }
@@ -783,6 +809,7 @@ fn handle_action(action: MenuAction, cx: &mut App) {
 fn install_commands(cx: &mut App) {
     cx.on_action(|_: &OpenSettings, cx| open_settings(cx));
     cx.on_action(|_: &Quit, cx| quit(cx));
+    cx.on_action(|_: &OpenAbout, cx| open_about(cx));
     crate::text_input::bind_keys(cx);
     // "secondary" is ⌘ on macOS and Ctrl elsewhere.
     cx.bind_keys([
@@ -793,6 +820,8 @@ fn install_commands(cx: &mut App) {
     cx.set_menus(vec![gpui::Menu {
         name: "tapbridge".into(),
         items: vec![
+            gpui::MenuItem::action("About tapbridge", OpenAbout),
+            gpui::MenuItem::separator(),
             gpui::MenuItem::action("Preferences\u{2026}", OpenSettings),
             gpui::MenuItem::separator(),
             gpui::MenuItem::os_submenu("Services", gpui::SystemMenuType::Services),
@@ -801,6 +830,17 @@ fn install_commands(cx: &mut App) {
         ],
         disabled: false,
     }]);
+}
+
+fn open_about(cx: &mut App) {
+    let (details, existing) = {
+        let shell = cx.global::<Shell>();
+        (shell.status_lines(), shell.about)
+    };
+    #[cfg(target_os = "macos")]
+    macos::dock::bring_to_front();
+    let window = crate::about::open_about_window(details, existing, cx);
+    cx.update_global::<Shell, _>(|shell, _| shell.about = Some(window));
 }
 
 fn open_settings(cx: &mut App) {
@@ -1178,7 +1218,6 @@ impl Shell {
             autostart: self.autostart,
             cards: self.card_rows(&status),
             card_busy: self.card_task.as_ref().is_some_and(CardTask::busy),
-            details: self.status_lines(),
         }
     }
 

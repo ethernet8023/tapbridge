@@ -12,6 +12,7 @@ mod macos;
 #[cfg(target_os = "macos")]
 mod security_key;
 
+mod about;
 mod app_state;
 mod assets;
 mod autostart;

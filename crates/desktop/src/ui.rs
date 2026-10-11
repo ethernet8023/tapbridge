@@ -1059,8 +1059,6 @@ pub struct SettingsSnapshot {
     pub cards: Vec<CardRow>,
     /// A card action is running: no new one can start.
     pub card_busy: bool,
-    /// Diagnostic lines (host, reader, relay...).
-    pub details: Vec<String>,
 }
 
 type OnSettingsAction = Rc<dyn Fn(SettingsAction, &mut App)>;
@@ -1824,21 +1822,6 @@ impl Render for SettingsView {
                 })),
             );
 
-        let mut details = div()
-            .flex()
-            .flex_col()
-            .gap(px(4.0))
-            .child(section_title("Details"))
-            .child(div().h(px(4.0)));
-        for line in &snapshot.details {
-            details = details.child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(rgb(0xA79FBA))
-                    .child(line.clone()),
-            );
-        }
-
         let column = div()
             .flex()
             .flex_col()
@@ -1853,7 +1836,6 @@ impl Render for SettingsView {
             .child(general);
         #[cfg(windows)]
         let column = column.child(self.passkeys.clone());
-        let column = column.child(details);
         let dialog = self.render_dialog(cx);
         div()
             .relative()
