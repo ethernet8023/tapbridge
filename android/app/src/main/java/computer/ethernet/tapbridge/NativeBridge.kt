@@ -8,7 +8,7 @@ package computer.ethernet.tapbridge
  * calls are in flight.
  *
  * Wire contract v4: connect dials a wake hint (HOSTID[;r=..][;d=..]) and sends
- * Hello { name, push } first; the host replies Accepted { name, platform }.
+ * Hello { name, push } first; the host replies Accepted { name, platform, piv_login }.
  */
 object NativeBridge {
     init {
@@ -38,8 +38,11 @@ object NativeBridge {
     /** Host display name from the Accepted reply (null on error). */
     @JvmStatic external fun hostName(handle: Long): String?
 
-    /** Host OS from the Accepted reply ([PLATFORM_MACOS] etc.; -1 on error). */
+    /** Host OS from the Accepted reply ([PLATFORM_MACOS] etc.; -1 on error). For wording only. */
     @JvmStatic external fun hostPlatform(handle: Long): Int
+
+    /** The host can pair a card's PIV identity with its OS login (Accepted.piv_login). */
+    @JvmStatic external fun hostPivLogin(handle: Long): Boolean
 
     /** Hint text actually used for the dial (for caching reconnect addresses). */
     @JvmStatic external fun usedHint(handle: Long): String?
@@ -61,7 +64,7 @@ object NativeBridge {
     @JvmStatic external fun cardInfo(
         handle: Long, uid: ByteArray, label: String, labelAt: Long,
         wake: Boolean, wakeAt: Long, caps: Int, capsAt: Long,
-        macLogin: Boolean, macLoginAt: Long, deletedAt: Long,
+        login: Boolean, loginAt: Long, deletedAt: Long,
     )
 
     /**
@@ -94,7 +97,7 @@ object NativeBridge {
         fun cardInfo(
             uid: ByteArray, label: String, labelAt: Long,
             wake: Boolean, wakeAt: Long, caps: Int, capsAt: Long,
-            macLogin: Boolean, macLoginAt: Long, deletedAt: Long,
+            login: Boolean, loginAt: Long, deletedAt: Long,
         )
         /** The PC asks the phone to do [action] for a card. */
         fun cardAction(uid: ByteArray, action: Int)
@@ -109,5 +112,5 @@ object NativeBridge {
 
     /** wire::action */
     const val ACTION_SETUP_CERTS = 1
-    const val ACTION_MAC_LOGIN = 2
+    const val ACTION_SETUP_LOGIN = 2
 }

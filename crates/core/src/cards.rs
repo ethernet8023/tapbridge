@@ -40,9 +40,9 @@ pub struct CardInfo {
     /// [`caps`] bits.
     pub caps: u8,
     pub caps_at: u64,
-    /// The card's PIV identity is paired with the PC's macOS login.
-    pub mac_login: bool,
-    pub mac_login_at: u64,
+    /// The card's PIV identity is paired with a PC's OS login (macOS today).
+    pub login: bool,
+    pub login_at: u64,
     /// When the card was forgotten (0: never).
     pub deleted_at: u64,
 }
@@ -58,8 +58,8 @@ impl CardInfo {
             wake_at: now,
             caps,
             caps_at: now,
-            mac_login: false,
-            mac_login_at: 0,
+            login: false,
+            login_at: 0,
             deleted_at: 0,
         }
     }
@@ -78,7 +78,7 @@ impl CardInfo {
         self.label_at
             .max(self.wake_at)
             .max(self.caps_at)
-            .max(self.mac_login_at)
+            .max(self.login_at)
     }
 
     /// Both copies must describe the same card (same UID).
@@ -87,10 +87,7 @@ impl CardInfo {
         let (label, label_at) = newer((&self.label, self.label_at), (&other.label, other.label_at));
         let (wake, wake_at) = newer((&self.wake, self.wake_at), (&other.wake, other.wake_at));
         let (caps, caps_at) = newer((&self.caps, self.caps_at), (&other.caps, other.caps_at));
-        let (mac_login, mac_login_at) = newer(
-            (&self.mac_login, self.mac_login_at),
-            (&other.mac_login, other.mac_login_at),
-        );
+        let (login, login_at) = newer((&self.login, self.login_at), (&other.login, other.login_at));
         Self {
             uid: self.uid.clone(),
             label: label.clone(),
@@ -99,8 +96,8 @@ impl CardInfo {
             wake_at,
             caps: *caps,
             caps_at,
-            mac_login: *mac_login,
-            mac_login_at,
+            login: *login,
+            login_at,
             deleted_at: self.deleted_at.max(other.deleted_at),
         }
     }
@@ -140,11 +137,11 @@ mod tests {
         let mut pc = card("Ring", 10);
         phone.label = "Hand".into();
         phone.label_at = 20;
-        pc.mac_login = true;
-        pc.mac_login_at = 30;
+        pc.login = true;
+        pc.login_at = 30;
         let merged = phone.merge(&pc);
         assert_eq!(merged.label, "Hand");
-        assert!(merged.mac_login);
+        assert!(merged.login);
         assert_eq!(merged, pc.merge(&phone), "order doesn't matter");
         assert_eq!(merged.merge(&merged), merged, "idempotent");
     }

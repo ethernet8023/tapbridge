@@ -49,6 +49,7 @@ async fn carries_pairing_presence_and_cancellation_in_order() {
         Frame::Accepted {
             name: "Desk PC \u{1f5a5}".into(),
             platform: platform::MACOS,
+            piv_login: true,
         },
         Frame::Rejected,
         Frame::Card {
@@ -84,8 +85,8 @@ async fn carries_pairing_presence_and_cancellation_in_order() {
         Frame::CardInfo(card()),
         Frame::CardInfo(CardInfo {
             deleted_at: 99,
-            mac_login: true,
-            mac_login_at: 7,
+            login: true,
+            login_at: 7,
             ..card()
         }),
         Frame::CardAction {
@@ -94,7 +95,7 @@ async fn carries_pairing_presence_and_cancellation_in_order() {
         },
         Frame::CardActionDone {
             uid: vec![0x04, 1, 2, 3],
-            action: action::MAC_LOGIN,
+            action: action::SETUP_LOGIN,
             ok: true,
         },
     ];
@@ -176,6 +177,7 @@ async fn rejects_oversized_card_and_apdu_before_writing() {
         Frame::Accepted {
             name: "PC".into(),
             platform: platform::MAX + 1,
+            piv_login: true,
         },
         Frame::Apdu {
             id: 1,
@@ -194,10 +196,12 @@ async fn rejects_oversized_card_and_apdu_before_writing() {
         Frame::Accepted {
             name: String::new(),
             platform: platform::MACOS,
+            piv_login: true,
         },
         Frame::Accepted {
             name: "n".repeat(MAX_NAME + 1),
             platform: platform::MACOS,
+            piv_login: true,
         },
     ];
     for frame in invalid {
@@ -236,11 +240,13 @@ async fn rejects_malformed_headers_and_trailing_control_bytes() {
         vec![v, 0, 2],
         vec![v, 7, 0],
         // Accepted without a name, with a truncated name, without a
-        // platform, with trailing bytes.
+        // platform, without the login flag, flag out of range, trailing byte.
         vec![v, 1],
         vec![v, 1, 0, 3, b'a'],
         vec![v, 1, 0, 1, b'a'],
-        vec![v, 1, 0, 1, b'a', 1, 0],
+        vec![v, 1, 0, 1, b'a', 1],
+        vec![v, 1, 0, 1, b'a', 1, 2],
+        vec![v, 1, 0, 1, b'a', 1, 1, 0],
         // Hello: invalid UTF-8 name, empty name, bad push flag, trailing byte.
         vec![v, 0, 0, 0, 1, 0xff, 0],
         vec![v, 0, 0, 0, 0, 0],
@@ -314,11 +320,12 @@ async fn frame_layout_is_fixed_and_secrets_are_redacted() {
         &Frame::Accepted {
             name: "PC".into(),
             platform: platform::MACOS,
+            piv_login: true,
         },
     )
     .await
     .unwrap();
-    assert_eq!(bytes, [0, 0, 0, 7, VERSION, 1, 0, 2, b'P', b'C', 1]);
+    assert_eq!(bytes, [0, 0, 0, 8, VERSION, 1, 0, 2, b'P', b'C', 1, 1]);
     assert_eq!(
         format!(
             "{:?}",

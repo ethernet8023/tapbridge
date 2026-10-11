@@ -1,5 +1,5 @@
 //! Pure state for the Cards section: the one card action in progress
-//! ("Set up as smart card", "Use for Mac login") and the text Preferences
+//! ("Set up as smart card", "Set up login") and the text Preferences
 //! shows for it. The shell feeds it time, connection state and service
 //! events, and carries out the [`Effect`]s it returns.
 
@@ -13,17 +13,17 @@ pub const CARD_WAIT: Duration = Duration::from_secs(90);
 /// What the shell must do next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Effect {
-    /// Send `SetupPiv` to the connected phone.
+    /// Ask the connected phone to set up the certificates (`CardAction`).
     SendSetup,
     /// Ask for the phone (wake it, or ReadCard on a live session).
     RequestTap,
-    /// Run the Mac login pairing now: the card is on the phone.
+    /// Run the login pairing now: the card is on the phone.
     RunPairing,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Step {
-    /// The phone was woken; `SetupPiv` goes out once it connects.
+    /// The phone was woken; the setup request goes out once it connects.
     Connecting {
         since: Instant,
     },
@@ -33,8 +33,7 @@ pub enum Step {
     SetupDone {
         ok: bool,
     },
-    /// Waiting for the card on the phone before pairing (macOS login).
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// Waiting for the card on the phone before pairing the login.
     WaitingCard {
         since: Instant,
     },
@@ -100,9 +99,8 @@ impl CardTask {
         waiting
     }
 
-    /// "Use for Mac login": runs at once when the card is on the phone.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub fn mac_login(uid: Vec<u8>, present: bool, now: Instant) -> (Self, Effect) {
+    /// "Set up login": runs at once when the card is on the phone.
+    pub fn login(uid: Vec<u8>, present: bool, now: Instant) -> (Self, Effect) {
         let (step, effect) = if present {
             (Step::Pairing, Effect::RunPairing)
         } else {
@@ -157,7 +155,7 @@ impl CardTask {
             Step::SetupDone { ok: true } => "Smart card set up.".into(),
             Step::SetupDone { ok: false } => "Setup didn't finish on the phone.".into(),
             Step::WaitingCard { .. } => "Hold the card to your phone.".into(),
-            Step::Pairing => "Pairing with your Mac login\u{2026}".into(),
+            Step::Pairing => format!("Pairing with your {} login\u{2026}", crate::login::OS_NAME),
             Step::Finished { text, .. } => text.clone(),
         }
     }
@@ -189,12 +187,12 @@ pub enum StepState {
     Locked,
 }
 
-/// The three steps toward signing in to the Mac with a card.
+/// The three steps toward signing in to this PC with a card.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Checklist {
     pub applet: StepState,
     pub certificates: StepState,
-    pub mac_login: StepState,
+    pub login: StepState,
 }
 
 impl Checklist {
@@ -213,20 +211,20 @@ impl Checklist {
             StepState::Done => StepState::Todo,
             _ => StepState::Locked,
         };
-        let mac_login = match certificates {
-            StepState::Done if card.mac_login => StepState::Done,
+        let login = match certificates {
+            StepState::Done if card.login => StepState::Done,
             StepState::Done => StepState::Todo,
             _ => StepState::Locked,
         };
         Self {
             applet,
             certificates,
-            mac_login,
+            login,
         }
     }
 
     pub fn ready(&self) -> bool {
-        self.mac_login == StepState::Done
+        self.login == StepState::Done
     }
 }
 
@@ -418,9 +416,9 @@ mod tests {
     }
 
     #[test]
-    fn mac_login_waits_for_the_right_card() {
+    fn login_waits_for_the_right_card() {
         let now = Instant::now();
-        let (mut task, effect) = CardTask::mac_login(UID.to_vec(), false, now);
+        let (mut task, effect) = CardTask::login(UID.to_vec(), false, now);
         assert_eq!(effect, Effect::RequestTap);
         assert_eq!(task.tick(now, true, &[]), None);
         assert_eq!(task.tick(now, true, &[4, 9, 9, 9]), None);
@@ -437,14 +435,14 @@ mod tests {
                 text: "Done.".into()
             }
         );
-        let (task, effect) = CardTask::mac_login(UID.to_vec(), true, now);
+        let (task, effect) = CardTask::login(UID.to_vec(), true, now);
         assert_eq!((task.step, effect), (Step::Pairing, Effect::RunPairing));
     }
 
     #[test]
-    fn mac_login_times_out_without_a_tap() {
+    fn login_times_out_without_a_tap() {
         let now = Instant::now();
-        let (mut task, _) = CardTask::mac_login(UID.to_vec(), false, now);
+        let (mut task, _) = CardTask::login(UID.to_vec(), false, now);
         task.tick(now + CARD_WAIT, true, &[]);
         assert!(task.failed() && task.dismissable());
     }
@@ -502,12 +500,12 @@ mod tests {
         use StepState::*;
         let none = Checklist::new(&card(|_| {}));
         assert_eq!(
-            (none.applet, none.certificates, none.mac_login),
+            (none.applet, none.certificates, none.login),
             (Todo, Locked, Locked)
         );
         let applet = Checklist::new(&card(|c| c.caps |= tapbridge_host::cards::caps::PIV));
         assert_eq!(
-            (applet.applet, applet.certificates, applet.mac_login),
+            (applet.applet, applet.certificates, applet.login),
             (Done, Todo, Locked)
         );
         let certs = Checklist::new(&card(|c| {
@@ -515,21 +513,21 @@ mod tests {
             c.caps |= tapbridge_host::cards::caps::CERTS;
         }));
         assert_eq!(
-            (certs.applet, certs.certificates, certs.mac_login),
+            (certs.applet, certs.certificates, certs.login),
             (Done, Done, Todo)
         );
         let ready = Checklist::new(&card(|c| {
             c.caps |= tapbridge_host::cards::caps::PIV;
             c.caps |= tapbridge_host::cards::caps::CERTS;
-            c.mac_login = true;
+            c.login = true;
         }));
         assert!(ready.ready());
-        // A stale Mac login flag can't skip missing certificates.
+        // A stale login flag can't skip missing certificates.
         let stale = Checklist::new(&card(|c| {
             c.caps |= tapbridge_host::cards::caps::PIV;
-            c.mac_login = true;
+            c.login = true;
         }));
-        assert_eq!(stale.mac_login, Locked);
+        assert_eq!(stale.login, Locked);
     }
 
     #[test]

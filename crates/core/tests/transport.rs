@@ -200,6 +200,7 @@ async fn capability_hello_roundtrip_and_debug_redaction() {
         transport::HelloReply::Accepted {
             host_name: "Desk".into(),
             platform: tapbridge_core::wire::platform::current(),
+            piv_login: tapbridge_core::wire::platform::piv_login(),
         }
     );
     let _conn = host_task.await.unwrap();
@@ -269,6 +270,7 @@ async fn accepted_handshake_keeps_both_stream_directions_open() {
         transport::HelloReply::Accepted {
             host_name: "Desk".into(),
             platform: tapbridge_core::wire::platform::current(),
+            piv_login: tapbridge_core::wire::platform::piv_login(),
         }
     );
     // Neither EOF nor STOP_SENDING is allowed after Accepted.

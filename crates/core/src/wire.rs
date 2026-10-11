@@ -6,8 +6,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub const MAX_APDU: usize = 65536;
 pub const MAX_ATR: usize = 33;
 pub const MAX_FRAME: usize = 65600;
-/// Frame format version byte. v3: `Card` carries a length-prefixed ATR and
-/// the tag UID; adds `SetupPiv` and `PivSetupDone`.
+/// Frame format version byte. v4: `Accepted` carries the host platform and
+/// whether it does PIV login; synced `CardInfo` records and `CardAction`s.
+/// No older version is accepted.
 pub const VERSION: u8 = 4;
 /// NFC tag UID (ISO 14443: 4, 7 or 10 bytes).
 pub const MAX_UID: usize = 10;
@@ -25,9 +26,12 @@ pub enum Frame {
     },
     Accepted {
         name: String,
-        /// The host's OS, one of [`platform`]: the phone shows macOS-only
-        /// steps (Mac login) only to a Mac.
+        /// The host's OS, one of [`platform`]. Only for wording ("Mac",
+        /// "Windows"); what the PC can do is in the flags below.
         platform: u8,
+        /// The PC can pair a card's PIV identity with its OS login
+        /// ([`action::SETUP_LOGIN`]).
+        piv_login: bool,
     },
     Rejected,
     Card {
@@ -97,6 +101,13 @@ pub mod platform {
             OTHER
         }
     }
+
+    /// Whether this build can pair a card's PIV identity with the OS login
+    /// (macOS `sc_auth` today). The one switch to flip when Windows or
+    /// Linux learn it; the PC's UI and the phone both follow it.
+    pub const fn piv_login() -> bool {
+        cfg!(target_os = "macos")
+    }
 }
 
 /// [`Frame::CardAction`] actions.
@@ -104,9 +115,10 @@ pub mod action {
     /// Host -> phone: create the card's PIV certificates (the phone asks for
     /// the PIN; existing certificates are kept).
     pub const SETUP_CERTS: u8 = 1;
-    /// Phone -> host: pair the card with the PC's macOS login.
-    pub const MAC_LOGIN: u8 = 2;
-    pub const MAX: u8 = MAC_LOGIN;
+    /// Phone -> host: pair the card's PIV identity with the PC's login
+    /// (only to a PC that said `piv_login` in [`super::Frame::Accepted`]).
+    pub const SETUP_LOGIN: u8 = 2;
+    pub const MAX: u8 = SETUP_LOGIN;
 }
 
 /// [`Frame::Auth`] states.
@@ -188,7 +200,7 @@ fn validate(frame: &Frame) -> io::Result<()> {
                     .as_ref()
                     .is_none_or(|push| (1..=MAX_PUSH).contains(&push.len()))
         }
-        Frame::Accepted { name, platform } => {
+        Frame::Accepted { name, platform, .. } => {
             (1..=MAX_NAME).contains(&name.len()) && *platform <= platform::MAX
         }
         Frame::Auth { state } => *state <= auth::MAX,
@@ -228,8 +240,13 @@ fn decode(body: &[u8]) -> io::Result<Frame> {
             let mut fields = Fields(data);
             let name = fields.string()?;
             let platform = fields.byte()?;
+            let piv_login = fields.flag()?;
             fields.end()?;
-            Ok(Frame::Accepted { name, platform })
+            Ok(Frame::Accepted {
+                name,
+                platform,
+                piv_login,
+            })
         }
         2 if data.is_empty() => Ok(Frame::Rejected),
         3 if data.len() >= 12 => {
@@ -277,8 +294,8 @@ fn decode(body: &[u8]) -> io::Result<Frame> {
                 wake_at: fields.number()?,
                 caps: fields.byte()?,
                 caps_at: fields.number()?,
-                mac_login: fields.flag()?,
-                mac_login_at: fields.number()?,
+                login: fields.flag()?,
+                login_at: fields.number()?,
                 deleted_at: fields.number()?,
             };
             fields.end()?;
@@ -323,10 +340,14 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -
                 put_string(&mut body, push);
             }
         }
-        Frame::Accepted { name, platform } => {
+        Frame::Accepted {
+            name,
+            platform,
+            piv_login,
+        } => {
             body.push(1);
             put_string(&mut body, name);
-            body.push(*platform);
+            body.extend_from_slice(&[*platform, u8::from(*piv_login)]);
         }
         Frame::Rejected => body.push(2),
         Frame::Card {
@@ -383,8 +404,8 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -
             body.extend_from_slice(&card.wake_at.to_be_bytes());
             body.push(card.caps);
             body.extend_from_slice(&card.caps_at.to_be_bytes());
-            body.push(u8::from(card.mac_login));
-            body.extend_from_slice(&card.mac_login_at.to_be_bytes());
+            body.push(u8::from(card.login));
+            body.extend_from_slice(&card.login_at.to_be_bytes());
             body.extend_from_slice(&card.deleted_at.to_be_bytes());
         }
         Frame::CardAction { uid, action } => {

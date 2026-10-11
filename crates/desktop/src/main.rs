@@ -19,6 +19,7 @@ mod card_tasks;
 mod glass;
 mod hostname;
 mod logging;
+mod login;
 #[cfg(windows)]
 mod passkeys;
 #[cfg(windows)]

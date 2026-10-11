@@ -864,9 +864,9 @@ pub enum SettingsAction {
     /// driver reads the card when it arrives; the probe watches that).
     CheckCard,
     OpenUrl(String),
-    /// macOS only: pair the card's login certificate with this Mac.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    MacLogin(Vec<u8>),
+    /// Pair the card's login certificate with this PC's login (where
+    /// `login::SUPPORTED`).
+    SetUpLogin(Vec<u8>),
     /// Close the status of the card action (or stop waiting for it).
     DismissCardTask,
 }
@@ -883,7 +883,7 @@ impl SettingsAction {
             Self::SetUpCard(_) => "set up certificates",
             Self::CheckCard => "check card",
             Self::OpenUrl(_) => "open url",
-            Self::MacLogin(_) => "mac login",
+            Self::SetUpLogin(_) => "set up login",
             Self::DismissCardTask => "dismiss card task",
         }
     }
@@ -911,8 +911,8 @@ pub struct CardRow {
     pub task_finished: bool,
     /// The action can be closed or stopped (not while sc_auth runs).
     pub task_dismissable: bool,
-    /// macOS: offer "Use for Mac login".
-    pub offer_mac_login: bool,
+    /// Offer "Set up login" (this PC supports card login).
+    pub offer_login: bool,
 }
 
 /// The overall state shown at the top of Settings (mirrors the tray icon).
@@ -1126,7 +1126,7 @@ impl SettingsView {
                             .text_color(rgb(ACCENT_SOFT))
                             .child(format!("Last seen {}", card.last_seen)),
                     )
-                    .when(cfg!(target_os = "macos"), |column| {
+                    .when(crate::login::SUPPORTED, |column| {
                         column.child(capability_marks(
                             card.passkey,
                             card.checklist.is_some_and(|c| c.ready()),
@@ -1186,7 +1186,7 @@ impl SettingsView {
                 })),
             );
             if let Some(checklist) = card.checklist
-                && cfg!(target_os = "macos")
+                && crate::login::SUPPORTED
             {
                 let open_uid = uid.clone();
                 let (label, tint, opacity) = if checklist.ready() {
@@ -1236,9 +1236,9 @@ impl SettingsView {
 }
 
 impl SettingsView {
-    /// The three "macOS login" steps: applet, certificates, Mac login.
-    /// Each button runs on the device that does the work: the phone creates
-    /// certificates, this Mac pairs its login.
+    /// The three login steps: applet, certificates, OS login. Each button
+    /// runs on the device that does the work: the phone creates
+    /// certificates, this PC pairs its login.
     fn render_checklist(
         &self,
         index: usize,
@@ -1358,30 +1358,29 @@ impl SettingsView {
             certs_body,
         ));
 
-        // 3. macOS login (paired on this Mac).
+        // 3. OS login (paired on this PC).
         let mut login_body = div().flex().flex_row();
-        if checklist.mac_login == StepState::Todo && !busy && cfg!(target_os = "macos") {
+        if checklist.login == StepState::Todo && !busy && crate::login::SUPPORTED {
             let login_uid = uid.clone();
             login_body = login_body.child(
-                card_button("step-login", index, "Set up macOS login", ACCENT, 0.6, cx).on_click(
+                card_button("step-login", index, "Set up login", ACCENT, 0.6, cx).on_click(
                     cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
-                        view.act(SettingsAction::MacLogin(login_uid.clone()), cx)
+                        view.act(SettingsAction::SetUpLogin(login_uid.clone()), cx)
                     }),
                 ),
             );
         }
+        let unlocks = format!("This card unlocks your {}.", crate::login::OS_NAME);
         list.child(step_row(
             3,
-            "macOS login",
-            match checklist.mac_login {
-                StepState::Done => "This card unlocks your Mac.",
+            &format!("{} login", crate::login::OS_NAME),
+            match checklist.login {
+                StepState::Done => &unlocks,
                 StepState::Locked => "Needs certificates.",
-                _ if cfg!(target_os = "macos") => {
-                    "Pairs the card with your account. macOS asks for your password."
-                }
-                _ => "Only on a Mac.",
+                _ if crate::login::SUPPORTED => crate::login::PAIR_HINT,
+                _ => "Not available on this computer yet.",
             },
-            checklist.mac_login,
+            checklist.login,
             login_body,
         ))
     }
@@ -1404,7 +1403,7 @@ impl CardDialog {
     }
 }
 
-/// "✓ 2FA  ✓ Login" under a card's name (macOS).
+/// "✓ 2FA  ✓ Login" under a card's name (where card login is supported).
 fn capability_marks(two_factor: bool, login: bool) -> gpui::Div {
     let mark = |on: bool, label: &'static str| {
         div()
@@ -1788,14 +1787,14 @@ impl SettingsView {
                     .child("Name this card. Return saves."),
             );
         }
-        if cfg!(target_os = "macos") {
+        if crate::login::SUPPORTED {
             sheet = sheet.child(capability_marks(
                 card.passkey,
                 card.checklist.is_some_and(|c| c.ready()),
             ));
         }
         if let Some(checklist) = card.checklist
-            && cfg!(target_os = "macos")
+            && crate::login::SUPPORTED
         {
             sheet = sheet.child(div().h(px(1.0)).bg(rgba(0xFFFFFF1F)));
             sheet = sheet.child(self.render_checklist(index, &card, checklist, cx));
@@ -1919,8 +1918,7 @@ pub fn settings_new_card(handle: WindowHandle<SettingsView>, uid: Vec<u8>, cx: &
 }
 
 /// Shows a card's "Set up login" dialog in an open Settings window (the
-/// phone asked for the Mac login), unless another dialog is up.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// phone asked for it), unless another dialog is up.
 pub fn settings_open_login(handle: WindowHandle<SettingsView>, uid: Vec<u8>, cx: &mut App) {
     let _ = handle.update(cx, |view, window, cx| {
         if view.dialog.is_none() {

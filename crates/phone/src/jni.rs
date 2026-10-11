@@ -140,6 +140,22 @@ pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_hostPlatfor
     }
 }
 
+/// Whether the host can pair a card with its OS login (false on error).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_hostPivLogin(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jboolean {
+    match unsafe { session(handle) } {
+        Ok(s) => s.host_piv_login().into(),
+        Err(error) => {
+            report(&mut env, error);
+            0
+        }
+    }
+}
+
 /// Hint text actually used for the dial, so Kotlin can cache it for later
 /// reconnects instead of re-discovering the host every time.
 #[unsafe(no_mangle)]
@@ -219,8 +235,8 @@ pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_read(
                         JValue::Long(card.wake_at as jlong),
                         JValue::Int(card.caps.into()),
                         JValue::Long(card.caps_at as jlong),
-                        JValue::Bool(card.mac_login.into()),
-                        JValue::Long(card.mac_login_at as jlong),
+                        JValue::Bool(card.login.into()),
+                        JValue::Long(card.login_at as jlong),
                         JValue::Long(card.deleted_at as jlong),
                     ],
                 )?;
@@ -300,8 +316,8 @@ pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_cardInfo(
     wake_at: jlong,
     caps: jint,
     caps_at: jlong,
-    mac_login: jboolean,
-    mac_login_at: jlong,
+    login: jboolean,
+    login_at: jlong,
     deleted_at: jlong,
 ) {
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
@@ -313,8 +329,8 @@ pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_cardInfo(
             wake_at: wake_at as u64,
             caps: u8::try_from(caps)?,
             caps_at: caps_at as u64,
-            mac_login: mac_login != 0,
-            mac_login_at: mac_login_at as u64,
+            login: login != 0,
+            login_at: login_at as u64,
             deleted_at: deleted_at as u64,
         };
         unsafe { session(handle)? }.send(&Frame::CardInfo(card))?;

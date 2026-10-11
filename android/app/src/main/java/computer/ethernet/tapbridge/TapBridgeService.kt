@@ -92,8 +92,8 @@ class TapBridgeService : Service() {
         fun onAuthState(state: AuthState) {}
         /** The PC asks to set up the certificates of the card with this UID. */
         fun onSetupCerts(uid: ByteArray) {}
-        /** The Mac login the phone asked a PC for ended. */
-        fun onMacLoginDone(uid: ByteArray, ok: Boolean) {}
+        /** The login setup the phone asked a PC for ended. */
+        fun onLoginDone(uid: ByteArray, ok: Boolean) {}
     }
     inner class LocalBinder : Binder() { val service get() = this@TapBridgeService }
     private val binder = LocalBinder()
@@ -150,8 +150,11 @@ class TapBridgeService : Service() {
         private set
     @Volatile var wakeHint: String? = null
         private set
-    /** OS of the PC on the live session (NativeBridge.PLATFORM_*); -1 without one. */
+    /** OS of the PC on the live session (NativeBridge.PLATFORM_*), for wording; -1 without one. */
     @Volatile var hostPlatform: Int = -1
+        private set
+    /** The PC on the live session can pair a card with its OS login. */
+    @Volatile var hostPivLogin: Boolean = false
         private set
 
     /** Local card edits go to the PC on the live session (PC edits came from it). */
@@ -346,10 +349,12 @@ class TapBridgeService : Service() {
                     this@TapBridgeService,
                     acceptedHost,
                     NativeBridge.hostName(pointer) ?: "PC",
+                    NativeBridge.hostPlatform(pointer).coerceAtLeast(0),
+                    NativeBridge.hostPivLogin(pointer),
                 )
                 targetHost = acceptedHost
                 hostPlatform = NativeBridge.hostPlatform(pointer)
-                if (hostPlatform == NativeBridge.PLATFORM_MACOS) Cards.markSeenMac(this@TapBridgeService)
+                hostPivLogin = NativeBridge.hostPivLogin(pointer)
                 NativeBridge.usedHint(pointer)?.let {
                     IdentityStore.saveHint(this@TapBridgeService, acceptedHost, it)
                 }
@@ -466,14 +471,14 @@ class TapBridgeService : Service() {
             override fun cardInfo(
                 uid: ByteArray, label: String, labelAt: Long,
                 wake: Boolean, wakeAt: Long, caps: Int, capsAt: Long,
-                macLogin: Boolean, macLoginAt: Long, deletedAt: Long,
+                login: Boolean, loginAt: Long, deletedAt: Long,
             ) {
-                val theirs = CardInfo(uid, label, labelAt, wake, wakeAt, caps, capsAt, macLogin, macLoginAt, deletedAt)
+                val theirs = CardInfo(uid, label, labelAt, wake, wakeAt, caps, capsAt, login, loginAt, deletedAt)
                 Cards.merge(this@TapBridgeService, theirs)?.let { session.sendCardInfo(it) }
             }
             override fun cardActionDone(uid: ByteArray, action: Int, ok: Boolean) {
-                if (action != NativeBridge.ACTION_MAC_LOGIN) return
-                main.post { listener?.onMacLoginDone(uid, ok) }
+                if (action != NativeBridge.ACTION_SETUP_LOGIN) return
+                main.post { listener?.onLoginDone(uid, ok) }
             }
             override fun cardAction(uid: ByteArray, action: Int) {
                 bumpActivity()
@@ -606,10 +611,10 @@ class TapBridgeService : Service() {
         if (status == Status.CONNECTED) session.sendCardAction(uid, NativeBridge.ACTION_SETUP_CERTS, done = true, ok = ok)
     }
 
-    /** Asks the PC on the live session to pair [uid] with its Mac login. False without a Mac. */
-    fun requestMacLogin(uid: ByteArray): Boolean {
-        if (status != Status.CONNECTED || hostPlatform != NativeBridge.PLATFORM_MACOS) return false
-        session.sendCardAction(uid, NativeBridge.ACTION_MAC_LOGIN, done = false, ok = false)
+    /** Asks the PC on the live session to pair [uid] with its login. False when it can't. */
+    fun requestLogin(uid: ByteArray): Boolean {
+        if (status != Status.CONNECTED || !hostPivLogin) return false
+        session.sendCardAction(uid, NativeBridge.ACTION_SETUP_LOGIN, done = false, ok = false)
         return true
     }
 

@@ -85,6 +85,7 @@ fn actual_phone_session_relays_frames_and_close_unblocks_reader() {
     .unwrap();
     assert_eq!(session.host_name(), "PC");
     assert_eq!(session.host_platform(), wire::platform::current());
+    assert_eq!(session.host_piv_login(), wire::platform::piv_login());
     assert!(!used.is_empty());
     let session = Arc::new(session);
     session

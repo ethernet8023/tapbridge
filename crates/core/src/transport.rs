@@ -116,9 +116,14 @@ pub async fn client_hello(
     .await?;
     let reply = read_frame(recv).await?;
     match reply {
-        Frame::Accepted { name, platform } => Ok(HelloReply::Accepted {
+        Frame::Accepted {
+            name,
+            platform,
+            piv_login,
+        } => Ok(HelloReply::Accepted {
             host_name: name,
             platform,
+            piv_login,
         }),
         Frame::Rejected => Ok(HelloReply::Rejected),
         _ => Err(io::Error::new(
@@ -148,9 +153,13 @@ impl std::fmt::Debug for ClientHello {
 /// The host's verdict on a Hello.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HelloReply {
-    /// Host accepted the session and told us its display name and OS
-    /// ([`crate::wire::platform`]).
-    Accepted { host_name: String, platform: u8 },
+    /// Host accepted the session and told us its display name, OS
+    /// ([`crate::wire::platform`]) and whether it does PIV login.
+    Accepted {
+        host_name: String,
+        platform: u8,
+        piv_login: bool,
+    },
     /// Host rejected; treat the session as dead.
     Rejected,
 }
@@ -162,6 +171,7 @@ pub async fn reply_accepted(send: &mut SendStream, name: String) -> io::Result<(
         &Frame::Accepted {
             name,
             platform: crate::wire::platform::current(),
+            piv_login: crate::wire::platform::piv_login(),
         },
     )
     .await

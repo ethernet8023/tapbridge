@@ -28,6 +28,8 @@ pub struct Session {
     host_name: String,
     /// Host OS from the `Accepted` reply ([`wire::platform`]).
     host_platform: u8,
+    /// The host can pair a card with its OS login.
+    host_piv_login: bool,
     /// The hint text that was dialed, for the phone to cache for reconnects.
     used_hint: String,
 }
@@ -97,7 +99,8 @@ impl Session {
                         transport::HelloReply::Accepted {
                             host_name,
                             platform,
-                        } => (host_name, platform),
+                            piv_login,
+                        } => (host_name, platform, piv_login),
                         transport::HelloReply::Rejected => {
                             transport::close(&connection);
                             return Err(io::Error::new(
@@ -111,19 +114,22 @@ impl Session {
             .await
         });
         match connected {
-            Ok(Ok((connection, reader, writer, (host_name, host_platform)))) => Ok((
-                Self {
-                    runtime,
-                    endpoint,
-                    connection,
-                    reader: Mutex::new(reader),
-                    writer: Mutex::new(writer),
-                    host_name,
-                    host_platform,
-                    used_hint: used_hint.clone(),
-                },
-                used_hint,
-            )),
+            Ok(Ok((connection, reader, writer, (host_name, host_platform, host_piv_login)))) => {
+                Ok((
+                    Self {
+                        runtime,
+                        endpoint,
+                        connection,
+                        reader: Mutex::new(reader),
+                        writer: Mutex::new(writer),
+                        host_name,
+                        host_platform,
+                        host_piv_login,
+                        used_hint: used_hint.clone(),
+                    },
+                    used_hint,
+                ))
+            }
             error => {
                 runtime.block_on(endpoint.close());
                 match error {
@@ -143,10 +149,14 @@ impl Session {
         &self.host_name
     }
 
-    /// Host OS ([`wire::platform`]): the phone shows Mac-only steps only to
-    /// a Mac.
+    /// Host OS ([`wire::platform`]), for wording only.
     pub fn host_platform(&self) -> u8 {
         self.host_platform
+    }
+
+    /// Whether the host can pair a card's PIV identity with its OS login.
+    pub fn host_piv_login(&self) -> bool {
+        self.host_piv_login
     }
 
     /// Hint text actually used for the dial, so the phone can cache it and

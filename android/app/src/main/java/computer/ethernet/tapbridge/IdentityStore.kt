@@ -18,7 +18,7 @@ import javax.crypto.spec.GCMParameterSpec
  * that would orphan the pairing on the host side.
  *
  * One phone pairs MANY hosts (Track C): per-host records live in one JSON
- * pref key ([PairedHosts]); the legacy single-host keys are migrated once.
+ * pref key ([PairedHosts]).
  * Each host is an independent peer with its own identity key and pairing
  * capability and still pins exactly one phone. The phone's own identity key
  * and FCM token belong to this install and are shared by all hosts.
@@ -32,9 +32,6 @@ object IdentityStore {
     private const val K_HOSTS = "paired_hosts"
     private const val K_LAST_USED = "last_used_host"
     // Legacy single-host keys (pre multi-PC pairing); read-only after migration.
-    private const val K_HOST = "paired_host"
-    private const val K_HINT = "cached_hint"
-    private const val K_HOST_NAME = "host_name"
     private const val K_PUSH_TOKEN = "push_token"
     private const val K_PHONE_NAME = "phone_name"
     private const val KEY_LEN = 32
@@ -63,29 +60,11 @@ object IdentityStore {
 
     // ------------------------------------------------------------- paired hosts
 
-    /**
-     * All paired hosts, oldest-paired first (list order = display order).
-     * Runs the one-time legacy migration on first read; never re-keys.
-     */
+    /** All paired hosts, oldest-paired first (list order = display order). */
     @Synchronized
     fun pairedHosts(ctx: Context): List<PairedHosts.Record> {
-        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val stored = prefs.getString(K_HOSTS, null)
-        if (stored == null) {
-            // One-time migration from the single-host prefs. The legacy keys
-            // are removed in the SAME commit so a crash cannot double-run or
-            // resurrect the old value; corrupt data fails loudly.
-            val migrated = PairedHosts.migrate(
-                prefs.getString(K_HOST, null),
-                prefs.getString(K_HOST_NAME, null),
-                prefs.getString(K_HINT, null),
-            )
-            check(prefs.edit()
-                .putString(K_HOSTS, PairedHosts.encode(migrated))
-                .remove(K_HOST).remove(K_HINT).remove(K_HOST_NAME)
-                .commit()) { "paired-hosts migration could not be saved" }
-            return migrated
-        }
+        val stored = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(K_HOSTS, null)
+            ?: return emptyList()
         return PairedHosts.decode(stored)
     }
 
@@ -100,11 +79,11 @@ object IdentityStore {
         pairedHosts(ctx).firstOrNull { it.hostId == hostId }
 
     /** Record after a successful connect/Accepted; keeps pairedAt and renames. */
-    fun saveAcceptedHost(ctx: Context, hostId: String, name: String) {
+    fun saveAcceptedHost(ctx: Context, hostId: String, name: String, platform: Int, pivLogin: Boolean) {
         val hosts = pairedHosts(ctx)
         saveHosts(
             ctx,
-            PairedHosts.upsertAfterAccept(hosts, hostId, name, System.currentTimeMillis()),
+            PairedHosts.upsertAfterAccept(hosts, hostId, name, System.currentTimeMillis(), platform, pivLogin),
         )
         setLastUsedHost(ctx, hostId)
     }

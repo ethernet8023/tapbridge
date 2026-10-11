@@ -28,13 +28,16 @@ data class PendingCard(val uid: ByteArray, val caps: Int, val suggested: String)
     override fun hashCode() = uid.contentHashCode()
 }
 
-/** What the phone can offer for the Mac login step right now. */
-enum class MacLink {
-    /** Connected to a Mac: the step can be started from here. */
-    CONNECTED,
-    /** Not connected to a Mac (or connected to another PC). */
-    NONE,
-}
+/**
+ * The login step (pairing a card with a PC's OS login), as far as the
+ * paired PCs allow it. Null when no paired PC supports it: the step is hidden.
+ */
+data class LoginTarget(
+    /** "Mac", "Windows PC": the PC(s) that support it, for wording. */
+    val osName: String,
+    /** Connected right now to a PC that supports it: "Set up" works. */
+    val connected: Boolean,
+)
 
 /** One checklist step's state (same four as the desktop's `StepState`). */
 private enum class Step { DONE, TODO, PROBLEM, LOCKED }
@@ -43,17 +46,16 @@ private enum class Step { DONE, TODO, PROBLEM, LOCKED }
 @Composable
 fun CardsScreen(
     cards: List<CardInfo>,
-    mac: MacLink,
-    /** Show the Mac login step at all (this phone has met a Mac). */
-    showMacLogin: Boolean,
-    /** Hex UID of the card whose Mac login is running on the Mac, if any. */
-    macLoginBusy: String?,
+    /** Null hides the login step (no paired PC supports it). */
+    login: LoginTarget?,
+    /** Hex UID of the card whose login is being set up on the PC, if any. */
+    loginBusy: String?,
     onAddCard: () -> Unit,
     onRename: (CardInfo, String) -> Unit,
     onForget: (CardInfo) -> Unit,
     onWake: (CardInfo, Boolean) -> Unit,
     onSetUpCerts: (CardInfo) -> Unit,
-    onMacLogin: (CardInfo) -> Unit,
+    onSetUpLogin: (CardInfo) -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -81,14 +83,13 @@ fun CardsScreen(
         cards.forEach { card ->
             CardItem(
                 card = card,
-                mac = mac,
-                showMacLogin = showMacLogin,
-                macLoginBusy = macLoginBusy == Cards.hex(card.uid),
+                target = login,
+                loginBusy = loginBusy == Cards.hex(card.uid),
                 onRename = { renaming = card },
                 onForget = { forgetting = card },
                 onWake = { onWake(card, it) },
                 onSetUpCerts = { onSetUpCerts(card) },
-                onMacLogin = { onMacLogin(card) },
+                onSetUpLogin = { onSetUpLogin(card) },
             )
             Spacer(Modifier.height(12.dp))
         }
@@ -140,14 +141,13 @@ fun CardsScreen(
 @Composable
 private fun CardItem(
     card: CardInfo,
-    mac: MacLink,
-    showMacLogin: Boolean,
-    macLoginBusy: Boolean,
+    target: LoginTarget?,
+    loginBusy: Boolean,
     onRename: () -> Unit,
     onForget: () -> Unit,
     onWake: (Boolean) -> Unit,
     onSetUpCerts: () -> Unit,
-    onMacLogin: () -> Unit,
+    onSetUpLogin: () -> Unit,
 ) {
     val certs = when {
         card.has(CardInfo.Caps.BLOCKED) -> Step.PROBLEM
@@ -156,7 +156,7 @@ private fun CardItem(
         else -> Step.LOCKED
     }
     val login = when {
-        card.macLogin -> Step.DONE
+        card.login -> Step.DONE
         certs == Step.DONE -> Step.TODO
         else -> Step.LOCKED
     }
@@ -197,18 +197,18 @@ private fun CardItem(
                 ) {
                     if (certs == Step.TODO) TextButton(onClick = onSetUpCerts) { Text("Set up") }
                 }
-                if (showMacLogin) StepRow(
+                if (target != null) StepRow(
                     login,
-                    "Mac login",
+                    "${target.osName} login",
                     when {
-                        macLoginBusy -> "Finish on your Mac"
-                        login == Step.TODO && mac == MacLink.NONE -> "Connect to your Mac to set this up"
+                        loginBusy -> "Finish on your ${target.osName}"
+                        login == Step.TODO && !target.connected -> "Connect to your ${target.osName} to set this up"
                         login == Step.LOCKED -> "Needs the certificates"
                         else -> null
                     },
                 ) {
-                    if (login == Step.TODO && mac == MacLink.CONNECTED && !macLoginBusy) {
-                        TextButton(onClick = onMacLogin) { Text("Set up") }
+                    if (login == Step.TODO && target.connected && !loginBusy) {
+                        TextButton(onClick = onSetUpLogin) { Text("Set up") }
                     }
                 }
                 Row(

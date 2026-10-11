@@ -7,21 +7,24 @@ package computer.ethernet.tapbridge
  * peer with its own identity key and pairing capability, and each host still
  * pins exactly one phone. A record is:
  *
- *   host_id -> { name, cached_hint, paired_at, renamed }
+ *   host_id -> { name, cached_hint, paired_at, renamed, platform, piv_login }
  *
  * `name` is the host display name from the `Accepted` handshake (or a
  * user-chosen one; `renamed` freezes a user edit so a later `Accepted` cannot
  * overwrite it). `cached_hint` is the last wake/dial hint for that host.
+ * `platform` (NativeBridge.PLATFORM_*) and `piv_login` (the PC can pair a
+ * card with its OS login) come from the latest `Accepted`.
  *
  * Storage format: strict JSON in ONE SharedPreferences key (see
  * [IdentityStore]). The codec and every merge/routing rule live here as pure
  * functions with no Android dependencies, so they are unit-testable on the
- * JVM. Decode is strict, mirroring wire.rs: unknown version, unknown fields,
- * trailing bytes, overlength or invalid values throw — corrupt state fails
- * loudly and never silently re-keys.
+ * JVM. Decode is strict, mirroring wire.rs: unknown fields, trailing bytes,
+ * overlength or invalid values throw — corrupt state fails loudly and never
+ * silently re-keys. A store from another format version is not migrated:
+ * it reads as nothing paired.
  */
 object PairedHosts {
-    private const val VERSION = 1L
+    private const val VERSION = 2L
     private const val MAX_NAME_BYTES = 64
     private const val MAX_HINT_BYTES = 1024
 
@@ -36,7 +39,20 @@ object PairedHosts {
         val pairedAt: Long,
         /** True once the user renamed the host; Accepted no longer overwrites. */
         val renamed: Boolean = false,
-    )
+        /** The PC's OS (NativeBridge.PLATFORM_*), for wording. */
+        val platform: Int = NativeBridge.PLATFORM_OTHER,
+        /** The PC can pair a card's PIV identity with its OS login. */
+        val pivLogin: Boolean = false,
+    ) {
+        /** "Mac", "Windows" or "PC", for "unlocks your …". */
+        val osName get() = osName(platform)
+    }
+
+    fun osName(platform: Int) = when (platform) {
+        NativeBridge.PLATFORM_MACOS -> "Mac"
+        NativeBridge.PLATFORM_WINDOWS -> "Windows PC"
+        else -> "PC"
+    }
 
     /** A wake the phone should act on: which host, and which hint to dial. */
     data class Wake(val hostId: String, val hint: String)
@@ -53,6 +69,8 @@ object PairedHosts {
             append(record.cachedHint?.let { jsonString(it) } ?: "null")
             append(",\"at\":").append(record.pairedAt)
             append(",\"ren\":").append(record.renamed)
+            append(",\"os\":").append(record.platform)
+            append(",\"login\":").append(record.pivLogin)
             append('}')
         }
         append("}}")
@@ -69,7 +87,7 @@ object PairedHosts {
 
         val root = value as? Map<*, *> ?: fail("root is not an object")
         if (root.keys != setOf("v", "hosts")) fail("unexpected top-level fields ${root.keys}")
-        if (root["v"] != VERSION) fail("unsupported version ${root["v"]}")
+        if (root["v"] != VERSION) return emptyList()
         val hosts = root["hosts"] as? Map<*, *> ?: fail("hosts is not an object")
         if (hosts.isEmpty()) return emptyList()
         val records = ArrayList<Record>(hosts.size)
@@ -77,7 +95,7 @@ object PairedHosts {
             val hostId = key as? String ?: fail("host key is not a string")
             if (!validHostId(hostId)) fail("host id is not 64 hex characters")
             val fields = raw as? Map<*, *> ?: fail("record for $hostId is not an object")
-            if (fields.keys != setOf("name", "hint", "at", "ren")) {
+            if (fields.keys != setOf("name", "hint", "at", "ren", "os", "login")) {
                 fail("unexpected fields ${fields.keys} for $hostId")
             }
             val name = fields["name"] as? String ?: fail("name is not a string")
@@ -90,33 +108,14 @@ object PairedHosts {
             }
             val at = fields["at"] as? Long ?: fail("at is not an integer")
             val renamed = fields["ren"] as? Boolean ?: fail("ren is not a boolean")
-            records.add(Record(hostId, name, hint, at, renamed))
+            val platform = (fields["os"] as? Long)?.takeIf { it in 0..255 }?.toInt() ?: fail("os is not a small integer")
+            val login = fields["login"] as? Boolean ?: fail("login is not a boolean")
+            records.add(Record(hostId, name, hint, at, renamed, platform, login))
         }
         return records
     }
 
-    // ------------------------------------------------------- migration/routing
-
-    /**
-     * One-time migration from the legacy single-host prefs
-     * (paired_host / host_name / cached_hint). Null host -> nothing paired.
-     */
-    fun migrate(legacyHost: String?, legacyName: String?, legacyHint: String?): List<Record> {
-        if (legacyHost == null) return emptyList()
-        if (!validHostId(legacyHost)) {
-            throw IllegalStateException("corrupt legacy pairing: host id is not 64 hex characters")
-        }
-        val name = legacyName?.takeIf { validName(it) } ?: "PC"
-        return listOf(
-            Record(
-                hostId = legacyHost,
-                name = name,
-                cachedHint = legacyHint?.takeIf { validHint(it) },
-                pairedAt = 0L, // pairing time unknown; sorts first (oldest)
-                renamed = legacyName != null, // a stored legacy name was Accepted-reported
-            ),
-        )
-    }
+    // ---------------------------------------------------------------- routing
 
     /**
      * FCM wake routing. `{"t":"wake","host":ID,"hint":HINT}` acts only when
@@ -134,7 +133,14 @@ object PairedHosts {
     // ------------------------------------------------------------ pure merges
 
     /** Upsert after a successful connect/Accepted: keeps pairedAt and renames. */
-    fun upsertAfterAccept(records: List<Record>, hostId: String, name: String, now: Long): List<Record> {
+    fun upsertAfterAccept(
+        records: List<Record>,
+        hostId: String,
+        name: String,
+        now: Long,
+        platform: Int = NativeBridge.PLATFORM_OTHER,
+        pivLogin: Boolean = false,
+    ): List<Record> {
         require(validHostId(hostId)) { "host id is not 64 hex characters" }
         require(validName(name)) { "host name must be 1..=$MAX_NAME_BYTES UTF-8 bytes" }
         val existing = records.firstOrNull { it.hostId == hostId }
@@ -142,7 +148,7 @@ object PairedHosts {
             existing == null -> Record(hostId, name, null, now, renamed = false)
             existing.renamed -> existing // user's name wins
             else -> existing.copy(name = name)
-        }
+        }.copy(platform = platform, pivLogin = pivLogin)
         return records.filterNot { it.hostId == hostId } + updated
     }
 

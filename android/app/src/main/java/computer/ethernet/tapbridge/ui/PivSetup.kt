@@ -161,7 +161,7 @@ fun PivSetupDialogs(
                 Text(
                     "This deletes the keys in slot ${slotNames(prompt.status.certificates.keys.toList())} " +
                         "and makes new ones. Anything that used the old certificates stops working: " +
-                        "a Mac paired for login has to be paired again, and files encrypted to the old " +
+                        "a computer paired for login has to be paired again, and files encrypted to the old " +
                         "key can't be opened with this card. This can't be undone.",
                 )
             },
@@ -195,7 +195,7 @@ fun PivSetupDialogs(
                     Text(
                         "This key can work as a smart card, but it has no certificate in " +
                             "slot ${slotNames(prompt.status.missing)}. tapbridge can create a key and a " +
-                            "self-signed certificate on it, so your Mac can pair it for login.",
+                            "self-signed certificate on it, so your computer can pair it for login.",
                     )
                     if (prompt.status.contactlessBlocked == true) {
                         ContactlessWarning()
@@ -334,7 +334,7 @@ fun PivSetupDialogs(
             text = {
                 Text(
                     "Slot ${slotNames(prompt.slots)} now ${if (prompt.slots.size == 1) "has a certificate" else "have certificates"}. " +
-                        "Next time you use this key with your Mac, macOS offers to pair it for login.",
+                        "You can now pair it for login on your computer, from Your cards or the computer's tapbridge preferences.",
                 )
             },
             confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } },

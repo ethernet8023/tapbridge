@@ -22,9 +22,9 @@ data class CardInfo(
     /** [Caps] bits. */
     val caps: Int,
     val capsAt: Long,
-    /** The card's PIV identity is paired with a Mac's login. */
-    val macLogin: Boolean,
-    val macLoginAt: Long,
+    /** The card's PIV identity is paired with a PC's OS login. */
+    val login: Boolean,
+    val loginAt: Long,
     /** When the card was forgotten (0: never). */
     val deletedAt: Long,
 ) {
@@ -38,7 +38,7 @@ data class CardInfo(
 
     fun has(bits: Int) = caps and bits == bits
 
-    fun newestEdit(): Long = maxOf(labelAt, wakeAt, capsAt, macLoginAt)
+    fun newestEdit(): Long = maxOf(labelAt, wakeAt, capsAt, loginAt)
 
     /** Forgotten, and not named again since. */
     val deleted get() = deletedAt > newestEdit()
@@ -53,15 +53,15 @@ data class CardInfo(
         val (label, labelAt) = newer(label to labelAt, other.label to other.labelAt, ::compareUtf8)
         val (wake, wakeAt) = newer(wake to wakeAt, other.wake to other.wakeAt) { a, b -> a.compareTo(b) }
         val (caps, capsAt) = newer(caps to capsAt, other.caps to other.capsAt) { a, b -> a.compareTo(b) }
-        val (mac, macAt) = newer(macLogin to macLoginAt, other.macLogin to other.macLoginAt) { a, b -> a.compareTo(b) }
-        return CardInfo(uid, label, labelAt, wake, wakeAt, caps, capsAt, mac, macAt, maxOf(deletedAt, other.deletedAt))
+        val (login, loginAt) = newer(login to loginAt, other.login to other.loginAt) { a, b -> a.compareTo(b) }
+        return CardInfo(uid, label, labelAt, wake, wakeAt, caps, capsAt, login, loginAt, maxOf(deletedAt, other.deletedAt))
     }
 
     override fun equals(other: Any?): Boolean =
         other is CardInfo && uid.contentEquals(other.uid) && label == other.label &&
             labelAt == other.labelAt && wake == other.wake && wakeAt == other.wakeAt &&
-            caps == other.caps && capsAt == other.capsAt && macLogin == other.macLogin &&
-            macLoginAt == other.macLoginAt && deletedAt == other.deletedAt
+            caps == other.caps && capsAt == other.capsAt && login == other.login &&
+            loginAt == other.loginAt && deletedAt == other.deletedAt
 
     override fun hashCode(): Int = uid.contentHashCode() * 31 + labelAt.hashCode()
 
@@ -231,16 +231,6 @@ object Cards {
         return out.toString().trimEnd().takeIf { it.isNotEmpty() }
     }
 
-    private const val K_SEEN_MAC = "seen_mac"
-
-    /** This phone has connected to a Mac: Mac login is worth showing. */
-    fun seenMac(ctx: Context): Boolean =
-        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(K_SEEN_MAC, false)
-
-    fun markSeenMac(ctx: Context) {
-        if (!seenMac(ctx)) ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(K_SEEN_MAC, true).apply()
-    }
-
     /** The first free "Card N". */
     fun defaultLabel(ctx: Context): String {
         val taken = list(ctx).map { it.label }.toSet()
@@ -259,7 +249,7 @@ object Cards {
         ) { "cards could not be saved" }
     }
 
-    /** Header line, then `UID|LABEL_AT|WAKE|WAKE_AT|CAPS|CAPS_AT|MAC|MAC_AT|DELETED_AT|LABEL`. */
+    /** Header line, then `UID|LABEL_AT|WAKE|WAKE_AT|CAPS|CAPS_AT|LOGIN|LOGIN_AT|DELETED_AT|LABEL`. */
     fun encode(cards: List<CardInfo>): String = buildString {
         append(HEADER)
         for (c in cards) {
@@ -267,7 +257,7 @@ object Cards {
             append(
                 listOf(
                     hex(c.uid), c.labelAt, if (c.wake) 1 else 0, c.wakeAt, c.caps, c.capsAt,
-                    if (c.macLogin) 1 else 0, c.macLoginAt, c.deletedAt, c.label,
+                    if (c.login) 1 else 0, c.loginAt, c.deletedAt, c.label,
                 ).joinToString("|"),
             )
         }
@@ -289,8 +279,8 @@ object Cards {
                     wakeAt = p[3].toLong(),
                     caps = p[4].toInt(),
                     capsAt = p[5].toLong(),
-                    macLogin = flag(p[6]) ?: return@runCatching null,
-                    macLoginAt = p[7].toLong(),
+                    login = flag(p[6]) ?: return@runCatching null,
+                    loginAt = p[7].toLong(),
                     deletedAt = p[8].toLong(),
                     label = p[9],
                 )

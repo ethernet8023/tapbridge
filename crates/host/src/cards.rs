@@ -2,7 +2,7 @@
 //!
 //! Every card is a [`CardInfo`] (see `tapbridge_core::cards`): name, the
 //! phone's "open tapbridge when tapped" flag, what the card supports, and
-//! whether it is paired with this Mac's login, each with its own edit time.
+//! whether it is paired with a PC's OS login, each with its own edit time.
 //! Cards are added only when the user names one (on either device); a tap
 //! of an unknown card is reported so the UI can offer that.
 //!
@@ -14,7 +14,7 @@
 //!
 //! ```text
 //! tapbridge-cards 2
-//! UID LABEL_AT WAKE WAKE_AT CAPS CAPS_AT MAC_LOGIN MAC_LOGIN_AT DELETED_AT LAST_SEEN ATR LABEL
+//! UID LABEL_AT WAKE WAKE_AT CAPS CAPS_AT SETUP_LOGIN MAC_LOGIN_AT DELETED_AT LAST_SEEN ATR LABEL
 //! ```
 //!
 //! Tab-separated; UID and ATR in hex, times in Unix milliseconds, flags 0/1,
@@ -124,8 +124,8 @@ fn parse_line(line: &str) -> Option<KnownCard> {
     let wake_at = next()?.parse().ok()?;
     let caps = next()?.parse().ok()?;
     let caps_at = next()?.parse().ok()?;
-    let mac_login = flag(next()?)?;
-    let mac_login_at = next()?.parse().ok()?;
+    let login = flag(next()?)?;
+    let login_at = next()?.parse().ok()?;
     let deleted_at = next()?.parse().ok()?;
     let last_seen = next()?.parse().ok()?;
     let atr = unhex(next()?)?;
@@ -138,8 +138,8 @@ fn parse_line(line: &str) -> Option<KnownCard> {
         wake_at,
         caps,
         caps_at,
-        mac_login,
-        mac_login_at,
+        login,
+        login_at,
         deleted_at,
     };
     (info.valid() && uid_stable(&info.uid) && atr.len() <= tapbridge_core::wire::MAX_ATR).then_some(
@@ -171,8 +171,8 @@ pub fn serialize(cards: &[KnownCard]) -> String {
             info.wake_at,
             info.caps,
             info.caps_at,
-            u8::from(info.mac_login),
-            info.mac_login_at,
+            u8::from(info.login),
+            info.login_at,
             info.deleted_at,
             card.last_seen,
             hex(&card.atr),
@@ -253,7 +253,7 @@ impl KnownCards {
         let index = match self.cards.iter().position(|card| card.info.uid == uid) {
             Some(index) => {
                 // Revive: newer label and wake stamps outrank the tombstone;
-                // what was known about the card (caps, Mac login) is kept.
+                // what was known about the card (caps, login) is kept.
                 let info = &mut self.cards[index].info;
                 let now = now.max(info.deleted_at + 1);
                 info.label = label;
@@ -355,11 +355,11 @@ impl KnownCards {
         })
     }
 
-    pub fn set_mac_login(&mut self, uid: &[u8], paired: bool, now: u64) -> Option<&CardInfo> {
+    pub fn set_login(&mut self, uid: &[u8], paired: bool, now: u64) -> Option<&CardInfo> {
         self.edit(uid, |info| {
-            if info.mac_login != paired {
-                info.mac_login = paired;
-                info.mac_login_at = now;
+            if info.login != paired {
+                info.login = paired;
+                info.login_at = now;
             }
         })
     }
@@ -561,8 +561,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cards = KnownCards::open(dir.path());
         cards.add(&UID, "PC name", &[], 10);
-        cards.set_mac_login(&UID, true, 20);
-        // The phone renamed it later but doesn't know about the Mac login.
+        cards.set_login(&UID, true, 20);
+        // The phone renamed it later but doesn't know about the login.
         let phone = CardInfo {
             label: "Phone name".into(),
             label_at: 30,
@@ -570,9 +570,9 @@ mod tests {
         };
         let (reply, changed) = cards.merge(&phone);
         assert!(changed);
-        let reply = reply.expect("the phone is missing the Mac login");
+        let reply = reply.expect("the phone is missing the login");
         assert_eq!(reply.label, "Phone name");
-        assert!(reply.mac_login);
+        assert!(reply.login);
         // Merging the reply again settles: nothing to send, nothing new.
         assert_eq!(cards.merge(&reply), (None, false));
     }
@@ -644,7 +644,7 @@ mod tests {
         let info = cards.set_wake(&UID, false, 7).unwrap();
         assert!(!info.wake);
         assert_eq!(info.wake_at, 7);
-        assert!(cards.set_mac_login(&UID, true, 8).unwrap().mac_login);
+        assert!(cards.set_login(&UID, true, 8).unwrap().login);
         assert!(
             cards.rename(&[0x04, 9, 9, 9], "Nope", 9).is_none(),
             "unknown"
@@ -657,14 +657,14 @@ mod tests {
         let mut cards = KnownCards::open(dir.path());
         cards.add(&UID, "hand \u{270b}", &atr_with(b"x"), 10);
         cards.note_caps(&UID, caps::FIDO | caps::CERTS, 11);
-        cards.set_mac_login(&UID, true, 12);
+        cards.set_login(&UID, true, 12);
         cards.add(&[0x04, 7, 7, 7], "Gone", &[], 13);
         cards.forget(&[0x04, 7, 7, 7], 14);
         cards.save().unwrap();
         let reopened = KnownCards::open(dir.path());
         assert_eq!(reopened.records().count(), 2, "tombstones are kept");
         assert_eq!(reopened.list(), cards.list());
-        assert!(reopened.list()[0].info.mac_login);
+        assert!(reopened.list()[0].info.login);
         let text = fs::read_to_string(dir.path().join(FILE)).unwrap();
         assert!(
             text.starts_with("tapbridge-cards 2\n04112233445566\t10\t1\t10\t7\t11\t1\t12\t0\t")

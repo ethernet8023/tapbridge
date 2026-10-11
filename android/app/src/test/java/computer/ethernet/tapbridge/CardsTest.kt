@@ -9,12 +9,12 @@ class CardsTest {
 
     @Test fun eachFieldTakesTheNewerEditInAnyOrder() {
         val phone = card("Ring", 10).copy(label = "Phone", labelAt = 30)
-        val pc = card("Ring", 10).copy(macLogin = true, macLoginAt = 20, caps = 7, capsAt = 25)
+        val pc = card("Ring", 10).copy(login = true, loginAt = 20, caps = 7, capsAt = 25)
         val a = phone.merge(pc)
         val b = pc.merge(phone)
         assertEquals(a, b)
         assertEquals("Phone", a.label)
-        assertTrue(a.macLogin)
+        assertTrue(a.login)
         assertEquals(7, a.caps)
         assertEquals(a, a.merge(phone))
     }
@@ -54,7 +54,7 @@ class CardsTest {
 
     @Test fun encodingRoundTripsAndRejectsOtherFormats() {
         val cards = listOf(
-            card("Hand | ring", 10).copy(macLogin = true, macLoginAt = 12, caps = 7),
+            card("Hand | ring", 10).copy(login = true, loginAt = 12, caps = 7),
             CardInfo.new(byteArrayOf(4, 9, 9, 9), "Gone", 0, 1).copy(deletedAt = 2),
         )
         assertEquals(cards, Cards.decode(Cards.encode(cards)))

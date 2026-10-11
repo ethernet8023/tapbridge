@@ -6,36 +6,14 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Multi-PC pairing logic (Track C). Pure JVM tests: the store codec, the
- * legacy migration, wake routing and the per-host merges are all pure
+ * Multi-PC pairing logic (Track C). Pure JVM tests: the store codec,
+ * wake routing and the per-host merges are all pure
  * functions in [PairedHosts] with no Android dependencies.
  */
 class PairedHostsTest {
     private val hostA = "a".repeat(64)
     private val hostB = "b".repeat(64)
     private val hostC = "c".repeat(64)
-
-    // ------------------------------------------------------------ migration
-
-    @Test fun migrationCarriesTheLegacySinglePairing() {
-        val records = PairedHosts.migrate(hostA, "Office PC", "hint-a")
-        assertEquals(listOf(PairedHosts.Record(hostA, "Office PC", "hint-a", 0L, renamed = true)), records)
-    }
-
-    @Test fun migrationWithoutLegacyNameFallsBackToGeneric() {
-        val records = PairedHosts.migrate(hostA, null, null)
-        assertEquals("PC", records.single().name)
-        assertNull(records.single().cachedHint)
-    }
-
-    @Test fun unpairedLegacyStateMigratesToEmpty() {
-        assertTrue(PairedHosts.migrate(null, "ignored", "ignored").isEmpty())
-    }
-
-    @Test(expected = IllegalStateException::class)
-    fun corruptLegacyHostIdFailsLoudlyInsteadOfSilentRekey() {
-        PairedHosts.migrate("not-hex", "Office PC", null)
-    }
 
     // ---------------------------------------------------------- wake routing
 
@@ -85,6 +63,16 @@ class PairedHostsTest {
         val updated = PairedHosts.upsertAfterAccept(records, hostA, "New name", 99L)
         assertEquals("New name", updated.single().name)
         assertEquals(1L, updated.single().pairedAt)
+    }
+
+    @Test fun acceptedRecordsWhatThePcCanDo() {
+        var records = PairedHosts.upsertAfterAccept(emptyList(), hostA, "Mac", 1L, NativeBridge.PLATFORM_MACOS, true)
+        assertEquals("Mac", records.single().osName)
+        assertTrue(records.single().pivLogin)
+        // A later Accepted replaces both (the PC may have changed).
+        records = PairedHosts.upsertAfterAccept(records, hostA, "Win", 2L, NativeBridge.PLATFORM_WINDOWS, false)
+        assertEquals("Windows PC", records.single().osName)
+        assertTrue(!records.single().pivLogin)
     }
 
     @Test fun userRenameWinsOverLaterAccepted() {
@@ -143,7 +131,7 @@ class PairedHostsTest {
     @Test fun encodeDecodeRoundTripsManyHosts() {
         val records = listOf(
             PairedHosts.Record(hostA, "Office \"PC\"", "hint-a", 123L, renamed = true),
-            PairedHosts.Record(hostB, "Mac\nBook", null, 456L),
+            PairedHosts.Record(hostB, "Mac\nBook", null, 456L, platform = NativeBridge.PLATFORM_MACOS, pivLogin = true),
             PairedHosts.Record(hostC, "Unicode ✓ ☃", "h3", 7L),
         )
         assertEquals(records, PairedHosts.decode(PairedHosts.encode(records)))
@@ -171,37 +159,39 @@ class PairedHostsTest {
         assertTrue(PairedHosts.decode(PairedHosts.encode(emptyList()) + " \n").isEmpty())
     }
 
-    @Test(expected = IllegalStateException::class)
-    fun unknownVersionIsRejected() {
-        PairedHosts.decode("{\"v\":2,\"hosts\":{}}")
+    @Test fun anotherVersionReadsAsNothingPaired() {
+        // No migration: an older store is wiped, not converted.
+        val old = "{\"v\":1,\"hosts\":{\"" + hostA + "\":{\"name\":\"PC\",\"hint\":null,\"at\":1,\"ren\":false,\"os\":0,\"login\":false}}}"
+        assertTrue(PairedHosts.decode(old).isEmpty())
+        assertTrue(PairedHosts.decode("{\"v\":3,\"hosts\":{}}").isEmpty())
     }
 
     @Test(expected = IllegalStateException::class)
     fun unknownFieldsAreRejected() {
         PairedHosts.decode(
-            "{\"v\":1,\"hosts\":{\"" + hostA + "\":{\"name\":\"PC\",\"hint\":null,\"at\":1,\"ren\":false,\"extra\":1}}}",
+            "{\"v\":2,\"hosts\":{\"" + hostA + "\":{\"name\":\"PC\",\"hint\":null,\"at\":1,\"ren\":false,\"os\":0,\"login\":false,\"extra\":1}}}",
         )
     }
 
     @Test(expected = IllegalStateException::class)
     fun badHostIdIsRejected() {
         PairedHosts.decode(
-            "{\"v\":1,\"hosts\":{\"short\":{\"name\":\"PC\",\"hint\":null,\"at\":1,\"ren\":false}}}",
+            "{\"v\":2,\"hosts\":{\"short\":{\"name\":\"PC\",\"hint\":null,\"at\":1,\"ren\":false,\"os\":0,\"login\":false}}}",
         )
     }
 
     @Test(expected = IllegalStateException::class)
     fun overlengthNameIsRejected() {
         PairedHosts.decode(
-            "{\"v\":1,\"hosts\":{\"" + hostA + "\":{\"name\":\"" + "x".repeat(65) +
-                "\",\"hint\":null,\"at\":1,\"ren\":false}}}",
+            "{\"v\":2,\"hosts\":{\"" + hostA + "\":{\"name\":\"" + "x".repeat(65) +
+                "\",\"hint\":null,\"at\":1,\"ren\":false,\"os\":0,\"login\":false}}}",
         )
     }
 
     @Test(expected = IllegalStateException::class)
     fun fractionalNumbersAreRejected() {
         PairedHosts.decode(
-            "{\"v\":1,\"hosts\":{\"" + hostA + "\":{\"name\":\"PC\",\"hint\":null,\"at\":1.5,\"ren\":false}}}",
+            "{\"v\":2,\"hosts\":{\"" + hostA + "\":{\"name\":\"PC\",\"hint\":null,\"at\":1.5,\"ren\":false,\"os\":0,\"login\":false}}}",
         )
     }
 

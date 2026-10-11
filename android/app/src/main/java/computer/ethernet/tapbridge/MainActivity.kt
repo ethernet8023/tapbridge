@@ -46,7 +46,7 @@ import androidx.core.view.WindowCompat
 import computer.ethernet.tapbridge.ui.HomeScreen
 import computer.ethernet.tapbridge.ui.AddCardDialogs
 import computer.ethernet.tapbridge.ui.CardsScreen
-import computer.ethernet.tapbridge.ui.MacLink
+import computer.ethernet.tapbridge.ui.LoginTarget
 import computer.ethernet.tapbridge.ui.PendingCard
 import computer.ethernet.tapbridge.ui.PairScreen
 import computer.ethernet.tapbridge.ui.PivPrompt
@@ -91,10 +91,12 @@ class MainActivity : ComponentActivity() {
         var cards by mutableStateOf<List<CardInfo>>(emptyList())
         /** OS of the PC on the live session (NativeBridge.PLATFORM_*), -1 without one. */
         var hostPlatform by mutableStateOf(-1)
-        /** Hex UID of the card whose Mac login is running on the Mac. */
-        var macLoginBusy by mutableStateOf<String?>(null)
-        /** How the last Mac login request ended, shown once. */
-        var macLoginResult by mutableStateOf<String?>(null)
+        /** The PC on the live session can pair a card with its login. */
+        var hostPivLogin by mutableStateOf(false)
+        /** Hex UID of the card whose login is being set up on the PC. */
+        var loginBusy by mutableStateOf<String?>(null)
+        /** How the last login setup request ended, shown once. */
+        var loginResult by mutableStateOf<String?>(null)
         /** Phone-side PIV setup offer/flow; null when none is showing. */
         var pivPrompt by mutableStateOf<PivPrompt?>(null)
         /** A pairing code opened as a tapbridge: link, waiting for "Pair". */
@@ -124,7 +126,8 @@ class MainActivity : ComponentActivity() {
                     val connected = status == TapBridgeService.Status.CONNECTED
                     it.connectedHost = if (connected) service?.targetHost else null
                     it.hostPlatform = if (connected) service?.hostPlatform ?: -1 else -1
-                    if (!connected) it.macLoginBusy = null
+                    it.hostPivLogin = connected && service?.hostPivLogin == true
+                    if (!connected) it.loginBusy = null
                 }
             }
         }
@@ -140,13 +143,14 @@ class MainActivity : ComponentActivity() {
         override fun onSetupCerts(uid: ByteArray) {
             runOnUiThread { startHostPivSetup(uid) }
         }
-        override fun onMacLoginDone(uid: ByteArray, ok: Boolean) {
+        override fun onLoginDone(uid: ByteArray, ok: Boolean) {
             runOnUiThread {
                 val ui = state ?: return@runOnUiThread
-                if (ui.macLoginBusy != Cards.hex(uid)) return@runOnUiThread
-                ui.macLoginBusy = null
+                if (ui.loginBusy != Cards.hex(uid)) return@runOnUiThread
+                ui.loginBusy = null
                 val name = Cards.get(this@MainActivity, uid)?.label ?: "The card"
-                ui.macLoginResult = if (ok) "\u201C$name\u201D now unlocks your Mac." else "Mac login wasn't set up. Check your Mac for details."
+                val pc = PairedHosts.osName(ui.hostPlatform)
+                ui.loginResult = if (ok) "\u201C$name\u201D now unlocks your $pc." else "Login wasn't set up. Check your $pc for details."
             }
         }
     }
@@ -166,6 +170,7 @@ class MainActivity : ComponentActivity() {
             state?.authState = service?.authState ?: AuthState.IDLE
             state?.connectedHost = service?.takeIf { it.status == TapBridgeService.Status.CONNECTED }?.targetHost
             state?.hostPlatform = service?.takeIf { it.status == TapBridgeService.Status.CONNECTED }?.hostPlatform ?: -1
+            state?.hostPivLogin = service?.takeIf { it.status == TapBridgeService.Status.CONNECTED }?.hostPivLogin == true
             deliverForwardedTag()
             if (resumed) service?.takePendingPivSetup()?.let { startHostPivSetup(it) }
         }
@@ -240,13 +245,13 @@ class MainActivity : ComponentActivity() {
         state?.pivPrompt = PivPrompt.Scan
     }
 
-    /** Your cards -> "Set up" Mac login: the Mac pairs it. */
-    internal fun requestMacLogin(card: CardInfo) {
+    /** Your cards -> "Set up" login: the connected PC pairs it. */
+    internal fun requestLogin(card: CardInfo) {
         val ui = state ?: return
-        if (service?.requestMacLogin(card.uid) == true) {
-            ui.macLoginBusy = Cards.hex(card.uid)
+        if (service?.requestLogin(card.uid) == true) {
+            ui.loginBusy = Cards.hex(card.uid)
         } else {
-            ui.macLoginResult = "Connect to your Mac first."
+            ui.loginResult = "Connect to a computer that supports card login first."
         }
     }
 
@@ -670,15 +675,14 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
                 )
                 "cards" -> CardsScreen(
                     cards = ui.cards,
-                    mac = if (ui.hostPlatform == NativeBridge.PLATFORM_MACOS) MacLink.CONNECTED else MacLink.NONE,
-                    showMacLogin = Cards.seenMac(context) || ui.cards.any { it.macLogin },
-                    macLoginBusy = ui.macLoginBusy,
+                    login = loginTarget(ui, hosts),
+                    loginBusy = ui.loginBusy,
                     onAddCard = { ui.addKeyError = null; ui.addKeyMode = true },
                     onRename = { card, label -> Cards.rename(context, card.uid, label) },
                     onForget = { card -> Cards.forget(context, card.uid) },
                     onWake = { card, wake -> Cards.setWake(context, card.uid, wake) },
                     onSetUpCerts = { card -> activity.startPivSetup(card) },
-                    onMacLogin = { card -> activity.requestMacLogin(card) },
+                    onSetUpLogin = { card -> activity.requestLogin(card) },
                     onBack = { screen = "home" },
                     Modifier.fillMaxSize(),
                 )
@@ -720,7 +724,7 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
                 else -> HomeScreen(
                     ui = ui,
                     onStartPair = { screen = "pair" },
-                    onKeys = { screen = "cards" },
+                    onKeys = { hosts = IdentityStore.pairedHosts(context); screen = "cards" },
                     // Pairing completes in the background after the scan,
                     // so read the list fresh each time Settings opens.
                     onSettings = { hosts = IdentityStore.pairedHosts(context); screen = "settings" },
@@ -739,12 +743,12 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
         onSave = { card, label -> activity.savePendingCard(card, label) },
         onDiscard = { activity.discardPendingCard() },
     )
-    ui.macLoginResult?.let { text ->
+    ui.loginResult?.let { text ->
         AlertDialog(
-            onDismissRequest = { ui.macLoginResult = null },
-            title = { Text("Mac login") },
+            onDismissRequest = { ui.loginResult = null },
+            title = { Text("Card login") },
             text = { Text(text) },
-            confirmButton = { TextButton(onClick = { ui.macLoginResult = null }) { Text("OK") } },
+            confirmButton = { TextButton(onClick = { ui.loginResult = null }) { Text("OK") } },
         )
     }
     // After the add-card dialogs, so a new card is named first.
@@ -767,6 +771,20 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
             },
             onDismiss = { activity.endPiv() },
         )
+    }
+}
+
+/**
+ * The login step for Your cards: shown when any paired PC supports card
+ * login, named after that PC's OS (the connected one when it supports it).
+ */
+private fun loginTarget(ui: MainActivity.UiState, hosts: List<PairedHosts.Record>): LoginTarget? {
+    if (ui.hostPivLogin) return LoginTarget(PairedHosts.osName(ui.hostPlatform), connected = true)
+    val capable = hosts.filter { it.pivLogin }.map { it.osName }.distinct()
+    return when (capable.size) {
+        0 -> null
+        1 -> LoginTarget(capable[0], connected = false)
+        else -> LoginTarget("computer", connected = false)
     }
 }
 

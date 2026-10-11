@@ -8,7 +8,7 @@ use crate::macos;
 use crate::{
     autostart,
     card_tasks::{CardTask, Effect},
-    hostname, logging,
+    hostname, logging, login,
     tray::{MenuAction, Tray, TrayState},
     ui, wake,
 };
@@ -62,12 +62,10 @@ pub enum UiEvent {
     #[cfg(not(windows))]
     WakeRequested,
     Woke(wake::WakeResult),
-    /// "Use for Mac login" finished: (ok, message).
-    #[cfg(target_os = "macos")]
-    MacLoginDone(bool, String),
-    /// macOS: whether this card's identity is paired with the Mac login
-    /// (read from `sc_auth identities` after a tap).
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// Setting up the card's login (see `login`) finished: (ok, message).
+    LoginDone(bool, String),
+    /// Whether this card's identity is paired with the login, read after a
+    /// tap (`login::present_card_paired`).
     LoginChecked(Vec<u8>, bool),
 }
 
@@ -108,7 +106,7 @@ struct Shell {
     /// A card tapped here for the first time, just added: name it once it
     /// shows up in the list. (Cards synced from the phone are named there.)
     new_card: Option<Vec<u8>>,
-    /// The phone asked for the Mac login of this card; answer it when the
+    /// The phone asked to set up the login of this card; answer it when the
     /// pairing ends.
     phone_asked_login: Option<Vec<u8>>,
     // Held for their Drop / process-lifetime handles.
@@ -188,7 +186,7 @@ pub fn preview_ui() {
                         last_seen: "now".into(),
                         passkey: true,
                         smart_card: true,
-                        offer_mac_login: cfg!(target_os = "macos"),
+                        offer_login: login::SUPPORTED,
                         checklist: Some(crate::card_tasks::Checklist::new(&card)),
                         install_steps: crate::card_tasks::install_steps(&flex, false),
                         flexsecure: true,
@@ -458,9 +456,10 @@ fn tick(inbox: &mpsc::Receiver<UiEvent>, cx: &mut App) {
                     }
                 }
             }
-            #[cfg(target_os = "macos")]
-            service::Event::CardPresent { present: true, uid } if !uid.is_empty() => {
-                check_mac_login(uid.clone(), cx);
+            service::Event::CardPresent { present: true, uid }
+                if login::SUPPORTED && !uid.is_empty() =>
+            {
+                check_login(uid.clone(), cx);
             }
             // A tap of a card this PC doesn't know adds it under the
             // suggested name; the CardsChanged that follows opens the New
@@ -631,19 +630,21 @@ fn handle_event(event: UiEvent, cx: &mut App) {
                 shell.refresh_tray();
             });
         }
-        #[cfg(target_os = "macos")]
-        UiEvent::MacLoginDone(ok, text) => {
-            logging::log(&format!("mac login: pairing finished, ok={ok}"));
+        UiEvent::LoginDone(ok, text) => {
+            logging::log(&format!("login: pairing finished, ok={ok}"));
             cx.update_global::<Shell, _>(|shell, _| {
                 if let Some(task) = shell.card_task.as_mut() {
                     task.paired(ok, text);
                     if let Some(service) = shell.service.as_ref() {
                         if ok {
-                            service
-                                .edit_card(task.uid.clone(), service::CardEdit::SetMacLogin(true));
+                            service.edit_card(task.uid.clone(), service::CardEdit::SetLogin(true));
                         }
                         if shell.phone_asked_login.as_ref() == Some(&task.uid) {
-                            service.card_action_done(task.uid.clone(), wire::action::MAC_LOGIN, ok);
+                            service.card_action_done(
+                                task.uid.clone(),
+                                wire::action::SETUP_LOGIN,
+                                ok,
+                            );
                         }
                     }
                     if shell.phone_asked_login.as_ref() == Some(&task.uid) {
@@ -655,7 +656,7 @@ fn handle_event(event: UiEvent, cx: &mut App) {
         UiEvent::LoginChecked(uid, paired) => {
             cx.update_global::<Shell, _>(|shell, _| {
                 if let Some(service) = shell.service.as_ref() {
-                    service.edit_card(uid, service::CardEdit::SetMacLogin(paired));
+                    service.edit_card(uid, service::CardEdit::SetLogin(paired));
                 }
             });
         }
@@ -730,29 +731,11 @@ fn run_card_effect(effect: Effect, cx: &mut App) {
             }
         }
         Effect::RunPairing => {
-            #[cfg(target_os = "macos")]
-            {
-                let events = cx.global::<Shell>().events.clone();
-                logging::log("mac login: pairing the card on the phone");
-                std::thread::spawn(move || {
-                    use crate::mac_login;
-                    let outcome = match mac_login::current_user() {
-                        Some(user) => mac_login::pair_present_card(
-                            &mac_login::SystemRunner,
-                            &user,
-                            6,
-                            Duration::from_secs(1),
-                        ),
-                        None => mac_login::Outcome::Failed("unknown user".into()),
-                    };
-                    let _ = events.send(UiEvent::MacLoginDone(outcome.ok(), outcome.message()));
-                });
-            }
-            #[cfg(not(target_os = "macos"))]
-            cx.update_global::<Shell, _>(|shell, _| {
-                if let Some(task) = shell.card_task.as_mut() {
-                    task.paired(false, "Only available on a Mac.".into());
-                }
+            let events = cx.global::<Shell>().events.clone();
+            logging::log("login: pairing the card on the phone");
+            std::thread::spawn(move || {
+                let (ok, message) = login::pair_present_card();
+                let _ = events.send(UiEvent::LoginDone(ok, message));
             });
         }
     }
@@ -857,12 +840,11 @@ fn settings_action(action: ui::SettingsAction, cx: &mut App) {
             cx.update_global::<Shell, _>(|shell, _| shell.card_task = Some(task));
             run_card_effect(effect, cx);
         }
-        #[cfg(target_os = "macos")]
-        ui::SettingsAction::MacLogin(uid) => {
-            start_mac_login(uid, cx);
+        ui::SettingsAction::SetUpLogin(uid) => {
+            if login::SUPPORTED {
+                start_login(uid, cx);
+            }
         }
-        #[cfg(not(target_os = "macos"))]
-        ui::SettingsAction::MacLogin(_) => {}
         ui::SettingsAction::CheckCard => {
             logging::log("cards: asking for a tap to check the card");
             request_tap(cx);
@@ -878,10 +860,9 @@ fn settings_action(action: ui::SettingsAction, cx: &mut App) {
     }
 }
 
-/// Starts pairing the card with this Mac's login unless another card task
+/// Starts pairing the card with this PC's login unless another card task
 /// is running. Returns whether it started.
-#[cfg(target_os = "macos")]
-fn start_mac_login(uid: Vec<u8>, cx: &mut App) -> bool {
+fn start_login(uid: Vec<u8>, cx: &mut App) -> bool {
     if cx
         .global::<Shell>()
         .card_task
@@ -897,26 +878,26 @@ fn start_mac_login(uid: Vec<u8>, cx: &mut App) -> bool {
         .map(ServiceHandle::status)
         .unwrap_or_default();
     let present = status.card_present && status.card_uid == uid;
-    let (task, effect) = CardTask::mac_login(uid, present, Instant::now());
+    let (task, effect) = CardTask::login(uid, present, Instant::now());
     cx.update_global::<Shell, _>(|shell, _| shell.card_task = Some(task));
     run_card_effect(effect, cx);
     true
 }
 
-/// The phone asks this PC to do something for a card. Only the Mac login
-/// runs here; anything else is answered as failed.
+/// The phone asks this PC to do something for a card. Only the login
+/// setup runs here (where supported); anything else is answered as failed.
 fn card_action_requested(uid: Vec<u8>, action: u8, cx: &mut App) {
-    #[cfg(target_os = "macos")]
-    if action == wire::action::MAC_LOGIN
+    if login::SUPPORTED
+        && action == wire::action::SETUP_LOGIN
         && cx
             .global::<Shell>()
             .cards
             .iter()
             .any(|card| card.info.uid == uid)
     {
-        logging::log("mac login: the phone asked to pair a card");
+        logging::log("login: the phone asked to pair a card");
         open_settings(cx);
-        if start_mac_login(uid.clone(), cx) {
+        if start_login(uid.clone(), cx) {
             cx.update_global::<Shell, _>(|shell, _| shell.phone_asked_login = Some(uid.clone()));
             if let Some(window) = cx.global::<Shell>().settings {
                 ui::settings_open_login(window, uid, cx);
@@ -929,12 +910,10 @@ fn card_action_requested(uid: Vec<u8>, action: u8, cx: &mut App) {
     }
 }
 
-/// macOS: after a known card arrives, reads `sc_auth identities` (never
-/// pairs) to learn whether its login identity is already paired, so a
-/// pairing made outside tapbridge shows up too. Only for cards that hold
-/// certificates; macOS's token driver needs a moment, hence the retries.
-#[cfg(target_os = "macos")]
-fn check_mac_login(uid: Vec<u8>, cx: &mut App) {
+/// After a known card arrives, reads (never pairs) whether its login
+/// identity is already paired, so a pairing made outside tapbridge shows
+/// up too. Only for cards that hold certificates.
+fn check_login(uid: Vec<u8>, cx: &mut App) {
     let shell = cx.global::<Shell>();
     if !shell
         .cards
@@ -946,10 +925,7 @@ fn check_mac_login(uid: Vec<u8>, cx: &mut App) {
     }
     let events = shell.events.clone();
     std::thread::spawn(move || {
-        use crate::mac_login;
-        if let Some(paired) =
-            mac_login::present_card_paired(&mac_login::SystemRunner, 4, Duration::from_secs(1))
-        {
+        if let Some(paired) = login::present_card_paired() {
             let _ = events.send(UiEvent::LoginChecked(uid, paired));
         }
     });
@@ -1071,7 +1047,7 @@ impl Shell {
                     task_failed: task.is_some_and(CardTask::failed),
                     task_finished: task.is_some_and(|task| !task.busy()),
                     task_dismissable: task.is_some_and(CardTask::dismissable),
-                    offer_mac_login: cfg!(target_os = "macos")
+                    offer_login: login::SUPPORTED
                         && (card.has(caps::CERTS) || self.setup_ok.contains(&card.uid)),
                     checklist: Some(crate::card_tasks::Checklist::new(card)),
                     install_steps: crate::card_tasks::install_steps(

@@ -175,7 +175,7 @@ class NfcCardSession(private val gate: NativeGate) {
                 gate.withHandle(h) {
                     NativeBridge.cardInfo(
                         it, card.uid, card.label, card.labelAt, card.wake, card.wakeAt,
-                        card.caps, card.capsAt, card.macLogin, card.macLoginAt, card.deletedAt,
+                        card.caps, card.capsAt, card.login, card.loginAt, card.deletedAt,
                     )
                 }
             }

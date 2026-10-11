@@ -114,8 +114,8 @@ pub enum CardEdit {
     Rename(String),
     /// The phone's "open tapbridge when tapped".
     SetWake(bool),
-    /// Whether the card is paired with this Mac's login.
-    SetMacLogin(bool),
+    /// Whether the card is paired with this PC's OS login.
+    SetLogin(bool),
     /// What this PC found the card supports ([`crate::cards::caps`]).
     NoteCaps(u8),
     Forget,
@@ -550,7 +550,7 @@ async fn run_inner(
                                 CardEdit::Add(label) => known.add(&uid, &label, &atr, now),
                                 CardEdit::Rename(label) => known.rename(&uid, &label, now),
                                 CardEdit::SetWake(wake) => known.set_wake(&uid, wake, now),
-                                CardEdit::SetMacLogin(paired) => known.set_mac_login(&uid, paired, now),
+                                CardEdit::SetLogin(paired) => known.set_login(&uid, paired, now),
                                 CardEdit::NoteCaps(seen) => known.note_caps(&uid, seen, now),
                                 CardEdit::Forget => known.forget(&uid, now),
                             }
@@ -1029,6 +1029,7 @@ mod tests {
             transport::HelloReply::Accepted {
                 host_name: "Test PC".into(),
                 platform: wire::platform::current(),
+                piv_login: wire::platform::piv_login(),
             }
         );
         let mut collector = Collector {
@@ -1463,9 +1464,9 @@ mod tests {
         let _session = crate::test_session();
         let (handle, mut collector, mut phone) = paired_service(dir.path(), "Pixel", None).await;
         assert!(handle.edit_card(IMPLANT.to_vec(), CardEdit::Add("PC name".into())));
-        assert!(handle.edit_card(IMPLANT.to_vec(), CardEdit::SetMacLogin(true)));
+        assert!(handle.edit_card(IMPLANT.to_vec(), CardEdit::SetLogin(true)));
         // The phone renamed it (later) and read its caps, but doesn't know
-        // about the Mac login.
+        // about the login.
         let mut theirs = tapbridge_core::cards::CardInfo::new(
             IMPLANT.to_vec(),
             "Phone name".into(),
@@ -1488,10 +1489,10 @@ mod tests {
         else {
             unreachable!()
         };
-        assert!(back.mac_login, "the PC's newer field goes back");
+        assert!(back.login, "the PC's newer field goes back");
         let card = handle.known_cards().remove(0);
         assert_eq!(card.info.label, "Phone name");
-        assert!(card.info.has(crate::cards::caps::FIDO) && card.info.mac_login);
+        assert!(card.info.has(crate::cards::caps::FIDO) && card.info.login);
         handle.shutdown();
         transport::close(&phone.conn);
         drop(phone.endpoint);
@@ -1523,25 +1524,25 @@ mod tests {
         collector
             .wait(|event| matches!(event, Event::CardActionDone { ok: true, action, .. } if *action == wire::action::SETUP_CERTS))
             .await;
-        // The phone asks the PC for the Mac login; the PC answers.
+        // The phone asks the PC to set up its login; the PC answers.
         wire::write_frame(
             &mut phone.send,
             &Frame::CardAction {
                 uid: IMPLANT.to_vec(),
-                action: wire::action::MAC_LOGIN,
+                action: wire::action::SETUP_LOGIN,
             },
         )
         .await
         .unwrap();
         collector
-            .wait(|event| matches!(event, Event::CardActionRequested { action, .. } if *action == wire::action::MAC_LOGIN))
+            .wait(|event| matches!(event, Event::CardActionRequested { action, .. } if *action == wire::action::SETUP_LOGIN))
             .await;
-        assert!(handle.card_action_done(IMPLANT.to_vec(), wire::action::MAC_LOGIN, false));
+        assert!(handle.card_action_done(IMPLANT.to_vec(), wire::action::SETUP_LOGIN, false));
         assert_eq!(
             read_until(&mut phone, |f| matches!(f, Frame::CardActionDone { .. })).await,
             Frame::CardActionDone {
                 uid: IMPLANT.to_vec(),
-                action: wire::action::MAC_LOGIN,
+                action: wire::action::SETUP_LOGIN,
                 ok: false
             }
         );
