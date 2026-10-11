@@ -1,19 +1,25 @@
-//! Cards seen through the phone, keyed by NFC UID, plus the passive
-//! capability probe that fills in what each card can do.
+//! Cards known on this PC, synced with the phone.
+//!
+//! Every card is a [`CardInfo`] (see `tapbridge_core::cards`): name, the
+//! phone's "open tapbridge when tapped" flag, what the card supports, and
+//! whether it is paired with this Mac's login, each with its own edit time.
+//! Cards are added only when the user names one (on either device); a tap
+//! of an unknown card is reported so the UI can offer that.
+//!
+//! The PC keeps two things the phone doesn't need: when each card was last
+//! seen and its ATR (for the install instructions). Both are local only.
 //!
 //! Plain text file `cards.txt` in the state directory (nothing here is
-//! secret). Format, one card per line after a header line:
+//! secret), one card per line after the header:
 //!
 //! ```text
-//! tapbridge-cards 1
-//! UID_HEX \t FIRST_SEEN \t LAST_SEEN \t ATR_HEX \t FLAGS \t LABEL
+//! tapbridge-cards 2
+//! UID LABEL_AT WAKE WAKE_AT CAPS CAPS_AT MAC_LOGIN MAC_LOGIN_AT DELETED_AT LAST_SEEN ATR LABEL
 //! ```
 //!
-//! Times are Unix seconds. FLAGS is `-` or any of `f` (FIDO applet), `p`
-//! (PIV applet), `c` (PIV authentication certificate in slot 9A), `b` (the
-//! PIV applet refuses its keys over NFC: a strict-contactless build), `m`
-//! (paired with this Mac's login). The label is last so it may hold
-//! anything but tabs and newlines.
+//! Tab-separated; UID and ATR in hex, times in Unix milliseconds, flags 0/1,
+//! CAPS a decimal bit set. The label is last so it may hold anything but
+//! tabs and newlines. Any other file is set aside as `cards.txt.bad`.
 
 use std::{
     fs,
@@ -21,53 +27,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const HEADER: &str = "tapbridge-cards 1";
+pub use tapbridge_core::cards::{CardInfo, MAX_LABEL, caps};
+
+const HEADER: &str = "tapbridge-cards 2";
 const FILE: &str = "cards.txt";
-/// Longest label kept, in characters.
-pub const MAX_LABEL: usize = 64;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KnownCard {
-    pub uid: Vec<u8>,
-    pub label: String,
-    pub first_seen: u64,
+    pub info: CardInfo,
+    /// Unix milliseconds of the last tap seen through the phone (0: never).
     pub last_seen: u64,
     pub atr: Vec<u8>,
-    pub has_fido: bool,
-    pub has_piv: bool,
-    /// A certificate is present in PIV slot 9A (PIV authentication).
-    pub piv_certs: bool,
-    /// The PIV applet answered "security status not satisfied" to a
-    /// certificate read: a strict-contactless build, unusable over NFC.
-    pub piv_blocked: bool,
-    /// The card's PIV identity is paired with this Mac's login (`sc_auth`).
-    pub mac_login: bool,
-}
-
-/// What the probe saw a card answer. Only `true` flags carry information:
-/// they are merged in, never cleared (except that a readable certificate
-/// clears `piv_blocked`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Capabilities {
-    pub has_fido: bool,
-    pub has_piv: bool,
-    pub piv_certs: bool,
-    pub piv_blocked: bool,
-}
-
-impl Capabilities {
-    pub fn any(&self) -> bool {
-        self.has_fido || self.has_piv || self.piv_certs || self.piv_blocked
-    }
-}
-
-/// Something the desktop learned about a card outside the probe.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mark {
-    /// The phone finished creating certificates on it.
-    Certificates,
-    /// Whether its identity is paired with this Mac's login.
-    MacLogin(bool),
 }
 
 /// A UID worth remembering: present, and not a random one (ISO 14443-3
@@ -92,13 +62,19 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
 }
 
 /// Cleans a user-typed label: one line, trimmed, at most [`MAX_LABEL`]
-/// characters. `None` when nothing is left.
+/// bytes (cut on a character boundary). `None` when nothing is left.
 pub fn clean_label(label: &str) -> Option<String> {
     let line: String = label
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    let trimmed: String = line.trim().chars().take(MAX_LABEL).collect();
+    let mut trimmed = String::new();
+    for c in line.trim().chars() {
+        if trimmed.len() + c.len_utf8() > MAX_LABEL {
+            break;
+        }
+        trimmed.push(c);
+    }
     let trimmed = trimmed.trim_end().to_owned();
     (!trimmed.is_empty()).then_some(trimmed)
 }
@@ -120,9 +96,8 @@ pub fn atr_name(atr: &[u8]) -> Option<String> {
         .max_by_key(String::len)
 }
 
-/// Parses the file text; `None` when it isn't a cards file at all.
-/// Malformed card lines are skipped, and a UID seen twice keeps its first
-/// line.
+/// Parses the file text; `None` when it isn't a current cards file.
+/// Malformed lines are skipped; a UID seen twice keeps its first line.
 pub fn parse(text: &str) -> Option<Vec<KnownCard>> {
     let mut lines = text.lines();
     if lines.next()? != HEADER {
@@ -133,7 +108,7 @@ pub fn parse(text: &str) -> Option<Vec<KnownCard>> {
         let Some(card) = parse_line(line) else {
             continue;
         };
-        if !cards.iter().any(|known| known.uid == card.uid) {
+        if !cards.iter().any(|known| known.info.uid == card.info.uid) {
             cards.push(card);
         }
     }
@@ -141,68 +116,75 @@ pub fn parse(text: &str) -> Option<Vec<KnownCard>> {
 }
 
 fn parse_line(line: &str) -> Option<KnownCard> {
-    let mut fields = line.splitn(6, '\t');
-    let uid = unhex(fields.next()?)?;
-    let first_seen = fields.next()?.parse().ok()?;
-    let last_seen = fields.next()?.parse().ok()?;
-    let atr = unhex(fields.next()?)?;
-    let flags = fields.next()?;
-    let label = clean_label(fields.next()?)?;
-    if !uid_stable(&uid) || uid.len() > tapbridge_core::wire::MAX_UID {
-        return None;
-    }
-    if flags != "-"
-        && !flags
-            .chars()
-            .all(|c| matches!(c, 'f' | 'p' | 'c' | 'b' | 'm'))
-    {
-        return None;
-    }
-    Some(KnownCard {
+    let mut fields = line.splitn(12, '\t');
+    let mut next = || fields.next();
+    let uid = unhex(next()?)?;
+    let label_at = next()?.parse().ok()?;
+    let wake = flag(next()?)?;
+    let wake_at = next()?.parse().ok()?;
+    let caps = next()?.parse().ok()?;
+    let caps_at = next()?.parse().ok()?;
+    let mac_login = flag(next()?)?;
+    let mac_login_at = next()?.parse().ok()?;
+    let deleted_at = next()?.parse().ok()?;
+    let last_seen = next()?.parse().ok()?;
+    let atr = unhex(next()?)?;
+    let label = clean_label(next()?)?;
+    let info = CardInfo {
         uid,
         label,
-        first_seen,
-        last_seen,
-        atr,
-        has_fido: flags.contains('f'),
-        has_piv: flags.contains('p'),
-        piv_certs: flags.contains('c'),
-        piv_blocked: flags.contains('b'),
-        mac_login: flags.contains('m'),
-    })
+        label_at,
+        wake,
+        wake_at,
+        caps,
+        caps_at,
+        mac_login,
+        mac_login_at,
+        deleted_at,
+    };
+    (info.valid() && uid_stable(&info.uid) && atr.len() <= tapbridge_core::wire::MAX_ATR).then_some(
+        KnownCard {
+            info,
+            last_seen,
+            atr,
+        },
+    )
+}
+
+fn flag(text: &str) -> Option<bool> {
+    match text {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    }
 }
 
 pub fn serialize(cards: &[KnownCard]) -> String {
     let mut text = format!("{HEADER}\n");
     for card in cards {
-        let mut flags = String::new();
-        for (set, flag) in [
-            (card.has_fido, 'f'),
-            (card.has_piv, 'p'),
-            (card.piv_certs, 'c'),
-            (card.piv_blocked, 'b'),
-            (card.mac_login, 'm'),
-        ] {
-            if set {
-                flags.push(flag);
-            }
-        }
-        if flags.is_empty() {
-            flags.push('-');
-        }
-        let label = clean_label(&card.label).unwrap_or_else(|| "Card".into());
+        let info = &card.info;
         text.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{flags}\t{label}\n",
-            hex(&card.uid),
-            card.first_seen,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            hex(&info.uid),
+            info.label_at,
+            u8::from(info.wake),
+            info.wake_at,
+            info.caps,
+            info.caps_at,
+            u8::from(info.mac_login),
+            info.mac_login_at,
+            info.deleted_at,
             card.last_seen,
             hex(&card.atr),
+            info.label,
         ));
     }
     text
 }
 
-/// The persistent list. Every change is saved right away.
+/// The persistent list, forgotten cards included (as tombstones, so the
+/// phone's older copy can't bring them back). Save with
+/// [`KnownCards::save`] after a change.
 pub struct KnownCards {
     cards: Vec<KnownCard>,
     path: PathBuf,
@@ -210,8 +192,7 @@ pub struct KnownCards {
 
 impl KnownCards {
     /// Loads `cards.txt` from `directory`. Never fails: a missing file is an
-    /// empty list, and an unreadable one is moved aside to `cards.txt.bad`
-    /// (kept for inspection, not silently overwritten).
+    /// empty list, and any other file is moved aside to `cards.txt.bad`.
     pub fn open(directory: &Path) -> Self {
         let path = directory.join(FILE);
         let cards = match fs::read(&path) {
@@ -227,93 +208,167 @@ impl KnownCards {
         Self { cards, path }
     }
 
-    pub fn list(&self) -> &[KnownCard] {
-        &self.cards
+    /// Cards the user has, oldest first (forgotten ones left out).
+    pub fn list(&self) -> Vec<KnownCard> {
+        self.cards
+            .iter()
+            .filter(|card| !card.info.deleted())
+            .cloned()
+            .collect()
+    }
+
+    /// Every record, forgotten ones included: what goes to the phone.
+    pub fn records(&self) -> impl Iterator<Item = &CardInfo> {
+        self.cards.iter().map(|card| &card.info)
     }
 
     pub fn get(&self, uid: &[u8]) -> Option<&KnownCard> {
-        self.cards.iter().find(|card| card.uid == uid)
+        self.cards
+            .iter()
+            .find(|card| card.info.uid == uid && !card.info.deleted())
     }
 
-    /// Records a tap at `now`. Returns whether the list changed (always,
-    /// for a stable UID: the last-seen time moves); cards without a stable
-    /// UID are ignored.
+    /// Records a tap. Returns whether the card is known (and so was
+    /// updated); unknown cards are left for the user to add.
     pub fn see(&mut self, uid: &[u8], atr: &[u8], now: u64) -> bool {
-        if !uid_stable(uid) || uid.len() > tapbridge_core::wire::MAX_UID {
-            return false;
-        }
-        if let Some(card) = self.cards.iter_mut().find(|card| card.uid == uid) {
-            card.last_seen = now;
-            if !atr.is_empty() {
-                card.atr = atr.to_vec();
-            }
-        } else {
-            let label = self.default_label(atr);
-            self.cards.push(KnownCard {
-                uid: uid.to_vec(),
-                label,
-                first_seen: now,
-                last_seen: now,
-                atr: atr.to_vec(),
-                ..KnownCard::default()
-            });
-        }
-        true
-    }
-
-    /// Merges newly observed capabilities. Returns whether anything changed.
-    pub fn note(&mut self, uid: &[u8], seen: Capabilities) -> bool {
-        let Some(card) = self.cards.iter_mut().find(|card| card.uid == uid) else {
-            return false;
-        };
-        let before = card.clone();
-        card.has_fido |= seen.has_fido;
-        // A certificate read (or refusal) means the PIV applet answered too.
-        card.has_piv |= seen.has_piv || seen.piv_certs || seen.piv_blocked;
-        card.piv_certs |= seen.piv_certs;
-        if seen.piv_certs {
-            // Readable now: the applet was reinstalled without the block.
-            card.piv_blocked = false;
-        } else {
-            card.piv_blocked |= seen.piv_blocked;
-        }
-        before != *card
-    }
-
-    /// Records what the desktop learned; returns whether anything changed.
-    pub fn mark(&mut self, uid: &[u8], mark: Mark) -> bool {
-        let Some(card) = self.cards.iter_mut().find(|card| card.uid == uid) else {
-            return false;
-        };
-        let before = card.clone();
-        match mark {
-            Mark::Certificates => {
-                card.has_piv = true;
-                card.piv_certs = true;
-                card.piv_blocked = false;
-            }
-            Mark::MacLogin(paired) => card.mac_login = paired,
-        }
-        before != *card
-    }
-
-    pub fn rename(&mut self, uid: &[u8], label: &str) -> bool {
-        let Some(label) = clean_label(label) else {
-            return false;
-        };
-        match self.cards.iter_mut().find(|card| card.uid == uid) {
-            Some(card) if card.label != label => {
-                card.label = label;
+        match self.live_mut(uid) {
+            Some(card) => {
+                card.last_seen = now;
+                if !atr.is_empty() {
+                    card.atr = atr.to_vec();
+                }
                 true
             }
-            _ => false,
+            None => false,
         }
     }
 
-    pub fn forget(&mut self, uid: &[u8]) -> bool {
-        let before = self.cards.len();
-        self.cards.retain(|card| card.uid != uid);
-        self.cards.len() != before
+    /// Adds (or revives) a card the user named, with "open tapbridge when
+    /// tapped" on. `None` when the UID or label is unusable.
+    pub fn add(&mut self, uid: &[u8], label: &str, atr: &[u8], now: u64) -> Option<&CardInfo> {
+        let label = clean_label(label)?;
+        if !uid_stable(uid) || uid.len() > tapbridge_core::wire::MAX_UID {
+            return None;
+        }
+        let index = match self.cards.iter().position(|card| card.info.uid == uid) {
+            Some(index) => {
+                // Revive: newer label and wake stamps outrank the tombstone;
+                // what was known about the card (caps, Mac login) is kept.
+                let info = &mut self.cards[index].info;
+                let now = now.max(info.deleted_at + 1);
+                info.label = label;
+                info.label_at = now;
+                info.wake = true;
+                info.wake_at = now;
+                index
+            }
+            None => {
+                self.cards.push(KnownCard {
+                    info: CardInfo::new(uid.to_vec(), label, true, 0, now),
+                    last_seen: 0,
+                    atr: Vec::new(),
+                });
+                self.cards.len() - 1
+            }
+        };
+        let card = &mut self.cards[index];
+        card.last_seen = now;
+        if !atr.is_empty() {
+            card.atr = atr.to_vec();
+        }
+        Some(&card.info)
+    }
+
+    /// Merges a record from the phone. Returns the merged record when it
+    /// differs from what the phone sent (send it back), and whether
+    /// anything changed here.
+    pub fn merge(&mut self, theirs: &CardInfo) -> (Option<CardInfo>, bool) {
+        if !theirs.valid() || !uid_stable(&theirs.uid) {
+            return (None, false);
+        }
+        match self
+            .cards
+            .iter_mut()
+            .find(|card| card.info.uid == theirs.uid)
+        {
+            Some(card) => {
+                let merged = card.info.merge(theirs);
+                let changed = merged != card.info;
+                card.info = merged.clone();
+                ((merged != *theirs).then_some(merged), changed)
+            }
+            None => {
+                self.cards.push(KnownCard {
+                    info: theirs.clone(),
+                    last_seen: 0,
+                    atr: Vec::new(),
+                });
+                (None, true)
+            }
+        }
+    }
+
+    /// Applies a local edit to a known card; returns the new record when it
+    /// changed.
+    fn edit(&mut self, uid: &[u8], change: impl FnOnce(&mut CardInfo)) -> Option<&CardInfo> {
+        let card = self.live_mut(uid)?;
+        let before = card.info.clone();
+        change(&mut card.info);
+        (card.info != before).then_some(&card.info)
+    }
+
+    pub fn rename(&mut self, uid: &[u8], label: &str, now: u64) -> Option<&CardInfo> {
+        let label = clean_label(label)?;
+        self.edit(uid, |info| {
+            if info.label != label {
+                info.label = label;
+                info.label_at = now;
+            }
+        })
+    }
+
+    pub fn set_wake(&mut self, uid: &[u8], wake: bool, now: u64) -> Option<&CardInfo> {
+        self.edit(uid, |info| {
+            if info.wake != wake {
+                info.wake = wake;
+                info.wake_at = now;
+            }
+        })
+    }
+
+    /// Merges what was seen on the card into its caps (the phone reads
+    /// them; the PC adds what its own traffic proves).
+    pub fn note_caps(&mut self, uid: &[u8], seen: u8, now: u64) -> Option<&CardInfo> {
+        self.edit(uid, |info| {
+            let mut caps = info.caps | seen;
+            if seen & caps::CERTS != 0 {
+                // Readable now: the applet was reinstalled without the block.
+                caps &= !caps::BLOCKED;
+            }
+            if caps & (caps::CERTS | caps::BLOCKED) != 0 {
+                caps |= caps::PIV;
+            }
+            if caps != info.caps {
+                info.caps = caps;
+                info.caps_at = now;
+            }
+        })
+    }
+
+    pub fn set_mac_login(&mut self, uid: &[u8], paired: bool, now: u64) -> Option<&CardInfo> {
+        self.edit(uid, |info| {
+            if info.mac_login != paired {
+                info.mac_login = paired;
+                info.mac_login_at = now;
+            }
+        })
+    }
+
+    /// Forgets a card; it stays forgotten on the phone too.
+    pub fn forget(&mut self, uid: &[u8], now: u64) -> Option<&CardInfo> {
+        let card = self.live_mut(uid)?;
+        card.info.deleted_at = now.max(card.info.newest_edit() + 1);
+        Some(&card.info)
     }
 
     /// Atomic replace of `cards.txt`.
@@ -330,21 +385,29 @@ impl KnownCards {
         Ok(())
     }
 
+    fn live_mut(&mut self, uid: &[u8]) -> Option<&mut KnownCard> {
+        self.cards
+            .iter_mut()
+            .find(|card| card.info.uid == uid && !card.info.deleted())
+    }
+
     /// The card's announced name, else the first free "Card N".
-    fn default_label(&self, atr: &[u8]) -> String {
+    pub fn default_label(&self, atr: &[u8]) -> String {
         if let Some(name) = atr_name(atr).and_then(|name| clean_label(&name)) {
             return name;
         }
+        let taken = self.list();
         (1..)
             .map(|n| format!("Card {n}"))
-            .find(|label| !self.cards.iter().any(|card| &card.label == label))
+            .find(|label| !taken.iter().any(|card| &card.info.label == label))
             .expect("unbounded range")
     }
 }
 
 /// Passive capability detection: watches the APDUs the PC itself sends
 /// (macOS's PIV token, the security-key relay, the Windows reader) and
-/// their answers. It never sends anything to the card.
+/// their answers. It never sends anything to the card. Returns [`caps`]
+/// bits; only set bits carry information.
 #[derive(Default)]
 pub struct CapabilityProbe {
     /// (APDU id, what that request would prove) awaiting its response.
@@ -376,32 +439,31 @@ impl CapabilityProbe {
         self.pending = classify(apdu).map(|probe| (id, probe));
     }
 
-    /// The card answered APDU `id`; returns what that answer proves.
-    pub fn response(&mut self, id: u64, rapdu: &[u8]) -> Capabilities {
-        let mut seen = Capabilities::default();
+    /// The card answered APDU `id`; returns the [`caps`] that answer proves.
+    pub fn response(&mut self, id: u64, rapdu: &[u8]) -> u8 {
         let Some((pending, probe)) = self.pending.take() else {
-            return seen;
+            return 0;
         };
         if pending != id {
-            return seen;
+            return 0;
         }
         let [.., sw1, sw2] = rapdu else {
-            return seen;
+            return 0;
         };
         let ok = (*sw1, *sw2) == (0x90, 0x00);
         let more = *sw1 == 0x61;
+        let bit = |set: bool, bit: u8| if set { bit } else { 0 };
         match probe {
-            Probe::SelectFido => seen.has_fido = ok,
-            Probe::SelectPiv => seen.has_piv = ok || more,
+            Probe::SelectFido => bit(ok, caps::FIDO),
+            Probe::SelectPiv => bit(ok || more, caps::PIV),
+            // An empty 9000 is no certificate; 61xx means data follows.
+            // 6982 on a plain object read: the applet locks its keys over
+            // contactless (PivApplet's strict-contactless builds).
             Probe::CertAuth => {
-                // An empty 9000 is no certificate; 61xx means data follows.
-                seen.piv_certs = (ok && rapdu.len() > 2) || more;
-                // 6982 on a plain object read: the applet locks its keys
-                // over contactless (PivApplet's strict-contactless builds).
-                seen.piv_blocked = (*sw1, *sw2) == (0x69, 0x82);
+                bit((ok && rapdu.len() > 2) || more, caps::CERTS)
+                    | bit((*sw1, *sw2) == (0x69, 0x82), caps::BLOCKED)
             }
         }
-        seen
     }
 
     /// The APDU failed (tag lost, I/O error): nothing to learn.
@@ -439,8 +501,7 @@ mod tests {
     use super::*;
 
     const UID: [u8; 7] = [0x04, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
-    const OTHER: [u8; 4] = [0x5A, 0x01, 0x02, 0x03];
-    /// 3B 8C 80 01 + "PivApplet\0\0\0"-style historical bytes + TCK.
+    /// 3B 8n 80 01 + historical bytes + TCK.
     fn atr_with(historical: &[u8]) -> Vec<u8> {
         let mut atr = vec![0x3B, 0x80 | historical.len() as u8, 0x80, 0x01];
         atr.extend_from_slice(historical);
@@ -459,149 +520,185 @@ mod tests {
     }
 
     #[test]
-    fn uid_less_cards_are_ignored() {
+    fn taps_only_update_cards_the_user_added() {
         let dir = tempfile::tempdir().unwrap();
         let mut cards = KnownCards::open(dir.path());
-        assert!(!cards.see(&[], &atr_with(&[]), 10));
-        assert!(!cards.see(&[0x08, 9, 9, 9], &atr_with(&[]), 10));
+        assert!(!cards.see(&UID, &atr_with(b"x"), 10));
         assert!(cards.list().is_empty());
-        assert!(!cards.note(
-            &[],
-            Capabilities {
-                has_fido: true,
-                ..Capabilities::default()
-            }
-        ));
+        assert!(cards.add(&[0x08, 9, 9, 9], "Random", &[], 10).is_none());
+        assert!(cards.add(&UID, " \n ", &[], 10).is_none());
+        let added = cards
+            .add(&UID, "  Hand\tring ", &atr_with(b"x"), 10)
+            .unwrap();
+        assert_eq!(added.label, "Hand ring");
+        assert!(added.wake);
+        assert!(cards.see(&UID, &atr_with(b"PivApplet"), 20));
+        let card = cards.get(&UID).unwrap();
+        assert_eq!(card.last_seen, 20);
+        assert_eq!(card.atr, atr_with(b"PivApplet"));
     }
 
     #[test]
-    fn new_cards_get_numbered_or_announced_labels() {
+    fn default_labels_use_the_atr_name_or_the_next_number() {
         let dir = tempfile::tempdir().unwrap();
         let mut cards = KnownCards::open(dir.path());
-        cards.see(&UID, &atr_with(&[0x80, 0x73]), 1);
-        cards.see(&OTHER, &atr_with(&[]), 2);
-        cards.see(&[0x04, 9, 9, 9, 9, 9, 9], &atr_with(b"\x80YubiKey"), 3);
-        let labels: Vec<_> = cards.list().iter().map(|c| c.label.as_str()).collect();
-        assert_eq!(labels, ["Card 1", "Card 2", "YubiKey"]);
-        // A freed number is reused, never a duplicate.
-        cards.forget(&UID);
-        cards.see(&[0x04, 7, 7, 7, 7, 7, 7], &[], 4);
-        assert_eq!(cards.list().last().unwrap().label, "Card 1");
+        assert_eq!(cards.default_label(&atr_with(b"\x80YubiKey")), "YubiKey");
+        assert_eq!(cards.default_label(&[]), "Card 1");
+        cards.add(&UID, "Card 1", &[], 1);
+        assert_eq!(cards.default_label(&[]), "Card 2");
     }
 
     #[test]
-    fn re_seeing_a_card_merges_instead_of_duplicating() {
+    fn labels_are_cut_to_the_wire_limit_in_bytes() {
+        let label = clean_label(&"\u{270b}".repeat(30)).unwrap(); // 3 bytes each
+        assert!(label.len() <= MAX_LABEL);
+        assert_eq!(label.chars().count(), 21);
+        assert_eq!(clean_label(" \n\t "), None);
+    }
+
+    #[test]
+    fn merging_the_phones_copy_reports_what_to_send_back() {
         let dir = tempfile::tempdir().unwrap();
         let mut cards = KnownCards::open(dir.path());
-        cards.see(&UID, &atr_with(&[1]), 100);
-        cards.rename(&UID, "Implant");
-        cards.note(
-            &UID,
-            Capabilities {
-                has_fido: true,
-                ..Capabilities::default()
-            },
-        );
-        assert!(cards.see(&UID, &atr_with(&[2]), 250));
-        assert!(cards.note(
-            &UID,
-            Capabilities {
-                piv_certs: true,
-                ..Capabilities::default()
-            }
-        ));
-        // Nothing new: no change reported.
-        assert!(!cards.note(
-            &UID,
-            Capabilities {
-                has_fido: true,
-                ..Capabilities::default()
-            }
-        ));
+        cards.add(&UID, "PC name", &[], 10);
+        cards.set_mac_login(&UID, true, 20);
+        // The phone renamed it later but doesn't know about the Mac login.
+        let phone = CardInfo {
+            label: "Phone name".into(),
+            label_at: 30,
+            ..CardInfo::new(UID.to_vec(), "x".into(), true, caps::FIDO, 5)
+        };
+        let (reply, changed) = cards.merge(&phone);
+        assert!(changed);
+        let reply = reply.expect("the phone is missing the Mac login");
+        assert_eq!(reply.label, "Phone name");
+        assert!(reply.mac_login);
+        // Merging the reply again settles: nothing to send, nothing new.
+        assert_eq!(cards.merge(&reply), (None, false));
+    }
+
+    #[test]
+    fn an_unknown_card_from_the_phone_is_added_and_invalid_ones_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cards = KnownCards::open(dir.path());
+        let phone = CardInfo::new(UID.to_vec(), "From phone".into(), true, caps::FIDO, 5);
+        assert_eq!(cards.merge(&phone), (None, true));
+        assert_eq!(cards.list()[0].info.label, "From phone");
+        let bad = CardInfo {
+            label: String::new(),
+            ..phone
+        };
+        assert_eq!(cards.merge(&bad), (None, false));
+        let random = CardInfo::new(vec![0x08, 1, 2, 3], "R".into(), true, 0, 5);
+        assert_eq!(cards.merge(&random), (None, false));
+    }
+
+    #[test]
+    fn forgotten_cards_stay_forgotten_until_added_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cards = KnownCards::open(dir.path());
+        cards.add(&UID, "Ring", &[], 10);
+        cards.note_caps(&UID, caps::FIDO, 11);
+        let stale = cards.get(&UID).unwrap().info.clone();
+        cards.forget(&UID, 20).unwrap();
+        assert!(cards.list().is_empty());
+        assert!(!cards.see(&UID, &[], 25));
+        assert_eq!(cards.records().count(), 1, "kept as a tombstone");
+        // The phone's older copy doesn't bring it back...
+        let (reply, _) = cards.merge(&stale);
+        assert!(reply.unwrap().deleted());
+        assert!(cards.list().is_empty());
+        // ...but adding it again does, keeping what was known.
+        cards.add(&UID, "Ring again", &[], 30).unwrap();
+        let card = &cards.list()[0].info;
+        assert_eq!(card.label, "Ring again");
+        assert!(card.has(caps::FIDO));
+        // Even when the adding device's clock is behind the forget.
+        cards.forget(&UID, 100).unwrap();
+        cards.add(&UID, "Back", &[], 50).unwrap();
         assert_eq!(cards.list().len(), 1);
-        let card = &cards.list()[0];
-        assert_eq!(card.label, "Implant");
-        assert_eq!((card.first_seen, card.last_seen), (100, 250));
-        assert_eq!(card.atr, atr_with(&[2]));
-        assert!(card.has_fido && card.has_piv && card.piv_certs);
     }
 
     #[test]
-    fn list_survives_save_and_reopen() {
+    fn caps_merge_and_blocked_clears_once_certificates_read() {
         let dir = tempfile::tempdir().unwrap();
         let mut cards = KnownCards::open(dir.path());
-        cards.see(&UID, &atr_with(b"PivApplet"), 1_700_000_000);
-        cards.see(&OTHER, &[], 1_700_000_100);
-        cards.note(
-            &UID,
-            Capabilities {
-                has_fido: true,
-                has_piv: true,
-                piv_certs: false,
-                piv_blocked: false,
-            },
+        cards.add(&UID, "Ring", &[], 1);
+        let info = cards.note_caps(&UID, caps::BLOCKED, 2).unwrap();
+        assert!(info.has(caps::PIV | caps::BLOCKED));
+        assert_eq!(info.caps_at, 2);
+        let info = cards.note_caps(&UID, caps::CERTS, 3).unwrap();
+        assert!(info.has(caps::PIV | caps::CERTS));
+        assert!(!info.has(caps::BLOCKED));
+        assert!(cards.note_caps(&UID, caps::CERTS, 4).is_none(), "no change");
+    }
+
+    #[test]
+    fn local_edits_stamp_only_their_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cards = KnownCards::open(dir.path());
+        cards.add(&UID, "Ring", &[], 1);
+        let info = cards.rename(&UID, "Hand", 5).unwrap().clone();
+        assert_eq!((info.label_at, info.wake_at), (5, 1));
+        assert!(cards.rename(&UID, "Hand", 6).is_none(), "same name");
+        let info = cards.set_wake(&UID, false, 7).unwrap();
+        assert!(!info.wake);
+        assert_eq!(info.wake_at, 7);
+        assert!(cards.set_mac_login(&UID, true, 8).unwrap().mac_login);
+        assert!(
+            cards.rename(&[0x04, 9, 9, 9], "Nope", 9).is_none(),
+            "unknown"
         );
-        cards.rename(&OTHER, "  Office\tbadge\n ");
+    }
+
+    #[test]
+    fn the_list_survives_save_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cards = KnownCards::open(dir.path());
+        cards.add(&UID, "hand \u{270b}", &atr_with(b"x"), 10);
+        cards.note_caps(&UID, caps::FIDO | caps::CERTS, 11);
+        cards.set_mac_login(&UID, true, 12);
+        cards.add(&[0x04, 7, 7, 7], "Gone", &[], 13);
+        cards.forget(&[0x04, 7, 7, 7], 14);
         cards.save().unwrap();
         let reopened = KnownCards::open(dir.path());
+        assert_eq!(reopened.records().count(), 2, "tombstones are kept");
         assert_eq!(reopened.list(), cards.list());
-        assert_eq!(reopened.get(&OTHER).unwrap().label, "Office badge");
-        let text = fs::read_to_string(dir.path().join("cards.txt")).unwrap();
-        assert!(text.starts_with("tapbridge-cards 1\n04112233445566\t1700000000\t"));
-        assert!(text.contains("\tfp\tPivApplet\n"));
-        assert!(text.contains("\t-\tOffice badge\n"));
-    }
-
-    #[test]
-    fn forget_and_rename_report_changes() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut cards = KnownCards::open(dir.path());
-        cards.see(&UID, &[], 1);
-        assert!(!cards.rename(&UID, "   "));
-        assert!(!cards.rename(&OTHER, "Nope"));
-        assert!(cards.rename(&UID, &"x".repeat(100)));
-        assert_eq!(cards.get(&UID).unwrap().label.len(), MAX_LABEL);
-        assert!(!cards.forget(&OTHER));
-        assert!(cards.forget(&UID));
-        assert!(cards.list().is_empty());
-    }
-
-    #[test]
-    fn corrupt_file_is_moved_aside_and_starts_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cards.txt");
-        fs::write(&path, b"\xff\xfe not a cards file").unwrap();
-        let mut cards = KnownCards::open(dir.path());
-        assert!(cards.list().is_empty());
-        assert_eq!(
-            fs::read(dir.path().join("cards.txt.bad")).unwrap(),
-            b"\xff\xfe not a cards file"
+        assert!(reopened.list()[0].info.mac_login);
+        let text = fs::read_to_string(dir.path().join(FILE)).unwrap();
+        assert!(
+            text.starts_with("tapbridge-cards 2\n04112233445566\t10\t1\t10\t7\t11\t1\t12\t0\t")
         );
-        cards.see(&UID, &[], 5);
-        cards.save().unwrap();
-        assert_eq!(KnownCards::open(dir.path()).list().len(), 1);
+    }
+
+    #[test]
+    fn any_other_file_is_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        fs::write(&path, "tapbridge-cards 1\n04112233\t1\t2\t3B00\tf\tOld\n").unwrap();
+        assert!(KnownCards::open(dir.path()).list().is_empty());
+        assert!(dir.path().join("cards.txt.bad").exists());
+        assert!(!path.exists());
     }
 
     #[test]
     fn malformed_lines_are_skipped_and_duplicates_keep_the_first() {
-        let text = "tapbridge-cards 1\n\
-            04112233445566\t1\t2\t3B00\tfc\tFirst\n\
-            zz\t1\t2\t\t-\tBad hex\n\
-            5A010203\tx\t2\t\t-\tBad time\n\
-            5A010203\t1\t2\t\tq\tBad flag\n\
-            08010203\t1\t2\t\t-\tRandom UID\n\
-            5A010203\t1\t2\t\t-\t\n\
-            5A010203\t1\t2\n\
-            04112233445566\t9\t9\t\t-\tSecond\n\
-            5A010203\t3\t4\t\t-\tGood\n";
-        let cards = parse(text).unwrap();
-        assert_eq!(cards.len(), 2);
-        assert_eq!(cards[0].label, "First");
-        assert!(cards[0].has_fido && !cards[0].has_piv && cards[0].piv_certs);
-        assert_eq!(cards[1].label, "Good");
+        let line =
+            |uid: &str, label: &str| format!("{uid}\t1\t1\t1\t0\t1\t0\t0\t0\t1\t\t{label}\n");
+        let text = format!(
+            "{HEADER}\n{}{}{}{}{}{}",
+            line("04112233445566", "First"),
+            line("zz", "Bad hex"),
+            line("08010203", "Random UID"),
+            "04AABBCC\t1\t2\t1\t0\t1\t0\t0\t0\t1\t\tBad flag\n",
+            line("04112233445566", "Second"),
+            line("5A010203", "Good"),
+        );
+        let cards = parse(&text).unwrap();
+        let labels: Vec<_> = cards.iter().map(|c| c.info.label.as_str()).collect();
+        assert_eq!(labels, ["First", "Good"]);
         assert!(parse("").is_none());
-        assert!(parse("tapbridge-cards 2\n").is_none());
-        assert_eq!(parse("tapbridge-cards 1\n").unwrap(), Vec::new());
+        assert_eq!(parse(&format!("{HEADER}\n")).unwrap(), Vec::new());
     }
 
     #[test]
@@ -613,7 +710,6 @@ mod tests {
         assert_eq!(atr_name(&atr_with(&[0x80, 0x73, 0xC0, 0x21])), None);
         assert_eq!(atr_name(&atr_with(b"abc")), None);
         assert_eq!(atr_name(&[0x3B, 0x00]), None);
-        // Historical length past the end of the ATR.
         assert_eq!(atr_name(&[0x3B, 0x8F, 0x80, 0x01, b'A']), None);
     }
 
@@ -627,39 +723,29 @@ mod tests {
     const GET_CERT_9A: [u8; 11] = [0x00, 0xCB, 0x3F, 0xFF, 5, 0x5C, 3, 0x5F, 0xC1, 0x05, 0];
 
     #[test]
-    fn probe_sees_fido_select_success() {
+    fn probe_reads_fido_piv_certs_and_blocked() {
         let mut probe = CapabilityProbe::default();
         probe.request(1, &select(&FIDO_AID));
-        let mut answer = b"U2F_V2".to_vec();
-        answer.extend([0x90, 0x00]);
-        assert_eq!(
-            probe.response(1, &answer),
-            Capabilities {
-                has_fido: true,
-                ..Capabilities::default()
-            }
-        );
-        // The same select failing proves nothing.
+        assert_eq!(probe.response(1, b"U2F_V2\x90\x00"), caps::FIDO);
         probe.request(2, &select(&FIDO_AID));
-        assert!(!probe.response(2, &[0x6A, 0x82]).any());
-    }
-
-    #[test]
-    fn probe_sees_piv_select_and_certificate_from_macos_traffic() {
-        let mut probe = CapabilityProbe::default();
+        assert_eq!(probe.response(2, &[0x6A, 0x82]), 0);
         // macOS's pivtoken selects the short PIV AID and gets 61xx.
-        probe.request(10, &select(&PIV_AID));
-        assert!(probe.response(10, &[0x61, 0x11]).has_piv);
-        probe.request(11, &GET_CERT_9A);
-        let seen = probe.response(11, &[0x53, 0x82, 0x01, 0x00, 0x90, 0x00]);
-        assert!(seen.piv_certs && !seen.has_fido);
-        probe.request(12, &GET_CERT_9A);
-        assert!(probe.response(12, &[0x61, 0x00]).piv_certs);
+        probe.request(3, &select(&PIV_AID));
+        assert_eq!(probe.response(3, &[0x61, 0x11]), caps::PIV);
+        probe.request(4, &GET_CERT_9A);
+        assert_eq!(
+            probe.response(4, &[0x53, 0x01, 0x00, 0x90, 0x00]),
+            caps::CERTS
+        );
+        probe.request(5, &GET_CERT_9A);
+        assert_eq!(probe.response(5, &[0x61, 0x00]), caps::CERTS);
+        probe.request(6, &GET_CERT_9A);
+        assert_eq!(probe.response(6, &[0x69, 0x82]), caps::BLOCKED);
         // Empty slot: not found, or an empty success.
-        probe.request(13, &GET_CERT_9A);
-        assert!(!probe.response(13, &[0x6A, 0x82]).any());
-        probe.request(14, &GET_CERT_9A);
-        assert!(!probe.response(14, &[0x90, 0x00]).any());
+        probe.request(7, &GET_CERT_9A);
+        assert_eq!(probe.response(7, &[0x6A, 0x82]), 0);
+        probe.request(8, &GET_CERT_9A);
+        assert_eq!(probe.response(8, &[0x90, 0x00]), 0);
     }
 
     #[test]
@@ -669,118 +755,36 @@ mod tests {
             0x00, 0xCB, 0x3F, 0xFF, 0x00, 0x00, 0x05, 0x5C, 0x03, 0x5F, 0xC1, 0x05, 0x00, 0x00,
         ];
         probe.request(1, &extended);
-        assert!(probe.response(1, &[0x53, 0x00, 0x90, 0x00]).piv_certs);
+        assert_eq!(probe.response(1, &[0x53, 0x00, 0x90, 0x00]), caps::CERTS);
         let mut select = vec![0x00, 0xA4, 0x04, 0x00, 0x00, 0x00, 0x05];
         select.extend_from_slice(&PIV_AID);
         probe.request(2, &select);
-        assert!(probe.response(2, &[0x90, 0x00]).has_piv);
-        // Extended header cut short.
+        assert_eq!(probe.response(2, &[0x90, 0x00]), caps::PIV);
         probe.request(3, &[0x00, 0xA4, 0x04, 0x00, 0x00, 0x00]);
-        assert!(!probe.response(3, &[0x90, 0x00]).any());
+        assert_eq!(probe.response(3, &[0x90, 0x00]), 0);
     }
 
     #[test]
     fn probe_ignores_other_commands_mismatched_ids_and_failures() {
         let mut probe = CapabilityProbe::default();
-        // Other slots and other applets.
         probe.request(
             1,
             &[0x00, 0xCB, 0x3F, 0xFF, 5, 0x5C, 3, 0x5F, 0xC1, 0x0A, 0],
         );
-        assert!(!probe.response(1, &[0x90, 0x00, 0x90, 0x00]).any());
+        assert_eq!(probe.response(1, &[0x90, 0x00, 0x90, 0x00]), 0);
         probe.request(2, &select(&[0xA0, 0, 0, 0, 0x03]));
-        assert!(!probe.response(2, &[0x90, 0x00]).any());
-        // A response to another id doesn't count.
+        assert_eq!(probe.response(2, &[0x90, 0x00]), 0);
         probe.request(3, &select(&PIV_AID));
-        assert!(!probe.response(4, &[0x90, 0x00]).any());
-        // A failed APDU clears it.
+        assert_eq!(probe.response(4, &[0x90, 0x00]), 0);
         probe.request(5, &select(&PIV_AID));
         probe.failed(5);
-        assert!(!probe.response(5, &[0x90, 0x00]).any());
-        // A new card clears it.
+        assert_eq!(probe.response(5, &[0x90, 0x00]), 0);
         probe.request(6, &select(&PIV_AID));
         probe.reset();
-        assert!(!probe.response(6, &[0x90, 0x00]).any());
-        // CTAP traffic, truncated APDUs and short replies never panic.
+        assert_eq!(probe.response(6, &[0x90, 0x00]), 0);
         probe.request(7, &[0x80, 0x10, 0, 0, 1, 4]);
-        assert!(!probe.response(7, &[0x00, 0x90, 0x00]).any());
+        assert_eq!(probe.response(7, &[0x00, 0x90, 0x00]), 0);
         probe.request(8, &[0x00, 0xA4, 0x04, 0x00, 9, 0xA0]);
-        assert!(!probe.response(8, &[0x90]).any());
-    }
-
-    #[test]
-    fn a_refused_certificate_read_marks_the_applet_blocked() {
-        let mut probe = CapabilityProbe::default();
-        probe.request(
-            1,
-            &[
-                0x00, 0xCB, 0x3F, 0xFF, 0x05, 0x5C, 0x03, 0x5F, 0xC1, 0x05, 0x00,
-            ],
-        );
-        let seen = probe.response(1, &[0x69, 0x82]);
-        assert!(seen.piv_blocked);
-        assert!(!seen.piv_certs);
-    }
-
-    #[test]
-    fn blocked_clears_once_a_certificate_is_readable() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut cards = KnownCards::open(dir.path());
-        cards.see(&UID, &atr_with(&[]), 1);
-        assert!(cards.note(
-            &UID,
-            Capabilities {
-                piv_blocked: true,
-                ..Default::default()
-            }
-        ));
-        let card = cards.get(&UID).unwrap();
-        assert!(card.has_piv && card.piv_blocked && !card.piv_certs);
-        assert!(cards.note(
-            &UID,
-            Capabilities {
-                piv_certs: true,
-                ..Default::default()
-            }
-        ));
-        let card = cards.get(&UID).unwrap();
-        assert!(card.piv_certs && !card.piv_blocked);
-    }
-
-    #[test]
-    fn marks_record_certificates_and_mac_login() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut cards = KnownCards::open(dir.path());
-        assert!(!cards.mark(&UID, Mark::Certificates), "unknown card");
-        cards.see(&UID, &atr_with(&[]), 1);
-        assert!(cards.mark(&UID, Mark::Certificates));
-        assert!(!cards.mark(&UID, Mark::Certificates), "no change");
-        assert!(cards.mark(&UID, Mark::MacLogin(true)));
-        let card = cards.get(&UID).unwrap();
-        assert!(card.has_piv && card.piv_certs && card.mac_login);
-        assert!(cards.mark(&UID, Mark::MacLogin(false)));
-        assert!(!cards.get(&UID).unwrap().mac_login);
-    }
-
-    #[test]
-    fn new_flags_survive_a_save() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut cards = KnownCards::open(dir.path());
-        cards.see(&UID, &atr_with(&[]), 1);
-        cards.note(
-            &UID,
-            Capabilities {
-                piv_blocked: true,
-                ..Default::default()
-            },
-        );
-        cards.mark(&UID, Mark::MacLogin(true));
-        cards.save().unwrap();
-        let card = KnownCards::open(dir.path()).get(&UID).cloned().unwrap();
-        assert!(card.piv_blocked && card.mac_login && card.has_piv);
-        // Files written before these flags still load.
-        let old = format!("{HEADER}\n{}\t1\t2\t3B00\tfpc\tOld\n", hex(&UID));
-        let parsed = parse(&old).unwrap();
-        assert!(parsed[0].piv_certs && !parsed[0].piv_blocked && !parsed[0].mac_login);
+        assert_eq!(probe.response(8, &[0x90]), 0);
     }
 }

@@ -26,6 +26,8 @@ pub struct Session {
     writer: Mutex<SendStream>,
     /// Host display name from the `Accepted` handshake reply.
     host_name: String,
+    /// Host OS from the `Accepted` reply ([`wire::platform`]).
+    host_platform: u8,
     /// The hint text that was dialed, for the phone to cache for reconnects.
     used_hint: String,
 }
@@ -92,7 +94,10 @@ impl Session {
                     connection.open_bi().await.map_err(io::Error::other)?;
                 let accepted =
                     match transport::client_hello(&mut writer, &mut reader, hello).await? {
-                        transport::HelloReply::Accepted { host_name } => host_name,
+                        transport::HelloReply::Accepted {
+                            host_name,
+                            platform,
+                        } => (host_name, platform),
                         transport::HelloReply::Rejected => {
                             transport::close(&connection);
                             return Err(io::Error::new(
@@ -106,7 +111,7 @@ impl Session {
             .await
         });
         match connected {
-            Ok(Ok((connection, reader, writer, host_name))) => Ok((
+            Ok(Ok((connection, reader, writer, (host_name, host_platform)))) => Ok((
                 Self {
                     runtime,
                     endpoint,
@@ -114,6 +119,7 @@ impl Session {
                     reader: Mutex::new(reader),
                     writer: Mutex::new(writer),
                     host_name,
+                    host_platform,
                     used_hint: used_hint.clone(),
                 },
                 used_hint,
@@ -137,6 +143,12 @@ impl Session {
         &self.host_name
     }
 
+    /// Host OS ([`wire::platform`]): the phone shows Mac-only steps only to
+    /// a Mac.
+    pub fn host_platform(&self) -> u8 {
+        self.host_platform
+    }
+
     /// Hint text actually used for the dial, so the phone can cache it and
     /// skip discovery on later reconnects.
     pub fn used_hint(&self) -> &str {
@@ -155,7 +167,9 @@ impl Session {
                 | Frame::Cancel { .. }
                 | Frame::ReadCard
                 | Frame::Auth { .. }
-                | Frame::SetupPiv { .. }
+                | Frame::CardInfo(_)
+                | Frame::CardAction { .. }
+                | Frame::CardActionDone { .. }
         ) {
             self.close();
             return Err(io::Error::new(

@@ -9,7 +9,7 @@ use std::{
     io,
     sync::{Mutex, OnceLock},
 };
-use tapbridge_core::wire::Frame;
+use tapbridge_core::{cards::CardInfo, wire::Frame};
 
 static CONTEXT: OnceLock<GlobalRef> = OnceLock::new();
 static INIT: Mutex<()> = Mutex::new(());
@@ -124,6 +124,22 @@ pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_hostName(
     }
 }
 
+/// Host OS from the `Accepted` reply (`wire::platform`; -1 on error).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_hostPlatform(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jint {
+    match unsafe { session(handle) } {
+        Ok(s) => s.host_platform().into(),
+        Err(error) => {
+            report(&mut env, error);
+            -1
+        }
+    }
+}
+
 /// Hint text actually used for the dial, so Kotlin can cache it for later
 /// reconnects instead of re-discovering the host every time.
 #[unsafe(no_mangle)]
@@ -188,13 +204,47 @@ pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_read(
                     &[JValue::Int(state.into())],
                 )?;
             }
-            Frame::SetupPiv { uid } => {
-                let bytes = env.byte_array_from_slice(&uid)?;
+            Frame::CardInfo(card) => {
+                let uid = env.byte_array_from_slice(&card.uid)?;
+                let label = env.new_string(&card.label)?;
                 env.call_method(
                     &callbacks,
-                    "setupPiv",
-                    "([B)V",
-                    &[JValue::Object(bytes.as_ref())],
+                    "cardInfo",
+                    "([BLjava/lang/String;JZJIJZJJ)V",
+                    &[
+                        JValue::Object(uid.as_ref()),
+                        JValue::Object(label.as_ref()),
+                        JValue::Long(card.label_at as jlong),
+                        JValue::Bool(card.wake.into()),
+                        JValue::Long(card.wake_at as jlong),
+                        JValue::Int(card.caps.into()),
+                        JValue::Long(card.caps_at as jlong),
+                        JValue::Bool(card.mac_login.into()),
+                        JValue::Long(card.mac_login_at as jlong),
+                        JValue::Long(card.deleted_at as jlong),
+                    ],
+                )?;
+            }
+            Frame::CardAction { uid, action } => {
+                let uid = env.byte_array_from_slice(&uid)?;
+                env.call_method(
+                    &callbacks,
+                    "cardAction",
+                    "([BI)V",
+                    &[JValue::Object(uid.as_ref()), JValue::Int(action.into())],
+                )?;
+            }
+            Frame::CardActionDone { uid, action, ok } => {
+                let uid = env.byte_array_from_slice(&uid)?;
+                env.call_method(
+                    &callbacks,
+                    "cardActionDone",
+                    "([BIZ)V",
+                    &[
+                        JValue::Object(uid.as_ref()),
+                        JValue::Int(action.into()),
+                        JValue::Bool(ok.into()),
+                    ],
                 )?;
             }
             _ => return Err("invalid host frame".into()),
@@ -236,16 +286,72 @@ pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_card(
     }
 }
 
-/// The PIV setup the host asked for (`SetupPiv`) finished.
+/// Sends one synced card record to the host.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_pivSetupDone(
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_cardInfo(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
+    uid: JByteArray,
+    label: JString,
+    label_at: jlong,
+    wake: jboolean,
+    wake_at: jlong,
+    caps: jint,
+    caps_at: jlong,
+    mac_login: jboolean,
+    mac_login_at: jlong,
+    deleted_at: jlong,
+) {
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let card = CardInfo {
+            uid: env.convert_byte_array(uid)?,
+            label: env.get_string(&label)?.into(),
+            label_at: label_at as u64,
+            wake: wake != 0,
+            wake_at: wake_at as u64,
+            caps: u8::try_from(caps)?,
+            caps_at: caps_at as u64,
+            mac_login: mac_login != 0,
+            mac_login_at: mac_login_at as u64,
+            deleted_at: deleted_at as u64,
+        };
+        unsafe { session(handle)? }.send(&Frame::CardInfo(card))?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        report(&mut env, error);
+    }
+}
+
+/// Asks the host to do a `wire::action` for a card (`done` false), or
+/// reports how an action the host asked for ended (`done` true).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_cardAction(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    uid: JByteArray,
+    action: jint,
+    done: jboolean,
     ok: jboolean,
 ) {
-    let result =
-        unsafe { session(handle) }.and_then(|s| s.send(&Frame::PivSetupDone { ok: ok != 0 }));
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let uid = env.convert_byte_array(uid)?;
+        let action = u8::try_from(action)?;
+        let frame = if done != 0 {
+            Frame::CardActionDone {
+                uid,
+                action,
+                ok: ok != 0,
+            }
+        } else {
+            Frame::CardAction { uid, action }
+        };
+        unsafe { session(handle)? }.send(&frame)?;
+        Ok(())
+    })();
     if let Err(error) = result {
         report(&mut env, error);
     }

@@ -1,5 +1,6 @@
 //! Authenticated remote-reader sessions. Card bytes stay opaque.
 
+pub mod cards;
 pub mod pairing;
 pub mod transport;
 pub mod wake;

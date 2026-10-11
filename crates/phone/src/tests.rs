@@ -51,13 +51,18 @@ fn actual_phone_session_relays_frames_and_close_unblocks_reader() {
                     data: vec![0x90, 0]
                 }
             );
-            let setup = Frame::SetupPiv {
+            let setup = Frame::CardAction {
                 uid: vec![4, 1, 2, 3, 4, 5, 6],
+                action: wire::action::SETUP_CERTS,
             };
             wire::write_frame(&mut send, &setup).await.unwrap();
             assert_eq!(
                 wire::read_frame(&mut recv).await.unwrap(),
-                Frame::PivSetupDone { ok: true }
+                Frame::CardActionDone {
+                    uid: vec![4, 1, 2, 3, 4, 5, 6],
+                    action: wire::action::SETUP_CERTS,
+                    ok: true,
+                }
             );
             // Only now may the phone close: a close racing the last frame
             // would lose it (QUIC drops unread stream data on close).
@@ -79,6 +84,7 @@ fn actual_phone_session_relays_frames_and_close_unblocks_reader() {
     )
     .unwrap();
     assert_eq!(session.host_name(), "PC");
+    assert_eq!(session.host_platform(), wire::platform::current());
     assert!(!used.is_empty());
     let session = Arc::new(session);
     session
@@ -106,11 +112,18 @@ fn actual_phone_session_relays_frames_and_close_unblocks_reader() {
         .unwrap();
     assert_eq!(
         session.read().unwrap(),
-        Frame::SetupPiv {
-            uid: vec![4, 1, 2, 3, 4, 5, 6]
+        Frame::CardAction {
+            uid: vec![4, 1, 2, 3, 4, 5, 6],
+            action: wire::action::SETUP_CERTS,
         }
     );
-    session.send(&Frame::PivSetupDone { ok: true }).unwrap();
+    session
+        .send(&Frame::CardActionDone {
+            uid: vec![4, 1, 2, 3, 4, 5, 6],
+            action: wire::action::SETUP_CERTS,
+            ok: true,
+        })
+        .unwrap();
     got_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let blocked = session.clone();
     let (done_tx, done_rx) = mpsc::channel();

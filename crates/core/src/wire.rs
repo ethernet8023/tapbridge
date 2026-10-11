@@ -8,7 +8,7 @@ pub const MAX_ATR: usize = 33;
 pub const MAX_FRAME: usize = 65600;
 /// Frame format version byte. v3: `Card` carries a length-prefixed ATR and
 /// the tag UID; adds `SetupPiv` and `PivSetupDone`.
-pub const VERSION: u8 = 3;
+pub const VERSION: u8 = 4;
 /// NFC tag UID (ISO 14443: 4, 7 or 10 bytes).
 pub const MAX_UID: usize = 10;
 /// Display names (phone and host), UTF-8 bytes.
@@ -25,6 +25,9 @@ pub enum Frame {
     },
     Accepted {
         name: String,
+        /// The host's OS, one of [`platform`]: the phone shows macOS-only
+        /// steps (Mac login) only to a Mac.
+        platform: u8,
     },
     Rejected,
     Card {
@@ -58,15 +61,52 @@ pub enum Frame {
     Auth {
         state: u8,
     },
-    /// Host -> phone: open the phone's smart-card (PIV) setup for the card
-    /// with this UID (1..=[`MAX_UID`] bytes).
-    SetupPiv {
+    /// Both ways: one synced card record (see [`crate::cards`]). Sent for
+    /// every card on connect and for each local change; the receiver merges
+    /// it and sends the result back if it differs.
+    CardInfo(crate::cards::CardInfo),
+    /// Both ways: ask the other device to do one of the [`action`]s for the
+    /// card with this UID (1..=[`MAX_UID`] bytes).
+    CardAction {
         uid: Vec<u8>,
+        action: u8,
     },
-    /// Phone -> host: the PIV setup the host asked for finished.
-    PivSetupDone {
+    /// Both ways: the [`Frame::CardAction`] this device was asked for
+    /// finished.
+    CardActionDone {
+        uid: Vec<u8>,
+        action: u8,
         ok: bool,
     },
+}
+
+/// [`Frame::Accepted`] platforms.
+pub mod platform {
+    pub const OTHER: u8 = 0;
+    pub const MACOS: u8 = 1;
+    pub const WINDOWS: u8 = 2;
+    pub const MAX: u8 = WINDOWS;
+
+    /// The platform this build runs on.
+    pub const fn current() -> u8 {
+        if cfg!(target_os = "macos") {
+            MACOS
+        } else if cfg!(windows) {
+            WINDOWS
+        } else {
+            OTHER
+        }
+    }
+}
+
+/// [`Frame::CardAction`] actions.
+pub mod action {
+    /// Host -> phone: create the card's PIV certificates (the phone asks for
+    /// the PIN; existing certificates are kept).
+    pub const SETUP_CERTS: u8 = 1;
+    /// Phone -> host: pair the card with the PC's macOS login.
+    pub const MAC_LOGIN: u8 = 2;
+    pub const MAX: u8 = MAC_LOGIN;
 }
 
 /// [`Frame::Auth`] states.
@@ -99,8 +139,9 @@ impl std::fmt::Debug for Frame {
             Self::Cancel { .. } => "Cancel",
             Self::ReadCard => "ReadCard",
             Self::Auth { .. } => "Auth",
-            Self::SetupPiv { .. } => "SetupPiv",
-            Self::PivSetupDone { .. } => "PivSetupDone",
+            Self::CardInfo(_) => "CardInfo",
+            Self::CardAction { .. } => "CardAction",
+            Self::CardActionDone { .. } => "CardActionDone",
         })
     }
 }
@@ -135,7 +176,10 @@ fn validate(frame: &Frame) -> io::Result<()> {
                     atr.len() >= 2 && (4..=MAX_APDU as u32).contains(max_apdu)
                 }
         }
-        Frame::SetupPiv { uid } => (1..=MAX_UID).contains(&uid.len()),
+        Frame::CardInfo(card) => card.valid(),
+        Frame::CardAction { uid, action } | Frame::CardActionDone { uid, action, .. } => {
+            (1..=MAX_UID).contains(&uid.len()) && (1..=action::MAX).contains(action)
+        }
         Frame::Apdu { data, .. } => (4..=MAX_APDU).contains(&data.len()),
         Frame::Response { data, .. } => (2..=MAX_APDU).contains(&data.len()),
         Frame::Hello { name, push, .. } => {
@@ -144,7 +188,9 @@ fn validate(frame: &Frame) -> io::Result<()> {
                     .as_ref()
                     .is_none_or(|push| (1..=MAX_PUSH).contains(&push.len()))
         }
-        Frame::Accepted { name } => (1..=MAX_NAME).contains(&name.len()),
+        Frame::Accepted { name, platform } => {
+            (1..=MAX_NAME).contains(&name.len()) && *platform <= platform::MAX
+        }
         Frame::Auth { state } => *state <= auth::MAX,
         _ => true,
     };
@@ -181,8 +227,9 @@ fn decode(body: &[u8]) -> io::Result<Frame> {
         1 => {
             let mut fields = Fields(data);
             let name = fields.string()?;
+            let platform = fields.byte()?;
             fields.end()?;
-            Ok(Frame::Accepted { name })
+            Ok(Frame::Accepted { name, platform })
         }
         2 if data.is_empty() => Ok(Frame::Rejected),
         3 if data.len() >= 12 => {
@@ -222,11 +269,36 @@ fn decode(body: &[u8]) -> io::Result<Frame> {
         9 if data.len() == 1 => Ok(Frame::Auth { state: data[0] }),
         10 => {
             let mut fields = Fields(data);
-            let uid = fields.bytes()?;
+            let card = crate::cards::CardInfo {
+                uid: fields.bytes()?,
+                label: fields.string()?,
+                label_at: fields.number()?,
+                wake: fields.flag()?,
+                wake_at: fields.number()?,
+                caps: fields.byte()?,
+                caps_at: fields.number()?,
+                mac_login: fields.flag()?,
+                mac_login_at: fields.number()?,
+                deleted_at: fields.number()?,
+            };
             fields.end()?;
-            Ok(Frame::SetupPiv { uid })
+            Ok(Frame::CardInfo(card))
         }
-        11 if data.len() == 1 && data[0] <= 1 => Ok(Frame::PivSetupDone { ok: data[0] == 1 }),
+        11 => {
+            let mut fields = Fields(data);
+            let uid = fields.bytes()?;
+            let action = fields.byte()?;
+            fields.end()?;
+            Ok(Frame::CardAction { uid, action })
+        }
+        12 => {
+            let mut fields = Fields(data);
+            let uid = fields.bytes()?;
+            let action = fields.byte()?;
+            let ok = fields.flag()?;
+            fields.end()?;
+            Ok(Frame::CardActionDone { uid, action, ok })
+        }
         _ => Err(invalid()),
     }
 }
@@ -251,9 +323,10 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -
                 put_string(&mut body, push);
             }
         }
-        Frame::Accepted { name } => {
+        Frame::Accepted { name, platform } => {
             body.push(1);
             put_string(&mut body, name);
+            body.push(*platform);
         }
         Frame::Rejected => body.push(2),
         Frame::Card {
@@ -301,11 +374,29 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -
         }
         Frame::ReadCard => body.push(8),
         Frame::Auth { state } => body.extend_from_slice(&[9, *state]),
-        Frame::SetupPiv { uid } => {
+        Frame::CardInfo(card) => {
             body.push(10);
-            put_bytes(&mut body, uid);
+            put_bytes(&mut body, &card.uid);
+            put_string(&mut body, &card.label);
+            body.extend_from_slice(&card.label_at.to_be_bytes());
+            body.push(u8::from(card.wake));
+            body.extend_from_slice(&card.wake_at.to_be_bytes());
+            body.push(card.caps);
+            body.extend_from_slice(&card.caps_at.to_be_bytes());
+            body.push(u8::from(card.mac_login));
+            body.extend_from_slice(&card.mac_login_at.to_be_bytes());
+            body.extend_from_slice(&card.deleted_at.to_be_bytes());
         }
-        Frame::PivSetupDone { ok } => body.extend_from_slice(&[11, u8::from(*ok)]),
+        Frame::CardAction { uid, action } => {
+            body.push(11);
+            put_bytes(&mut body, uid);
+            body.push(*action);
+        }
+        Frame::CardActionDone { uid, action, ok } => {
+            body.push(12);
+            put_bytes(&mut body, uid);
+            body.extend_from_slice(&[*action, u8::from(*ok)]);
+        }
     }
     writer.write_u32(body.len() as u32).await?;
     writer.write_all(&body).await
@@ -339,6 +430,19 @@ impl<'a> Fields<'a> {
 
     fn byte(&mut self) -> io::Result<u8> {
         Ok(self.take(1)?[0])
+    }
+
+    fn number(&mut self) -> io::Result<u64> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    /// A 0/1 byte; anything else is malformed.
+    fn flag(&mut self) -> io::Result<bool> {
+        match self.byte()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(invalid()),
+        }
     }
 
     fn bytes(&mut self) -> io::Result<Vec<u8>> {

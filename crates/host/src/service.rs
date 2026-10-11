@@ -6,7 +6,7 @@
 //! returned [`ServiceHandle`] is fully synchronous — plain `std` channels —
 //! so the gpui UI thread calls it directly without crossing into tokio.
 use crate::{
-    cards::{CapabilityProbe, KnownCard, KnownCards, uid_stable},
+    cards::{CapabilityProbe, CardInfo, KnownCard, KnownCards, uid_stable},
     state::Store,
     trace::Tracer,
 };
@@ -55,13 +55,25 @@ pub enum Event {
         present: bool,
         uid: Vec<u8>,
     },
-    /// The known-cards list changed (a card was seen, renamed, forgotten,
-    /// or showed a new capability). Re-read it with
-    /// [`ServiceHandle::known_cards`].
+    /// The known-cards list changed (here or synced from the phone).
+    /// Re-read it with [`ServiceHandle::known_cards`].
     CardsChanged,
-    /// The phone finished the smart-card setup asked for with
-    /// [`ServiceHandle::setup_piv`].
-    PivSetupDone {
+    /// A card with a stable UID that isn't known was tapped: offer to add
+    /// it. `label` is a suggested name.
+    UnknownCard {
+        uid: Vec<u8>,
+        label: String,
+    },
+    /// The phone asks this PC to do a [`wire::action`] for a card.
+    CardActionRequested {
+        uid: Vec<u8>,
+        action: u8,
+    },
+    /// The phone finished an action this PC asked for
+    /// ([`ServiceHandle::request_card_action`]).
+    CardActionDone {
+        uid: Vec<u8>,
+        action: u8,
         ok: bool,
     },
     /// A phone completed pairing with the outstanding invitation: a new phone,
@@ -93,6 +105,22 @@ pub struct Status {
     pub card_uid: Vec<u8>,
 }
 
+/// A change the user (or this PC) makes to one card.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CardEdit {
+    /// Add the card under this name (it was tapped; see
+    /// [`Event::UnknownCard`]), or revive a forgotten one.
+    Add(String),
+    Rename(String),
+    /// The phone's "open tapbridge when tapped".
+    SetWake(bool),
+    /// Whether the card is paired with this Mac's login.
+    SetMacLogin(bool),
+    /// What this PC found the card supports ([`crate::cards::caps`]).
+    NoteCaps(u8),
+    Forget,
+}
+
 /// What happened after a [`ServiceHandle::request_tap`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum TapOutcome {
@@ -116,23 +144,16 @@ enum Command {
     AuthState(u8),
     Status(std::sync::mpsc::SyncSender<Status>),
     KnownCards(std::sync::mpsc::SyncSender<Vec<KnownCard>>),
-    RenameCard {
+    /// A local edit to the card list; synced to the phone when it changes
+    /// anything.
+    EditCard {
         uid: Vec<u8>,
-        label: String,
+        edit: CardEdit,
         reply: std::sync::mpsc::SyncSender<bool>,
     },
-    ForgetCard {
-        uid: Vec<u8>,
-        reply: std::sync::mpsc::SyncSender<bool>,
-    },
-    MarkCard {
-        uid: Vec<u8>,
-        mark: crate::cards::Mark,
-        reply: std::sync::mpsc::SyncSender<bool>,
-    },
-    /// Ask the connected phone to open its PIV setup for this card.
-    SetupPiv {
-        uid: Vec<u8>,
+    /// Send a [`Frame::CardAction`] or [`Frame::CardActionDone`].
+    CardFrame {
+        frame: Frame,
         reply: std::sync::mpsc::SyncSender<bool>,
     },
     EndpointAddr(std::sync::mpsc::SyncSender<iroh::EndpointAddr>),
@@ -227,36 +248,31 @@ impl ServiceHandle {
         }
     }
 
-    /// Every card seen through the phone, oldest first.
+    /// The user's cards, oldest first.
     pub fn known_cards(&self) -> Vec<KnownCard> {
         self.reply(Command::KnownCards)
     }
 
-    /// Renames a known card; `false` when unknown or the label is blank.
-    pub fn rename_card(&self, uid: Vec<u8>, label: String) -> bool {
-        self.reply_option(|reply| Command::RenameCard { uid, label, reply })
+    /// Changes one card and syncs it to the phone. `false` when nothing
+    /// changed (unknown card, same value, unusable name).
+    pub fn edit_card(&self, uid: Vec<u8>, edit: CardEdit) -> bool {
+        self.reply_option(|reply| Command::EditCard { uid, edit, reply })
             .unwrap_or(false)
     }
 
-    /// Drops a known card; it is added again the next time it is tapped.
-    pub fn forget_card(&self, uid: Vec<u8>) -> bool {
-        self.reply_option(|reply| Command::ForgetCard { uid, reply })
+    /// Asks the connected phone to do a [`wire::action`] for the card `uid`.
+    /// `false` when no session is live (wake the phone first). The answer
+    /// arrives as [`Event::CardActionDone`].
+    pub fn request_card_action(&self, uid: Vec<u8>, action: u8) -> bool {
+        let frame = Frame::CardAction { uid, action };
+        self.reply_option(|reply| Command::CardFrame { frame, reply })
             .unwrap_or(false)
     }
 
-    /// Records something learned about a known card outside the probe
-    /// (certificates created, Mac login paired). `false` when unchanged.
-    pub fn mark_card(&self, uid: Vec<u8>, mark: crate::cards::Mark) -> bool {
-        self.reply_option(|reply| Command::MarkCard { uid, mark, reply })
-            .unwrap_or(false)
-    }
-
-    /// Asks the connected phone to open its smart-card setup for the card
-    /// `uid`. `false` when no phone session is live (wake it first) or the
-    /// UID is not a stable one. The answer arrives as
-    /// [`Event::PivSetupDone`].
-    pub fn setup_piv(&self, uid: Vec<u8>) -> bool {
-        self.reply_option(|reply| Command::SetupPiv { uid, reply })
+    /// Tells the phone how an action it asked for ended.
+    pub fn card_action_done(&self, uid: Vec<u8>, action: u8, ok: bool) -> bool {
+        let frame = Frame::CardActionDone { uid, action, ok };
+        self.reply_option(|reply| Command::CardFrame { frame, reply })
             .unwrap_or(false)
     }
 
@@ -439,6 +455,7 @@ async fn run_inner(
     let mut card_uid: Vec<u8> = Vec::new();
     let mut known = KnownCards::open(&settings.state_dir);
     let mut probe = CapabilityProbe::default();
+    let mut pending_sync: Vec<CardInfo> = Vec::new();
     // Latest card state: generation + ATR (latest-wins, like the reader's
     // `Shared::latest_card`). Reported in Status; the macOS IFD path also
     // tags PIV APDUs with the generation.
@@ -524,41 +541,46 @@ async fn run_inner(
                             });
                         },
                         Command::KnownCards(reply) => {
-                            let _ = reply.send(known.list().to_vec());
+                            let _ = reply.send(known.list());
                         },
-                        Command::RenameCard { uid, label, reply } => {
-                            let changed = known.rename(&uid, &label);
-                            if changed {
+                        Command::EditCard { uid, edit, reply } => {
+                            let now = tapbridge_core::cards::now_ms();
+                            let atr = if card_present && card_uid == uid { latest_atr.clone() } else { Vec::new() };
+                            let changed = match edit {
+                                CardEdit::Add(label) => known.add(&uid, &label, &atr, now),
+                                CardEdit::Rename(label) => known.rename(&uid, &label, now),
+                                CardEdit::SetWake(wake) => known.set_wake(&uid, wake, now),
+                                CardEdit::SetMacLogin(paired) => known.set_mac_login(&uid, paired, now),
+                                CardEdit::NoteCaps(seen) => known.note_caps(&uid, seen, now),
+                                CardEdit::Forget => known.forget(&uid, now),
+                            }
+                            .cloned();
+                            if let Some(info) = &changed {
                                 let _ = known.save();
                                 let _ = events.send(Event::CardsChanged);
+                                if active.is_some() {
+                                    send_frame(
+                                        &mut active, &mut received, &to_reader, &events,
+                                        &mut card_present, Frame::CardInfo(info.clone()), tracer.as_mut(),
+                                    ).await?;
+                                }
                             }
-                            let _ = reply.send(changed);
+                            let _ = reply.send(changed.is_some());
                         },
-                        Command::ForgetCard { uid, reply } => {
-                            let changed = known.forget(&uid);
-                            if changed {
-                                let _ = known.save();
-                                let _ = events.send(Event::CardsChanged);
-                            }
-                            let _ = reply.send(changed);
-                        },
-                        Command::MarkCard { uid, mark, reply } => {
-                            let changed = known.mark(&uid, mark);
-                            if changed {
-                                let _ = known.save();
-                                let _ = events.send(Event::CardsChanged);
-                            }
-                            let _ = reply.send(changed);
-                        },
-                        Command::SetupPiv { uid, reply } => {
+                        Command::CardFrame { frame, reply } => {
                             // Checked here: an invalid frame would fail the
                             // write and drop the session.
-                            let sent = active.is_some()
-                                && uid_stable(&uid)
-                                && uid.len() <= wire::MAX_UID
+                            let valid = match &frame {
+                                Frame::CardAction { uid, action } | Frame::CardActionDone { uid, action, .. } => {
+                                    uid_stable(uid) && uid.len() <= wire::MAX_UID && (1..=wire::action::MAX).contains(action)
+                                }
+                                _ => false,
+                            };
+                            let sent = valid
+                                && active.is_some()
                                 && send_frame(
                                     &mut active, &mut received, &to_reader, &events,
-                                    &mut card_present, Frame::SetupPiv { uid }, tracer.as_mut(),
+                                    &mut card_present, frame, tracer.as_mut(),
                                 ).await?;
                             let _ = reply.send(sent);
                         },
@@ -710,6 +732,16 @@ async fn run_inner(
                     active = Some((conn, send, reader));
                     let _ = events.send(Event::PhoneConnected { name: name.clone() });
                     let _ = events.send(Event::CardPresent { present: false, uid: Vec::new() });
+                    // Sync: every record this PC has, forgotten ones too.
+                    let records: Vec<CardInfo> = known.records().cloned().collect();
+                    for info in records {
+                        if !send_frame(
+                            &mut active, &mut received, &to_reader, &events,
+                            &mut card_present, Frame::CardInfo(info), tracer.as_mut(),
+                        ).await? {
+                            break;
+                        }
+                    }
                 },
                 event = received.recv(), if active.is_some() => {
                     match event {
@@ -719,9 +751,16 @@ async fn run_inner(
                                 card_present = !atr.is_empty();
                                 probe.reset();
                                 card_uid = if card_present && uid_stable(uid) { uid.clone() } else { Vec::new() };
-                                if card_present && known.see(&card_uid, atr, unix_now()) {
-                                    let _ = known.save();
-                                    let _ = events.send(Event::CardsChanged);
+                                if card_present && !card_uid.is_empty() {
+                                    if known.see(&card_uid, atr, tapbridge_core::cards::now_ms()) {
+                                        let _ = known.save();
+                                        let _ = events.send(Event::CardsChanged);
+                                    } else {
+                                        let _ = events.send(Event::UnknownCard {
+                                            uid: card_uid.clone(),
+                                            label: known.default_label(atr),
+                                        });
+                                    }
                                 }
                                 card_generation = *generation;
                                 latest_atr.clone_from(atr);
@@ -741,9 +780,13 @@ async fn run_inner(
                             match &frame {
                                 Frame::Response { id, data, .. } => {
                                     let seen = probe.response(*id, data);
-                                    if seen.any() && known.note(&card_uid, seen) {
+                                    if seen != 0
+                                        && let Some(info) = known.note_caps(&card_uid, seen, tapbridge_core::cards::now_ms()).cloned()
+                                    {
                                         let _ = known.save();
                                         let _ = events.send(Event::CardsChanged);
+                                        // Queued for the phone after this frame is handled.
+                                        pending_sync.push(info);
                                     }
                                 }
                                 Frame::Failed { id, .. } => probe.failed(*id),
@@ -768,12 +811,37 @@ async fn run_inner(
                                 _ = shutdown.changed() => break,
                             }
                         },
-                        Some(Ok(Frame::PivSetupDone { ok })) => {
-                            let _ = events.send(Event::PivSetupDone { ok });
+                        Some(Ok(Frame::CardInfo(theirs))) => {
+                            let (reply, changed) = known.merge(&theirs);
+                            if changed {
+                                let _ = known.save();
+                                let _ = events.send(Event::CardsChanged);
+                            }
+                            if let Some(merged) = reply {
+                                send_frame(
+                                    &mut active, &mut received, &to_reader, &events,
+                                    &mut card_present, Frame::CardInfo(merged), tracer.as_mut(),
+                                ).await?;
+                            }
+                        },
+                        Some(Ok(Frame::CardAction { uid, action })) => {
+                            let _ = events.send(Event::CardActionRequested { uid, action });
+                        },
+                        Some(Ok(Frame::CardActionDone { uid, action, ok })) => {
+                            let _ = events.send(Event::CardActionDone { uid, action, ok });
                         },
                         _ => disconnect(&mut active, &mut received, &to_reader, &events, &mut card_present).await?,
                     }
                 },
+            }
+            // Caps learned from the PC's own traffic go to the phone too.
+            for info in std::mem::take(&mut pending_sync) {
+                if active.is_some() {
+                    send_frame(
+                        &mut active, &mut received, &to_reader, &events,
+                        &mut card_present, Frame::CardInfo(info), tracer.as_mut(),
+                    ).await?;
+                }
             }
             // PIV deadline watchdog: drain fired timers after each event.
             #[cfg(target_os = "macos")]
@@ -792,12 +860,6 @@ async fn run_inner(
     while handshakes.join_next().await.is_some() {}
     endpoint.close().await;
     result
-}
-
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// The tap outcome when no session is live.
@@ -965,7 +1027,8 @@ mod tests {
         assert_eq!(
             reply,
             transport::HelloReply::Accepted {
-                host_name: "Test PC".into()
+                host_name: "Test PC".into(),
+                platform: wire::platform::current(),
             }
         );
         let mut collector = Collector {
@@ -1321,73 +1384,206 @@ mod tests {
 
     const IMPLANT: [u8; 7] = [0x04, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
 
+    async fn read_phone_frame(phone: &mut PhoneSide) -> Frame {
+        tokio::time::timeout(Duration::from_secs(5), wire::read_frame(&mut phone.recv))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Reads frames until one matches (skipping sync records and the like).
+    async fn read_until(phone: &mut PhoneSide, wanted: impl Fn(&Frame) -> bool) -> Frame {
+        loop {
+            let frame = read_phone_frame(phone).await;
+            if wanted(&frame) {
+                return frame;
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_tapped_card_is_remembered_by_uid_and_random_uids_are_not() {
+    async fn unknown_cards_are_offered_and_added_ones_sync_to_the_phone() {
         let dir = tempfile::tempdir().unwrap();
         let _session = crate::test_session();
         let (handle, mut collector, mut phone) = paired_service(dir.path(), "Pixel", None).await;
         send_card(&mut phone, 1, &IMPLANT).await;
         collector
-            .wait(|event| matches!(event, Event::CardPresent { present: true, uid } if uid == &IMPLANT))
+            .wait(|event| matches!(event, Event::UnknownCard { uid, label } if uid == &IMPLANT && label == "Card 1"))
             .await;
-        collector
-            .wait(|event| matches!(event, Event::CardsChanged))
-            .await;
-        assert_eq!(handle.status().card_uid, IMPLANT);
-        let cards = handle.known_cards();
-        assert_eq!(cards.len(), 1);
-        assert_eq!(cards[0].label, "Card 1");
-        // A random UID is reported as none and not stored.
+        assert!(
+            handle.known_cards().is_empty(),
+            "a tap alone doesn't add it"
+        );
+        // A random UID is reported as none and never offered.
         send_card(&mut phone, 2, &[0x08, 1, 2, 3]).await;
         collector
             .wait(|event| matches!(event, Event::CardPresent { present: true, uid } if uid.is_empty()))
             .await;
-        assert!(handle.status().card_uid.is_empty());
-        assert_eq!(handle.known_cards().len(), 1);
-        // Rename and forget persist.
-        assert!(handle.rename_card(IMPLANT.to_vec(), "Implant".into()));
+        // Adding it sends the record to the phone.
+        assert!(handle.edit_card(IMPLANT.to_vec(), CardEdit::Add("Hand".into())));
+        let Frame::CardInfo(info) =
+            read_until(&mut phone, |f| matches!(f, Frame::CardInfo(_))).await
+        else {
+            unreachable!()
+        };
         assert_eq!(
-            crate::cards::KnownCards::open(dir.path()).list()[0].label,
+            (info.uid.as_slice(), info.label.as_str(), info.wake),
+            (&IMPLANT[..], "Hand", true)
+        );
+        assert!(handle.edit_card(IMPLANT.to_vec(), CardEdit::Rename("Implant".into())));
+        assert!(
+            !handle.edit_card(IMPLANT.to_vec(), CardEdit::Rename("Implant".into())),
+            "no change"
+        );
+        assert_eq!(
+            crate::cards::KnownCards::open(dir.path()).list()[0]
+                .info
+                .label,
             "Implant"
         );
-        assert!(handle.forget_card(IMPLANT.to_vec()));
+        assert!(handle.edit_card(IMPLANT.to_vec(), CardEdit::Forget));
         assert!(handle.known_cards().is_empty());
-        assert!(crate::cards::KnownCards::open(dir.path()).list().is_empty());
+        let Frame::CardInfo(info) = read_until(
+            &mut phone,
+            |f| matches!(f, Frame::CardInfo(i) if i.deleted()),
+        )
+        .await
+        else {
+            unreachable!()
+        };
+        assert_eq!(info.uid, IMPLANT);
         handle.shutdown();
         transport::close(&phone.conn);
         drop(phone.endpoint);
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn setup_piv_reaches_the_phone_and_its_answer_comes_back() {
+    async fn phone_records_merge_and_the_newer_copy_goes_back() {
         let dir = tempfile::tempdir().unwrap();
         let _session = crate::test_session();
         let (handle, mut collector, mut phone) = paired_service(dir.path(), "Pixel", None).await;
-        assert!(handle.setup_piv(IMPLANT.to_vec()));
-        let frame = tokio::time::timeout(Duration::from_secs(5), wire::read_frame(&mut phone.recv))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            frame,
-            Frame::SetupPiv {
-                uid: IMPLANT.to_vec()
-            }
+        assert!(handle.edit_card(IMPLANT.to_vec(), CardEdit::Add("PC name".into())));
+        assert!(handle.edit_card(IMPLANT.to_vec(), CardEdit::SetMacLogin(true)));
+        // The phone renamed it (later) and read its caps, but doesn't know
+        // about the Mac login.
+        let mut theirs = tapbridge_core::cards::CardInfo::new(
+            IMPLANT.to_vec(),
+            "Phone name".into(),
+            true,
+            crate::cards::caps::FIDO,
+            tapbridge_core::cards::now_ms() + 60_000,
         );
-        wire::write_frame(&mut phone.send, &Frame::PivSetupDone { ok: true })
+        theirs.label_at += 1;
+        wire::write_frame(&mut phone.send, &Frame::CardInfo(theirs.clone()))
             .await
             .unwrap();
         collector
-            .wait(|event| matches!(event, Event::PivSetupDone { ok: true }))
+            .wait(|event| matches!(event, Event::CardsChanged))
             .await;
-        // Still connected: the frame is not a protocol error.
+        let Frame::CardInfo(back) = read_until(
+            &mut phone,
+            |f| matches!(f, Frame::CardInfo(i) if i.label == "Phone name"),
+        )
+        .await
+        else {
+            unreachable!()
+        };
+        assert!(back.mac_login, "the PC's newer field goes back");
+        let card = handle.known_cards().remove(0);
+        assert_eq!(card.info.label, "Phone name");
+        assert!(card.info.has(crate::cards::caps::FIDO) && card.info.mac_login);
+        handle.shutdown();
+        transport::close(&phone.conn);
+        drop(phone.endpoint);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn card_actions_travel_both_ways() {
+        let dir = tempfile::tempdir().unwrap();
+        let _session = crate::test_session();
+        let (handle, mut collector, mut phone) = paired_service(dir.path(), "Pixel", None).await;
+        assert!(handle.request_card_action(IMPLANT.to_vec(), wire::action::SETUP_CERTS));
+        assert_eq!(
+            read_until(&mut phone, |f| matches!(f, Frame::CardAction { .. })).await,
+            Frame::CardAction {
+                uid: IMPLANT.to_vec(),
+                action: wire::action::SETUP_CERTS
+            }
+        );
+        wire::write_frame(
+            &mut phone.send,
+            &Frame::CardActionDone {
+                uid: IMPLANT.to_vec(),
+                action: wire::action::SETUP_CERTS,
+                ok: true,
+            },
+        )
+        .await
+        .unwrap();
+        collector
+            .wait(|event| matches!(event, Event::CardActionDone { ok: true, action, .. } if *action == wire::action::SETUP_CERTS))
+            .await;
+        // The phone asks the PC for the Mac login; the PC answers.
+        wire::write_frame(
+            &mut phone.send,
+            &Frame::CardAction {
+                uid: IMPLANT.to_vec(),
+                action: wire::action::MAC_LOGIN,
+            },
+        )
+        .await
+        .unwrap();
+        collector
+            .wait(|event| matches!(event, Event::CardActionRequested { action, .. } if *action == wire::action::MAC_LOGIN))
+            .await;
+        assert!(handle.card_action_done(IMPLANT.to_vec(), wire::action::MAC_LOGIN, false));
+        assert_eq!(
+            read_until(&mut phone, |f| matches!(f, Frame::CardActionDone { .. })).await,
+            Frame::CardActionDone {
+                uid: IMPLANT.to_vec(),
+                action: wire::action::MAC_LOGIN,
+                ok: false
+            }
+        );
+        assert!(
+            !handle.request_card_action(vec![0x08, 1, 2, 3], wire::action::SETUP_CERTS),
+            "random UID"
+        );
         assert!(handle.status().phone_connected);
         transport::close(&phone.conn);
         collector
             .wait(|event| matches!(event, Event::PhoneDisconnected))
             .await;
-        assert!(!handle.setup_piv(IMPLANT.to_vec()));
+        assert!(!handle.request_card_action(IMPLANT.to_vec(), wire::action::SETUP_CERTS));
         handle.shutdown();
+        drop(phone.endpoint);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_connecting_phone_receives_every_record_including_forgotten_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let _session = crate::test_session();
+        {
+            let mut cards = crate::cards::KnownCards::open(dir.path());
+            cards.add(&IMPLANT, "Kept", &[], 1);
+            cards.add(&[0x04, 9, 9, 9], "Gone", &[], 2);
+            cards.forget(&[0x04, 9, 9, 9], 3);
+            cards.save().unwrap();
+        }
+        let (handle, _collector, mut phone) = paired_service(dir.path(), "Pixel", None).await;
+        let mut seen = Vec::new();
+        while seen.len() < 2 {
+            if let Frame::CardInfo(info) = read_phone_frame(&mut phone).await {
+                seen.push((info.label.clone(), info.deleted()));
+            }
+        }
+        seen.sort();
+        assert_eq!(
+            seen,
+            [("Gone".to_owned(), true), ("Kept".to_owned(), false)]
+        );
+        handle.shutdown();
+        transport::close(&phone.conn);
         drop(phone.endpoint);
     }
 
@@ -1399,6 +1595,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _session = crate::test_session();
         let (handle, mut collector, mut phone) = paired_service(dir.path(), "Pixel", None).await;
+        assert!(handle.edit_card(IMPLANT.to_vec(), CardEdit::Add("Implant".into())));
+        let _ = read_until(&mut phone, |f| matches!(f, Frame::CardInfo(_))).await;
         send_card(&mut phone, 3, &IMPLANT).await;
         collector
             .wait(|event| matches!(event, Event::CardPresent { present: true, .. }))
@@ -1419,11 +1617,8 @@ mod tests {
                 let apdu = apdu.clone();
                 std::thread::spawn(move || handle.piv_transmit(apdu))
             };
-            let frame =
-                tokio::time::timeout(Duration::from_secs(5), wire::read_frame(&mut phone.recv))
-                    .await
-                    .unwrap()
-                    .unwrap();
+            // Caps learned from the previous answer sync first.
+            let frame = read_until(&mut phone, |f| matches!(f, Frame::Apdu { .. })).await;
             let Frame::Apdu {
                 id,
                 generation,
@@ -1447,7 +1642,11 @@ mod tests {
             assert_eq!(worker.join().unwrap().unwrap(), answer);
         }
         let card = handle.known_cards().remove(0);
-        assert!(card.has_piv && card.piv_certs && !card.has_fido);
+        assert!(
+            card.info
+                .has(crate::cards::caps::PIV | crate::cards::caps::CERTS)
+        );
+        assert!(!card.info.has(crate::cards::caps::FIDO));
         handle.shutdown();
         transport::close(&phone.conn);
         drop(phone.endpoint);

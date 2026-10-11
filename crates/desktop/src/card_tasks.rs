@@ -199,16 +199,17 @@ pub struct Checklist {
 
 impl Checklist {
     /// From what is known about the card. Each step needs the one before.
-    pub fn new(card: &tapbridge_host::cards::KnownCard) -> Self {
-        let applet = if card.piv_blocked {
+    pub fn new(card: &tapbridge_host::cards::CardInfo) -> Self {
+        use tapbridge_host::cards::caps;
+        let applet = if card.has(caps::BLOCKED) {
             StepState::Problem
-        } else if card.has_piv || card.piv_certs {
+        } else if card.caps & (caps::PIV | caps::CERTS) != 0 {
             StepState::Done
         } else {
             StepState::Todo
         };
         let certificates = match applet {
-            StepState::Done if card.piv_certs => StepState::Done,
+            StepState::Done if card.has(caps::CERTS) => StepState::Done,
             StepState::Done => StepState::Todo,
             _ => StepState::Locked,
         };
@@ -489,9 +490,9 @@ mod tests {
     }
 
     fn card(
-        edit: impl FnOnce(&mut tapbridge_host::cards::KnownCard),
-    ) -> tapbridge_host::cards::KnownCard {
-        let mut card = tapbridge_host::cards::KnownCard::default();
+        edit: impl FnOnce(&mut tapbridge_host::cards::CardInfo),
+    ) -> tapbridge_host::cards::CardInfo {
+        let mut card = tapbridge_host::cards::CardInfo::default();
         edit(&mut card);
         card
     }
@@ -504,28 +505,28 @@ mod tests {
             (none.applet, none.certificates, none.mac_login),
             (Todo, Locked, Locked)
         );
-        let applet = Checklist::new(&card(|c| c.has_piv = true));
+        let applet = Checklist::new(&card(|c| c.caps |= tapbridge_host::cards::caps::PIV));
         assert_eq!(
             (applet.applet, applet.certificates, applet.mac_login),
             (Done, Todo, Locked)
         );
         let certs = Checklist::new(&card(|c| {
-            c.has_piv = true;
-            c.piv_certs = true;
+            c.caps |= tapbridge_host::cards::caps::PIV;
+            c.caps |= tapbridge_host::cards::caps::CERTS;
         }));
         assert_eq!(
             (certs.applet, certs.certificates, certs.mac_login),
             (Done, Done, Todo)
         );
         let ready = Checklist::new(&card(|c| {
-            c.has_piv = true;
-            c.piv_certs = true;
+            c.caps |= tapbridge_host::cards::caps::PIV;
+            c.caps |= tapbridge_host::cards::caps::CERTS;
             c.mac_login = true;
         }));
         assert!(ready.ready());
         // A stale Mac login flag can't skip missing certificates.
         let stale = Checklist::new(&card(|c| {
-            c.has_piv = true;
+            c.caps |= tapbridge_host::cards::caps::PIV;
             c.mac_login = true;
         }));
         assert_eq!(stale.mac_login, Locked);
@@ -534,8 +535,8 @@ mod tests {
     #[test]
     fn a_blocking_applet_is_a_problem_and_locks_the_rest() {
         let blocked = Checklist::new(&card(|c| {
-            c.has_piv = true;
-            c.piv_blocked = true;
+            c.caps |= tapbridge_host::cards::caps::PIV;
+            c.caps |= tapbridge_host::cards::caps::BLOCKED;
         }));
         assert_eq!(blocked.applet, StepState::Problem);
         assert_eq!(blocked.certificates, StepState::Locked);

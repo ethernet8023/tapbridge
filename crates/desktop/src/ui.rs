@@ -260,25 +260,21 @@ impl PairingView {
                 TEXT,
             ),
         };
+        // A card must come through before setup is done: no Skip. The
+        // window can still be closed; the test starts again next pairing.
         let mut buttons = div().flex().flex_row().gap(px(10.0));
         buttons = match &self.test {
-            Some(TestTap::Works { .. }) | None => buttons
+            Some(TestTap::Works { .. }) => buttons
                 .child(button("test-done", "Done", ACCENT, 0.6, cx).on_click(cx.listener(close))),
-            Some(TestTap::TimedOut) => buttons
-                .child(
-                    button("test-retry", "Try again", ACCENT, 0.6, cx).on_click(cx.listener(
-                        |view, _: &gpui::ClickEvent, _, cx| {
-                            view.test = Some(TestTap::start(Instant::now()));
-                            cx.notify();
-                        },
-                    )),
-                )
-                .child(
-                    button("test-skip", "Skip", 0xFFFFFF, 0.06, cx).on_click(cx.listener(close)),
-                ),
-            Some(TestTap::Waiting { .. }) => buttons.child(
-                button("test-skip", "Skip", 0xFFFFFF, 0.06, cx).on_click(cx.listener(close)),
-            ),
+            Some(TestTap::TimedOut) => {
+                buttons.child(button("test-retry", "Try again", ACCENT, 0.6, cx).on_click(
+                    cx.listener(|view, _: &gpui::ClickEvent, _, cx| {
+                        view.test = Some(TestTap::start(Instant::now()));
+                        cx.notify();
+                    }),
+                ))
+            }
+            Some(TestTap::Waiting { .. }) | None => buttons,
         };
         glass::panel("test-card", 14.0, cx)
             .w(px(380.0))
@@ -1918,6 +1914,19 @@ fn build_qr(text: &str) -> Option<(Vec<bool>, u16)> {
 pub fn settings_new_card(handle: WindowHandle<SettingsView>, uid: Vec<u8>, cx: &mut App) {
     let _ = handle.update(cx, |view, window, cx| {
         view.new_card(uid, window, cx);
+        window.activate();
+    });
+}
+
+/// Shows a card's "Set up login" dialog in an open Settings window (the
+/// phone asked for the Mac login), unless another dialog is up.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn settings_open_login(handle: WindowHandle<SettingsView>, uid: Vec<u8>, cx: &mut App) {
+    let _ = handle.update(cx, |view, window, cx| {
+        if view.dialog.is_none() {
+            view.dialog = Some(CardDialog::Login(uid));
+            cx.notify();
+        }
         window.activate();
     });
 }

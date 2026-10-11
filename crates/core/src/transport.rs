@@ -116,7 +116,10 @@ pub async fn client_hello(
     .await?;
     let reply = read_frame(recv).await?;
     match reply {
-        Frame::Accepted { name } => Ok(HelloReply::Accepted { host_name: name }),
+        Frame::Accepted { name, platform } => Ok(HelloReply::Accepted {
+            host_name: name,
+            platform,
+        }),
         Frame::Rejected => Ok(HelloReply::Rejected),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -145,15 +148,23 @@ impl std::fmt::Debug for ClientHello {
 /// The host's verdict on a Hello.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HelloReply {
-    /// Host accepted the session and told us its display name.
-    Accepted { host_name: String },
+    /// Host accepted the session and told us its display name and OS
+    /// ([`crate::wire::platform`]).
+    Accepted { host_name: String, platform: u8 },
     /// Host rejected; treat the session as dead.
     Rejected,
 }
 
 /// Host reply helpers used by [`host_handle_hello`] or custom host loops.
 pub async fn reply_accepted(send: &mut SendStream, name: String) -> io::Result<()> {
-    write_frame(send, &Frame::Accepted { name }).await
+    write_frame(
+        send,
+        &Frame::Accepted {
+            name,
+            platform: crate::wire::platform::current(),
+        },
+    )
+    .await
 }
 
 /// See [`reply_accepted`].

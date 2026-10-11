@@ -1,4 +1,33 @@
-use tapbridge_core::wire::{Frame, MAX_NAME, MAX_PUSH, MAX_UID, VERSION, read_frame, write_frame};
+use tapbridge_core::cards::{CardInfo, caps};
+use tapbridge_core::wire::{
+    Frame, MAX_NAME, MAX_PUSH, MAX_UID, VERSION, action, platform, read_frame, write_frame,
+};
+
+fn card() -> CardInfo {
+    CardInfo::new(
+        vec![0x04, 0x2C, 0x26, 0x82, 0xF2, 0x6F, 0x80],
+        "hand \u{270b}".into(),
+        true,
+        caps::FIDO | caps::PIV | caps::CERTS,
+        1_791_670_000_000,
+    )
+}
+
+#[tokio::test]
+async fn a_bad_flag_byte_in_card_info_is_rejected() {
+    let mut bytes = Vec::new();
+    write_frame(&mut bytes, &Frame::CardInfo(card()))
+        .await
+        .unwrap();
+    // The wake flag sits right after uid, label and label_at.
+    let wake = 4 + 2 + 1 + 7 + 2 + "hand \u{270b}".len() + 8;
+    assert_eq!(bytes[wake], 1);
+    bytes[wake] = 2;
+    assert_eq!(
+        read_frame(&mut bytes.as_slice()).await.unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+}
 
 fn hello(name: &str, push: Option<&str>) -> Frame {
     Frame::Hello {
@@ -19,6 +48,7 @@ async fn carries_pairing_presence_and_cancellation_in_order() {
         hello("p", None),
         Frame::Accepted {
             name: "Desk PC \u{1f5a5}".into(),
+            platform: platform::MACOS,
         },
         Frame::Rejected,
         Frame::Card {
@@ -51,11 +81,22 @@ async fn carries_pairing_presence_and_cancellation_in_order() {
         Frame::Cancel { id: 10 },
         Frame::ReadCard,
         Frame::Auth { state: 2 },
-        Frame::SetupPiv {
+        Frame::CardInfo(card()),
+        Frame::CardInfo(CardInfo {
+            deleted_at: 99,
+            mac_login: true,
+            mac_login_at: 7,
+            ..card()
+        }),
+        Frame::CardAction {
             uid: vec![0x04, 1, 2, 3, 4, 5, 6],
+            action: action::SETUP_CERTS,
         },
-        Frame::PivSetupDone { ok: true },
-        Frame::PivSetupDone { ok: false },
+        Frame::CardActionDone {
+            uid: vec![0x04, 1, 2, 3],
+            action: action::MAC_LOGIN,
+            ok: true,
+        },
     ];
     let mut bytes = Vec::new();
     for frame in &frames {
@@ -103,9 +144,38 @@ async fn rejects_oversized_card_and_apdu_before_writing() {
             max_apdu: 0,
             uid: vec![4, 1, 2, 3],
         },
-        Frame::SetupPiv { uid: vec![] },
-        Frame::SetupPiv {
+        Frame::CardAction {
+            uid: vec![],
+            action: action::SETUP_CERTS,
+        },
+        Frame::CardAction {
             uid: vec![1; MAX_UID + 1],
+            action: action::SETUP_CERTS,
+        },
+        Frame::CardAction {
+            uid: vec![4, 1],
+            action: 0,
+        },
+        Frame::CardActionDone {
+            uid: vec![4, 1],
+            action: action::MAX + 1,
+            ok: true,
+        },
+        Frame::CardInfo(CardInfo {
+            label: String::new(),
+            ..card()
+        }),
+        Frame::CardInfo(CardInfo {
+            uid: vec![],
+            ..card()
+        }),
+        Frame::CardInfo(CardInfo {
+            caps: 0x80,
+            ..card()
+        }),
+        Frame::Accepted {
+            name: "PC".into(),
+            platform: platform::MAX + 1,
         },
         Frame::Apdu {
             id: 1,
@@ -123,9 +193,11 @@ async fn rejects_oversized_card_and_apdu_before_writing() {
         hello("p", Some(&"t".repeat(MAX_PUSH + 1))),
         Frame::Accepted {
             name: String::new(),
+            platform: platform::MACOS,
         },
         Frame::Accepted {
             name: "n".repeat(MAX_NAME + 1),
+            platform: platform::MACOS,
         },
     ];
     for frame in invalid {
@@ -163,10 +235,12 @@ async fn rejects_malformed_headers_and_trailing_control_bytes() {
         vec![v, 2, 0],
         vec![v, 0, 2],
         vec![v, 7, 0],
-        // Accepted without a name, with a truncated name, with trailing bytes.
+        // Accepted without a name, with a truncated name, without a
+        // platform, with trailing bytes.
         vec![v, 1],
         vec![v, 1, 0, 3, b'a'],
-        vec![v, 1, 0, 1, b'a', 0],
+        vec![v, 1, 0, 1, b'a'],
+        vec![v, 1, 0, 1, b'a', 1, 0],
         // Hello: invalid UTF-8 name, empty name, bad push flag, trailing byte.
         vec![v, 0, 0, 0, 1, 0xff, 0],
         vec![v, 0, 0, 0, 0, 0],
@@ -174,14 +248,17 @@ async fn rejects_malformed_headers_and_trailing_control_bytes() {
         vec![v, 0, 0, 0, 1, b'p', 0, 0],
         // Hello with a truncated capability.
         vec![v, 0, 1, 0, 0],
-        // PivSetupDone: missing flag, flag out of range, trailing byte.
-        vec![v, 11],
-        vec![v, 11, 2],
-        vec![v, 11, 1, 0],
-        // SetupPiv: missing length, truncated UID, trailing byte.
+        // CardAction: missing action, truncated UID, trailing byte.
+        vec![v, 11, 1, 4],
+        vec![v, 11, 4, 1, 2, 3],
+        vec![v, 11, 1, 4, 1, 0],
+        // CardActionDone: missing flag, flag out of range, trailing byte.
+        vec![v, 12, 1, 4, 1],
+        vec![v, 12, 1, 4, 1, 2],
+        vec![v, 12, 1, 4, 1, 1, 0],
+        // CardInfo: truncated.
         vec![v, 10],
-        vec![v, 10, 4, 1, 2, 3],
-        vec![v, 10, 1, 1, 0],
+        vec![v, 10, 1, 4, 0, 1, b'a'],
     ] {
         let mut bytes = (body.len() as u32).to_be_bytes().to_vec();
         bytes.extend(body);
@@ -232,10 +309,16 @@ async fn frame_layout_is_fixed_and_secrets_are_redacted() {
         [0, 0, 0, 11, VERSION, 0, 0, 0, 1, b'p', 1, 0, 2, b't', b'k']
     );
     let mut bytes = Vec::new();
-    write_frame(&mut bytes, &Frame::Accepted { name: "PC".into() })
-        .await
-        .unwrap();
-    assert_eq!(bytes, [0, 0, 0, 6, VERSION, 1, 0, 2, b'P', b'C']);
+    write_frame(
+        &mut bytes,
+        &Frame::Accepted {
+            name: "PC".into(),
+            platform: platform::MACOS,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(bytes, [0, 0, 0, 7, VERSION, 1, 0, 2, b'P', b'C', 1]);
     assert_eq!(
         format!(
             "{:?}",
