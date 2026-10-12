@@ -984,6 +984,7 @@ pub enum SettingsAction {
     Pair,
     Forget,
     SetAutostart(bool),
+    SetAlwaysPresent(bool),
     RenameCard(Vec<u8>, String),
     ForgetCard(Vec<u8>),
     SetUpCard(Vec<u8>),
@@ -1005,6 +1006,7 @@ impl SettingsAction {
             Self::Pair => "pair",
             Self::Forget => "forget phone",
             Self::SetAutostart(_) => "set autostart",
+            Self::SetAlwaysPresent(_) => "set always present",
             Self::RenameCard(..) => "rename card",
             Self::ForgetCard(_) => "forget card",
             Self::SetUpCard(_) => "set up certificates",
@@ -1061,6 +1063,8 @@ pub struct SettingsSnapshot {
     pub phone: Option<String>,
     pub phone_connected: bool,
     pub autostart: bool,
+    /// The login card always shows as present; `None` where unsupported.
+    pub always_present: Option<bool>,
     /// Known cards, shown once a phone is paired.
     pub cards: Vec<CardRow>,
     /// A card action is running: no new one can start.
@@ -1728,10 +1732,7 @@ impl Render for SettingsView {
 
         let (phone_title, phone_detail) = match &snapshot.phone {
             Some(name) if snapshot.phone_connected => (name.clone(), Some("Paired & online")),
-            Some(name) => (
-                name.clone(),
-                Some("Paired"),
-            ),
+            Some(name) => (name.clone(), Some("Paired")),
             None => ("No phone paired".to_owned(), None),
         };
         let phone_button = if snapshot.phone.is_some() {
@@ -1826,7 +1827,29 @@ impl Render for SettingsView {
                     view.act(SettingsAction::SetAutostart(!autostart), cx);
                     cx.notify();
                 })),
-            );
+            )
+            .when_some(snapshot.always_present, |general, always| {
+                general.child(
+                    option_row(
+                        "opt-always-present",
+                        always,
+                        true,
+                        "Card always ready",
+                        "Your login card shows as inserted even before you tap it, so \
+                         the lock screen and sudo ask for it straight away. If you \
+                         don't tap within 25 seconds, you can use your password."
+                            .to_owned(),
+                        cx,
+                    )
+                    .on_click(cx.listener(
+                        move |view, _: &gpui::ClickEvent, _, cx| {
+                            view.snapshot.always_present = Some(!always);
+                            view.act(SettingsAction::SetAlwaysPresent(!always), cx);
+                            cx.notify();
+                        },
+                    )),
+                )
+            });
 
         let column = div()
             .flex()

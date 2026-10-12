@@ -91,6 +91,9 @@ struct Shell {
     about: Option<WindowHandle<crate::about::AboutView>>,
     /// Start-at-login state, cached: Settings re-renders from it every tick.
     autostart: bool,
+    /// macOS: the login card always shows as present (see
+    /// [`crate::macos::AlwaysPresent`]).
+    always_present: bool,
     /// Shown in the tray until the next state change (e.g. relay problems).
     notice: Option<String>,
     /// Why the host service failed to start, shown in Settings → Details.
@@ -171,6 +174,7 @@ pub fn preview_ui() {
             phone: Some("Pixel 9 Pro XL".into()),
             phone_connected: true,
             autostart: true,
+            always_present: Some(false),
             cards: vec![
                 {
                     let flex = [
@@ -311,6 +315,7 @@ fn shell_setup(
         settings: None,
         about: None,
         autostart: autostart::is_enabled(),
+        always_present: always_present_load(&state_dir),
         notice: None,
         service_error: None,
         waiting_since: None,
@@ -362,6 +367,22 @@ impl InstanceGuard for NoopInstance {
     // macOS: no second-instance signaling; host.lock guards single runs.
 }
 
+/// Reads the saved always-present setting and applies it to the IFD server.
+fn always_present_load(state_dir: &std::path::Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let enabled = crate::macos::always_present_saved(state_dir);
+        crate::macos::ALWAYS_PRESENT.load_cache(state_dir);
+        crate::macos::ALWAYS_PRESENT.set_enabled(enabled);
+        enabled
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = state_dir;
+        false
+    }
+}
+
 fn spawn_service(state_dir: PathBuf, trace: bool, events: mpsc::Sender<UiEvent>) {
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -407,9 +428,14 @@ fn spawn_ifd_server(handle: &ServiceHandle, events: &mpsc::Sender<UiEvent>) {
             let service = handle.clone();
             let events = events.clone();
             std::thread::spawn(move || {
-                macos::serve(listener, service, move || {
-                    let _ = events.send(UiEvent::WakeRequested);
-                });
+                macos::serve(
+                    listener,
+                    service,
+                    move || {
+                        let _ = events.send(UiEvent::WakeRequested);
+                    },
+                    &macos::ALWAYS_PRESENT,
+                );
             });
             logging::log("ifd: PC/SC reader socket listening");
         }
@@ -871,6 +897,19 @@ fn settings_action(action: ui::SettingsAction, cx: &mut App) {
             logging::log(&format!("start at login -> {enabled}: {result:?}"));
             cx.update_global::<Shell, _>(|shell, _| shell.autostart = autostart::is_enabled());
         }
+        ui::SettingsAction::SetAlwaysPresent(enabled) => {
+            #[cfg(target_os = "macos")]
+            cx.update_global::<Shell, _>(|shell, _| {
+                let result = crate::macos::always_present_save(&shell.state_dir, enabled);
+                logging::log(&format!("always-present card -> {enabled}: {result:?}"));
+                if result.is_ok() {
+                    crate::macos::ALWAYS_PRESENT.set_enabled(enabled);
+                    shell.always_present = enabled;
+                }
+            });
+            #[cfg(not(target_os = "macos"))]
+            let _ = enabled;
+        }
         ui::SettingsAction::RenameCard(uid, label) => {
             cx.update_global::<Shell, _>(|shell, _| {
                 if let Some(service) = shell.service.as_ref() {
@@ -1091,6 +1130,16 @@ impl Shell {
         if let Some(service) = self.service.as_ref() {
             self.cards = service.known_cards();
         }
+        // The always-present card is the one paired with this Mac's login.
+        #[cfg(target_os = "macos")]
+        crate::macos::ALWAYS_PRESENT.set_atr(
+            self.cards
+                .iter()
+                .rev()
+                .find(|known| known.info.login && !known.info.deleted() && !known.atr.is_empty())
+                .map(|known| known.atr.clone())
+                .unwrap_or_default(),
+        );
     }
 
     fn card_rows(&self, status: &service::Status) -> Vec<ui::CardRow> {
@@ -1216,6 +1265,7 @@ impl Shell {
             }),
             phone_connected: status.phone_connected,
             autostart: self.autostart,
+            always_present: cfg!(target_os = "macos").then_some(self.always_present),
             cards: self.card_rows(&status),
             card_busy: self.card_task.as_ref().is_some_and(CardTask::busy),
         }
