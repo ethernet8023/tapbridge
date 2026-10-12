@@ -1,7 +1,8 @@
 # Builds every app on every push to main and every pull request:
 #   macOS    tests + clippy, tapbridge.app + IFD bundle -> unsigned .pkg
 #   Windows  tests (x64), tapbridge.exe + Inno Setup installer (x64, arm64)
-#   Android  unit tests, debug APK with the Rust JNI library (16 KB checked)
+#   Android  unit tests, debug APK with the Rust JNI library (16 KB checked),
+#            carrying both Windows installers (Settings -> Install on a PC)
 # Artifacts are unsigned dev builds (the macOS app is ad-hoc signed; its
 # virtual security key only runs with AMFI off, see spikes/fido-hid).
 name: build
@@ -107,6 +108,9 @@ jobs:
           if-no-files-found: error
 
   android:
+    # Waits for both Windows installers: the APK carries them so the phone
+    # can hand the PC app over USB tethering (USB plan, Track I).
+    needs: windows
     runs-on: ubuntu-24.04
     env:
       NDK_VERSION: 27.2.12479018
@@ -162,6 +166,28 @@ jobs:
           }
           JSON
           fi
+      - uses: actions/download-artifact@v5
+        with:
+          name: tapbridge-windows-x64
+          path: windows-artifacts/x64
+      - uses: actions/download-artifact@v5
+        with:
+          name: tapbridge-windows-arm64
+          path: windows-artifacts/arm64
+      - name: Bundle Windows installers
+        run: |
+          dest=android/app/src/main/assets/installer
+          mkdir -p "$dest"
+          shopt -s nullglob
+          for arch in x64 arm64; do
+            files=(windows-artifacts/$arch/*-setup.exe windows-artifacts/$arch/dist/*-setup.exe)
+            if [ ${#files[@]} -ne 1 ]; then
+              echo "::error::expected one $arch setup.exe, found ${#files[@]}"
+              exit 1
+            fi
+            cp "${files[0]}" "$dest/"
+          done
+          ls -l "$dest"
       - name: Unit tests + debug APK
         run: scripts/build-android.sh testDebugUnitTest assembleDebug --console=plain
       - uses: actions/upload-artifact@v5
