@@ -35,7 +35,30 @@ object NativeBridge {
         pushToken: String,
     ): Long
 
-    /** Host display name from the Accepted reply (null on error). */
+    /**
+     * USB step 1, blocking (worker thread): runs the signed USB handshake on
+     * the accessory [fd] (ParcelFileDescriptor.getFd(); the caller keeps and
+     * later closes the PFD, Rust works on a dup). Returns a handle whose host
+     * is verified ([hostId], [hostName], [pairingOpen]); frame calls fail
+     * until [usbHello] succeeded. close()/release() as for [connect].
+     */
+    @JvmStatic external fun usbOpen(fd: Int, key: ByteArray): Long
+
+    /**
+     * USB step 2, blocking: sends Hello (with the PC's pairing capability
+     * when [usePairing], i.e. the user confirmed pairing) and waits for
+     * Accepted. Throws IOException on Rejected or a closed link.
+     */
+    @JvmStatic external fun usbHello(handle: Long, usePairing: Boolean, phoneName: String, pushToken: String)
+
+    /** Verified id (64 hex) of the PC on this handle (null on error). */
+    @JvmStatic external fun hostId(handle: Long): String?
+
+    /** The PC's pairing window is open (USB handshake only). */
+    @JvmStatic external fun pairingOpen(handle: Long): Boolean
+
+    /** Host display name from the Accepted reply (over USB before usbHello:
+     *  the handshake's name). Null on error. */
     @JvmStatic external fun hostName(handle: Long): String?
 
     /** Host OS from the Accepted reply ([PLATFORM_MACOS] etc.; -1 on error). For wording only. */

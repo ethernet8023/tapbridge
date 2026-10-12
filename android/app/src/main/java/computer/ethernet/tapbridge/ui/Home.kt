@@ -76,11 +76,17 @@ enum class HomeStatus { UNPAIRED, CONNECTING, CONNECTED, ERROR }
 
 /** Status card with an animated presence dot and cross-faded copy. */
 @Composable
-fun StatusCard(status: HomeStatus, hostName: String?, error: String?, modifier: Modifier = Modifier) {
+fun StatusCard(
+    status: HomeStatus,
+    hostName: String?,
+    error: String?,
+    modifier: Modifier = Modifier,
+    viaUsb: Boolean = false,
+) {
     val description = when (status) {
         HomeStatus.UNPAIRED -> "Not paired yet"
         HomeStatus.CONNECTING -> "Connecting to the PC"
-        HomeStatus.CONNECTED -> "Connected to the PC"
+        HomeStatus.CONNECTED -> if (viaUsb) "Connected to the PC via USB" else "Connected to the PC"
         HomeStatus.ERROR -> "Connection failed"
     }
     ElevatedCard(
@@ -90,13 +96,13 @@ fun StatusCard(status: HomeStatus, hostName: String?, error: String?, modifier: 
         shape = RoundedCornerShape(28.dp),
     ) {
         AnimatedContent(
-            targetState = status to (hostName ?: ""),
+            targetState = Triple(status, hostName ?: "", viaUsb),
             transitionSpec = {
                 (fadeIn(tween(260)) + slideInVertically(tween(260)) { it / 3 })
                     .togetherWith(fadeOut(tween(160)) + slideOutVertically(tween(160)) { -it / 3 })
             },
             label = "status",
-        ) { (state, name) ->
+        ) { (state, name, usb) ->
             Row(
                 Modifier.padding(horizontal = 20.dp, vertical = 18.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -118,7 +124,7 @@ fun StatusCard(status: HomeStatus, hostName: String?, error: String?, modifier: 
                         text = when (state) {
                             HomeStatus.UNPAIRED -> "Scan the code your PC shows to get started."
                             HomeStatus.CONNECTING -> if (name.isEmpty()) "Reaching your PC" else "Reaching $name"
-                            HomeStatus.CONNECTED -> "Online"
+                            HomeStatus.CONNECTED -> if (usb) "Connected via USB" else "Online"
                             HomeStatus.ERROR -> error ?: "Check that tapbridge is running on the PC."
                         },
                         style = MaterialTheme.typography.bodyMedium,

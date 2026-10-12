@@ -36,6 +36,8 @@ pub enum TrayState {
 }
 
 /// Menu titles. macOS matches the item by title to swap in an SF Symbol.
+const ABOUT_TITLE: &str = "About tapbridge";
+
 /// macOS keeps the classic "Preferences…" wording; Windows says "Settings…".
 const SETTINGS_TITLE: &str = if cfg!(target_os = "macos") {
     "Preferences\u{2026}"
@@ -76,7 +78,7 @@ impl Tray {
             Some(NativeIcon::PreferencesGeneral),
             Some(Accelerator::new(COMMAND, Code::Comma)),
         );
-        let about_item = MenuItem::with_id("about", "About tapbridge", true, None);
+        let about_item = MenuItem::with_id("about", ABOUT_TITLE, true, None);
         let quit_item = MenuItem::with_id(
             "quit",
             QUIT_TITLE,
@@ -94,7 +96,14 @@ impl Tray {
         ])
         .map_err(|e| e.to_string())?;
         #[cfg(target_os = "macos")]
-        use_sf_symbol(&menu, SETTINGS_TITLE, "gearshape");
+        {
+            use_svg_icon(
+                &menu,
+                SETTINGS_TITLE,
+                include_bytes!("../assets/ui/gear.svg"),
+            );
+            use_svg_icon(&menu, ABOUT_TITLE, include_bytes!("../assets/ui/info.svg"));
+        }
         let builder = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("tapbridge");
@@ -168,22 +177,30 @@ impl Tray {
     }
 }
 
-/// Replaces a menu item's image with an SF Symbol (template, so it follows
-/// the menu's light/dark appearance). muda only knows `NSImageName`s, whose
-/// gear is the old full-colour System Preferences icon.
+/// Replaces a menu item's image with one of our SVG glyphs (SF Symbols
+/// exports), as a template so it follows the menu's light/dark appearance.
+/// NSImage reads SVG itself (macOS 13+).
 #[cfg(target_os = "macos")]
-fn use_sf_symbol(menu: &Menu, title: &str, symbol: &str) {
+fn use_svg_icon(menu: &Menu, title: &str, svg: &[u8]) {
+    use objc2::AllocAnyThread;
     use objc2_app_kit::{NSImage, NSMenu};
-    use objc2_foundation::NSString;
+    use objc2_foundation::{NSData, NSSize, NSString};
     use tray_icon::menu::ContextMenu;
     // SAFETY: the NSMenu lives as long as `menu` (and the tray retains it);
     // the tray is built on the main thread, where AppKit calls belong.
     let ns_menu = unsafe { &*(menu.ns_menu() as *const NSMenu) };
-    if let Some(item) = ns_menu.itemWithTitle(&NSString::from_str(title)) {
-        let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-            &NSString::from_str(symbol),
-            None,
-        );
-        item.setImage(image.as_deref());
-    }
+    let Some(item) = ns_menu.itemWithTitle(&NSString::from_str(title)) else {
+        return;
+    };
+    let data = NSData::with_bytes(svg);
+    let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else {
+        return;
+    };
+    // About the size of an SF Symbol at the menu font size (these SVG
+    // exports are tight to the glyph); keep the aspect ratio.
+    let natural = image.size();
+    let scale = 13.0 / natural.width.max(natural.height).max(1.0);
+    image.setSize(NSSize::new(natural.width * scale, natural.height * scale));
+    image.setTemplate(true);
+    item.setImage(Some(&image));
 }

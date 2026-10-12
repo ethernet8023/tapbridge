@@ -1,6 +1,7 @@
 package computer.ethernet.tapbridge.ui
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -9,6 +10,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Badge
+import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.*
@@ -116,6 +118,8 @@ fun SettingsScreen(
     onPairAnother: () -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
+    /** Null when this APK carries no PC installers (local builds). */
+    onInstallOnPc: (() -> Unit)? = null,
 ) {
     // The saved name is tracked here: the caller's value is not observable.
     var savedName by remember { mutableStateOf(phoneName) }
@@ -201,6 +205,14 @@ fun SettingsScreen(
             Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(6.dp))
             Text(if (hosts.isEmpty()) "Pair a PC" else "Pair another PC")
+        }
+        if (onInstallOnPc != null) {
+            ListItem(
+                leadingContent = { Icon(Icons.Filled.Computer, contentDescription = null) },
+                headlineContent = { Text("Install tapbridge on a PC") },
+                supportingContent = { Text("Send the Windows app from this phone over a USB cable") },
+                modifier = Modifier.clickable(onClick = onInstallOnPc),
+            )
         }
         HorizontalDivider(Modifier.padding(vertical = 16.dp))
         Text(

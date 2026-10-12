@@ -181,6 +181,8 @@ pub fn preview_ui() {
             health: crate::ui::Health::Good,
             phone: Some("Pixel 9 Pro XL".into()),
             phone_connected: true,
+            usb: true,
+            use_usb: true,
             autostart: true,
             always_present: Some(false),
             security: cfg!(target_os = "macos").then(|| crate::ui::Security {
@@ -269,6 +271,7 @@ pub fn preview_ui() {
             Ok("paired") => {
                 let window = crate::ui::open_pairing_window(
                     "tapbridge-preview-invitation-0123456789abcdef",
+                    true,
                     None,
                     preview_action,
                     cx,
@@ -281,6 +284,7 @@ pub fn preview_ui() {
             _ => {
                 crate::ui::open_pairing_window(
                     "tapbridge-preview-invitation-0123456789abcdef",
+                    true,
                     None,
                     preview_action,
                     cx,
@@ -457,6 +461,7 @@ fn spawn_service(state_dir: PathBuf, trace: bool, events: mpsc::Sender<UiEvent>)
         }));
         match started {
             Ok(handle) => {
+                crate::usb_link::spawn(handle.clone(), runtime.handle().clone());
                 #[cfg(target_os = "macos")]
                 spawn_ifd_server(&handle, &events);
                 #[cfg(target_os = "macos")]
@@ -762,7 +767,10 @@ fn handle_event(event: UiEvent, cx: &mut App) {
                     task.paired(ok, text);
                     if let Some(service) = shell.service.as_ref() {
                         if ok {
-                            service.edit_card(task.uid.clone(), service::CardEdit::SetLogin(true));
+                            service.edit_card(
+                                task.uid.clone(),
+                                service::CardEdit::SetLogin(!task.unpair),
+                            );
                         }
                         if shell.phone_asked_login.as_ref() == Some(&task.uid) {
                             service.card_action_done(
@@ -886,6 +894,14 @@ fn run_card_effect(effect: Effect, cx: &mut App) {
                 let _ = events.send(UiEvent::LoginDone(ok, message));
             });
         }
+        Effect::RunUnpairing => {
+            let events = cx.global::<Shell>().events.clone();
+            logging::log("login: unpairing the card on the phone");
+            std::thread::spawn(move || {
+                let (ok, message) = login::unpair_present_card();
+                let _ = events.send(UiEvent::LoginDone(ok, message));
+            });
+        }
     }
 }
 
@@ -970,6 +986,15 @@ fn settings_action(action: ui::SettingsAction, cx: &mut App) {
             cx.update_global::<Shell, _>(|shell, _| {
                 if let Some(service) = shell.service.as_ref() {
                     service.forget_phone();
+                }
+                shell.refresh_tray();
+            });
+        }
+        ui::SettingsAction::SetUseUsb(enabled) => {
+            logging::log(&format!("use usb cable -> {enabled}"));
+            cx.update_global::<Shell, _>(|shell, _| {
+                if let Some(service) = shell.service.as_ref() {
+                    service.set_use_usb(enabled);
                 }
                 shell.refresh_tray();
             });
@@ -1073,6 +1098,11 @@ fn settings_action(action: ui::SettingsAction, cx: &mut App) {
                 start_login(uid, cx);
             }
         }
+        ui::SettingsAction::RemoveLogin(uid) => {
+            if login::SUPPORTED {
+                start_unpair(uid, cx);
+            }
+        }
         ui::SettingsAction::CheckCard => {
             logging::log("cards: asking for a tap to check the card");
             request_tap(cx);
@@ -1110,6 +1140,30 @@ fn start_login(uid: Vec<u8>, cx: &mut App) -> bool {
     cx.update_global::<Shell, _>(|shell, _| shell.card_task = Some(task));
     run_card_effect(effect, cx);
     true
+}
+
+/// Starts removing the card from this PC's login unless another card
+/// task is running.
+fn start_unpair(uid: Vec<u8>, cx: &mut App) {
+    if cx
+        .global::<Shell>()
+        .card_task
+        .as_ref()
+        .is_some_and(CardTask::busy)
+    {
+        return;
+    }
+    let status = cx
+        .global::<Shell>()
+        .service
+        .as_ref()
+        .map(ServiceHandle::status)
+        .unwrap_or_default();
+    let present = status.card_present && status.card_uid == uid;
+    logging::log("login: removing a card from the login");
+    let (task, effect) = CardTask::unpair(uid, present, Instant::now());
+    cx.update_global::<Shell, _>(|shell, _| shell.card_task = Some(task));
+    run_card_effect(effect, cx);
 }
 
 /// The phone asks this PC to do something for a card. Only the login
@@ -1208,13 +1262,14 @@ fn request_tap(cx: &mut App) -> bool {
 }
 
 fn open_pairing(cx: &mut App) {
-    let (invitation, existing) = {
+    let (invitation, usb_hint, existing) = {
         let shell = cx.global::<Shell>();
         (
             shell
                 .service
                 .as_ref()
                 .and_then(ServiceHandle::mint_invitation),
+            shell.service.as_ref().is_some_and(|s| s.status().use_usb),
             shell.pairing,
         )
     };
@@ -1225,7 +1280,13 @@ fn open_pairing(cx: &mut App) {
     logging::log("pairing: invitation minted");
     #[cfg(target_os = "macos")]
     macos::dock::bring_to_front();
-    let window = ui::open_pairing_window(&invitation.to_string(), existing, settings_action, cx);
+    let window = ui::open_pairing_window(
+        &invitation.to_string(),
+        usb_hint,
+        existing,
+        settings_action,
+        cx,
+    );
     cx.update_global::<Shell, _>(|shell, _| shell.pairing = Some(window));
 }
 
@@ -1350,6 +1411,8 @@ impl Shell {
             (format!("Card present ({phone})"), TrayState::Card)
         } else if self.waiting_since.is_some() {
             (format!("Tap your key on {phone}"), TrayState::Waiting)
+        } else if status.phone_connected && status.usb {
+            (format!("{phone} connected (USB)"), TrayState::Connected)
         } else if status.phone_connected {
             (format!("{phone} connected"), TrayState::Connected)
         } else if status.paired {
@@ -1383,6 +1446,8 @@ impl Shell {
                     .unwrap_or_else(|| "Phone".to_owned())
             }),
             phone_connected: status.phone_connected,
+            usb: status.usb,
+            use_usb: status.use_usb,
             autostart: self.autostart,
             always_present: cfg!(target_os = "macos").then_some(self.always_present),
             security: self.security.clone(),
@@ -1418,6 +1483,18 @@ impl Shell {
                 lines.push(format!(
                     "Phone can be woken: {}",
                     if status.push_stored { "yes" } else { "no" }
+                ));
+                lines.push(format!(
+                    "Connection: {}",
+                    match (status.phone_connected, status.usb) {
+                        (false, _) => "none",
+                        (true, true) => "USB cable",
+                        (true, false) => "network",
+                    }
+                ));
+                lines.push(format!(
+                    "USB cable: {}",
+                    if status.use_usb { "on" } else { "off" }
                 ));
             }
             None => lines.push(match &self.service_error {

@@ -20,6 +20,7 @@ Your card does all the secret work. Your phone and computer only pass messages b
 - **One phone, many computers.** Pair the same phone with your desktop and your laptop.
 - **Careful with your card.** tapbridge never replaces certificates already on your card unless you clearly ask it to, and it never guesses your PIN.
 - **Mac security settings in one place.** Use your card for `sudo`, `su` and SSH, lock the screen when the card goes away, or turn off passwords entirely.
+- **Install the PC app from your phone.** Plug the phone into a Windows PC, turn on USB tethering, and download the installer from the phone in the PC's browser (Settings → Install tapbridge on a PC).
 - **Works on macOS and Windows.** The phone app is for Android phones with NFC.
 
 ## Development

@@ -55,6 +55,33 @@ pub fn pair_present_card() -> (bool, String) {
     }
 }
 
+/// Removes the pairing between the logged-in user and the card that is on
+/// the phone now (other cards stay paired). Blocks; call off the UI
+/// thread. Returns (ok, one sentence for the user).
+pub fn unpair_present_card() -> (bool, String) {
+    #[cfg(target_os = "macos")]
+    {
+        use crate::mac_login;
+        let outcome = match mac_login::current_user() {
+            Some(user) => mac_login::unpair_present_card(
+                &mac_login::SystemRunner,
+                &user,
+                6,
+                Duration::from_secs(1),
+            ),
+            None => mac_login::UnpairOutcome::Failed("unknown user".into()),
+        };
+        (outcome.ok(), outcome.message())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        (
+            false,
+            format!("Card login isn't available on {OS_NAME} yet."),
+        )
+    }
+}
+
 /// Whether the card on the phone is already paired with the login, read
 /// without changing anything. `None` when that can't be told (yet).
 /// Blocks; call off the UI thread.

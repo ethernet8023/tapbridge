@@ -220,6 +220,26 @@ fn pending_approval_cannot_consume_a_new_invitation() {
 }
 
 #[test]
+fn outstanding_capability_is_only_the_live_invitation() {
+    let mut gate = pairing::PairingGate::new();
+    assert_eq!(gate.outstanding_capability(), None);
+    let host = SecretKey::generate().public();
+    let invitation = gate.mint(host);
+    assert_eq!(gate.outstanding_capability(), Some(invitation.capability()));
+    let pending = gate
+        .authorize(
+            SecretKey::generate().public(),
+            Some(&invitation.capability()),
+        )
+        .unwrap();
+    gate.commit(pending).unwrap();
+    assert_eq!(gate.outstanding_capability(), None, "consumed");
+    let mut expiring = pairing::PairingGate::with_ttl(Duration::ZERO);
+    expiring.mint(host);
+    assert_eq!(expiring.outstanding_capability(), None, "expired");
+}
+
+#[test]
 fn one_invitation_cannot_commit_two_previously_authorized_phones() {
     let mut gate = pairing::PairingGate::new();
     let invitation = gate.mint(SecretKey::generate().public());
