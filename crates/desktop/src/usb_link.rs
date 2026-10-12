@@ -47,11 +47,14 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 /// notice a stop.
 const READ_WAIT: Duration = Duration::from_millis(200);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Accessory link attempts per enumeration (the phone app may open the
-/// accessory a moment late, or the user may open the pairing window and
-/// replug... a retry saves the replug).
+/// Quick accessory link retries per enumeration (the phone app may open
+/// the accessory a moment late, e.g. behind Android's "open with" prompt).
 const ATTEMPTS: u32 = 3;
 const RETRY_GAP: Duration = Duration::from_secs(5);
+/// After the quick retries, keep trying slowly while the phone stays
+/// plugged in, so it never needs a replug (pairing window opened later,
+/// app opened late).
+const SLOW_RETRY_GAP: Duration = Duration::from_secs(30);
 
 /// Starts the watcher thread. It asks the service for "Use USB cable" on
 /// every poll, so turning the setting off stops all probing.
@@ -140,7 +143,12 @@ impl Watcher {
         }
         if entry.attempts > 0 {
             let ended = *entry.ended_at.get_or_insert_with(Instant::now);
-            if entry.attempts >= ATTEMPTS || ended.elapsed() < RETRY_GAP {
+            let gap = if entry.attempts >= ATTEMPTS {
+                SLOW_RETRY_GAP
+            } else {
+                RETRY_GAP
+            };
+            if ended.elapsed() < gap {
                 return;
             }
         }

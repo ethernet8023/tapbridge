@@ -30,6 +30,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 const USB_OFF_FILE: &str = "usb-off";
 /// How long a phone on the cable may take between the verified USB
 /// handshake and its `Hello`: an unpaired phone asks its user first.
+/// How long the USB handshake may wait for the phone app to open the
+/// accessory (Android's "open with" prompt on a first plug-in).
+const USB_HANDSHAKE_WAIT: Duration = Duration::from_secs(60);
 const USB_HELLO_WAIT: Duration = Duration::from_secs(120);
 
 /// PIV APDU deadline on the macOS IFD path, matching the usbip reader's
@@ -1116,8 +1119,10 @@ async fn usb_handshake(
         mut write,
         guard,
     } = link;
+    // Android may first ask the user which app opens the accessory; the
+    // phone answers only after that, so wait like for the Hello.
     let peer = tokio::time::timeout(
-        Duration::from_secs(10),
+        USB_HANDSHAKE_WAIT,
         tapbridge_core::usb::host_handshake(&mut read, &mut write, &secret, &host_name, capability),
     )
     .await

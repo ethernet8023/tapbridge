@@ -249,6 +249,7 @@ pub fn preview_ui() {
             Ok("paired") => {
                 let window = crate::ui::open_pairing_window(
                     "tapbridge-preview-invitation-0123456789abcdef",
+                    true,
                     None,
                     preview_action,
                     cx,
@@ -261,6 +262,7 @@ pub fn preview_ui() {
             _ => {
                 crate::ui::open_pairing_window(
                     "tapbridge-preview-invitation-0123456789abcdef",
+                    true,
                     None,
                     preview_action,
                     cx,
@@ -1062,13 +1064,14 @@ fn request_tap(cx: &mut App) -> bool {
 }
 
 fn open_pairing(cx: &mut App) {
-    let (invitation, existing) = {
+    let (invitation, usb_hint, existing) = {
         let shell = cx.global::<Shell>();
         (
             shell
                 .service
                 .as_ref()
                 .and_then(ServiceHandle::mint_invitation),
+            shell.service.as_ref().is_some_and(|s| s.status().use_usb),
             shell.pairing,
         )
     };
@@ -1079,7 +1082,13 @@ fn open_pairing(cx: &mut App) {
     logging::log("pairing: invitation minted");
     #[cfg(target_os = "macos")]
     macos::dock::bring_to_front();
-    let window = ui::open_pairing_window(&invitation.to_string(), existing, settings_action, cx);
+    let window = ui::open_pairing_window(
+        &invitation.to_string(),
+        usb_hint,
+        existing,
+        settings_action,
+        cx,
+    );
     cx.update_global::<Shell, _>(|shell, _| shell.pairing = Some(window));
 }
 

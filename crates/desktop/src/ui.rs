@@ -19,6 +19,8 @@ use tapbridge_core::pairing::INVITATION_TTL;
 
 /// The pairing window is square; the QR is sized to fit it, not the reverse.
 const PAIRING_WINDOW: f32 = 480.0;
+/// The QR step is taller than wide: room for the USB hint under the countdown.
+const PAIRING_QR_HEIGHT: f32 = PAIRING_WINDOW + 30.0;
 /// The pairing window grows to this height once it shows the test card's
 /// checklist, so the steps fit without scrolling.
 const PAIRING_CARD_HEIGHT: f32 = 660.0;
@@ -61,12 +63,19 @@ pub struct PairingView {
     expires: Instant,
     /// "Try again" was pressed on the expired code: the shell mints a new one.
     retry: bool,
+    /// "Use USB cable" is on: say that plugging the phone in pairs too.
+    usb_hint: bool,
     /// Re-renders once a second for the countdown; dropped with the view.
     _ticker: Task<()>,
 }
 
 impl PairingView {
-    pub fn new(invitation: &str, on_action: OnSettingsAction, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        invitation: &str,
+        usb_hint: bool,
+        on_action: OnSettingsAction,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let (dark, dimension) = build_qr(invitation).unwrap_or((Vec::new(), 0));
         let ticker = cx.spawn(async move |this, cx| {
             loop {
@@ -86,6 +95,7 @@ impl PairingView {
             show_install: false,
             expires: Instant::now() + INVITATION_TTL,
             retry: false,
+            usb_hint,
             _ticker: ticker,
         }
     }
@@ -236,17 +246,29 @@ impl Render for PairingView {
                     .child(grid),
             );
         let remaining = self.expires.saturating_duration_since(Instant::now());
-        root.child(header).child(card).child(
-            div()
-                .text_size(px(26.0))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(rgb(if remaining < EXPIRY_WARNING {
-                    WARN
-                } else {
-                    ACCENT_SOFT
-                }))
-                .child(countdown(remaining)),
-        )
+        root.child(header)
+            .child(card)
+            .child(
+                div()
+                    .text_size(px(26.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(if remaining < EXPIRY_WARNING {
+                        WARN
+                    } else {
+                        ACCENT_SOFT
+                    }))
+                    .child(countdown(remaining)),
+            )
+            // While this window is open, plugging the phone in pairs it too
+            // (the USB handshake carries the outstanding capability).
+            .when(self.usb_hint, |root| {
+                root.child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(rgb(ACCENT_SOFT))
+                        .child("Or plug your phone into this computer with a USB cable"),
+                )
+            })
     }
 }
 
@@ -425,6 +447,7 @@ fn success_badge(diameter: f32) -> impl IntoElement {
 /// window opens instead.
 pub fn open_pairing_window(
     invitation: &str,
+    usb_hint: bool,
     existing: Option<WindowHandle<PairingView>>,
     on_action: impl Fn(SettingsAction, &mut App) + 'static,
     cx: &mut App,
@@ -434,7 +457,7 @@ pub fn open_pairing_window(
         let text = invitation.to_owned();
         let actions = on_action.clone();
         let refreshed = handle.update(cx, |view, window, cx| {
-            *view = PairingView::new(&text, actions, cx);
+            *view = PairingView::new(&text, usb_hint, actions, cx);
             window.activate();
             cx.notify();
         });
@@ -443,7 +466,7 @@ pub fn open_pairing_window(
         }
     }
     let invitation = invitation.to_owned();
-    let bounds = Bounds::centered(None, size(px(PAIRING_WINDOW), px(PAIRING_WINDOW)), cx);
+    let bounds = Bounds::centered(None, size(px(PAIRING_WINDOW), px(PAIRING_QR_HEIGHT)), cx);
     let window = cx
         .open_window(
             WindowOptions {
@@ -456,7 +479,7 @@ pub fn open_pairing_window(
                 is_resizable: false,
                 ..Default::default()
             },
-            move |_window, cx| cx.new(|cx| PairingView::new(&invitation, on_action, cx)),
+            move |_window, cx| cx.new(|cx| PairingView::new(&invitation, usb_hint, on_action, cx)),
         )
         .expect("pairing window");
     window.update(cx, |_, window, _| window.activate()).ok();
