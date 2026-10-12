@@ -9,6 +9,8 @@
 //! handle), which is usually the phone's ADB interface.
 //!
 //! Rules (docs/USB-PLAN.md, Track H):
+//! - A plugged-in phone is only switched while tapbridge wants it
+//!   ([`want_phone`]): the switch opens the app on the phone.
 //! - Only phone-like devices are probed: an MTP/PTP (class 6/1) or ADB
 //!   (ff/42/01) interface. Each plug-in is probed at most once (keyed by
 //!   the OS device id, which changes on re-enumeration) and never again
@@ -55,6 +57,29 @@ const ATTEMPTS: u32 = 3;
 const RETRY_GAP: Duration = Duration::from_secs(5);
 /// Gap after the first few attempts.
 const SLOW_RETRY_GAP: Duration = Duration::from_secs(10);
+
+/// How long a request for the phone keeps the cable link wanted.
+const DEMAND: Duration = Duration::from_secs(120);
+
+/// Until when tapbridge wants the phone over the cable. Switching a phone
+/// into accessory mode makes Android open the tapbridge app, so it only
+/// happens while something needs the phone (a card request, the pairing
+/// window), not on every plug-in.
+static WANTED_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Something needs the phone: switch a plugged-in phone to the cable link
+/// within the next [`DEMAND`]. A link already up stays up regardless.
+pub fn want_phone() {
+    if let Ok(mut until) = WANTED_UNTIL.lock() {
+        *until = Some(Instant::now() + DEMAND);
+    }
+}
+
+fn phone_wanted() -> bool {
+    WANTED_UNTIL
+        .lock()
+        .is_ok_and(|until| until.is_some_and(|until| Instant::now() < until))
+}
 
 /// Starts the watcher thread. It asks the service for "Use USB cable" on
 /// every poll, so turning the setting off stops all probing.
@@ -109,7 +134,7 @@ impl Watcher {
             for info in &devices {
                 if aoa::is_accessory(info.vendor_id(), info.product_id()) {
                     self.accessory(info, service, runtime);
-                } else if is_phone_like(info) && self.probed.insert(info.id()) {
+                } else if is_phone_like(info) && phone_wanted() && self.probed.insert(info.id()) {
                     match switch_to_accessory(info) {
                         Ok(()) => logging::log(&format!(
                             "usb: {:04x}:{:04x} switching to accessory mode",

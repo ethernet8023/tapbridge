@@ -579,6 +579,14 @@ fn tick(inbox: &mpsc::Receiver<UiEvent>, cx: &mut App) {
     while let Ok(event) = inbox.try_recv() {
         handle_event(event, cx);
     }
+    // While the pairing window is open, a phone plugged in pairs over USB.
+    if cx
+        .global::<Shell>()
+        .pairing
+        .is_some_and(|window| window.update(cx, |_, _, _| ()).is_ok())
+    {
+        crate::usb_link::want_phone();
+    }
     let service_events = cx
         .global::<Shell>()
         .service
@@ -1302,6 +1310,8 @@ fn check_login(uid: Vec<u8>, cx: &mut App) {
 /// the card actions and pairing test when they need the phone. Returns
 /// whether the request went out.
 fn request_tap(cx: &mut App) -> bool {
+    // A phone on the cable is switched over only now (it opens the app).
+    crate::usb_link::want_phone();
     cx.update_global::<Shell, _>(|shell, _| {
         let Some(service) = shell.service.as_ref() else {
             logging::log("wake: service not running");
@@ -1362,6 +1372,8 @@ fn open_pairing(cx: &mut App) {
         return;
     };
     logging::log("pairing: invitation minted");
+    // Plugging the phone in pairs it too while this window is open.
+    crate::usb_link::want_phone();
     #[cfg(target_os = "macos")]
     macos::dock::bring_to_front();
     let window = ui::open_pairing_window(
