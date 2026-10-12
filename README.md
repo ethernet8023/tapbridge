@@ -23,6 +23,24 @@ Your card does all the secret work. Your phone and computer only pass messages b
 - **Install the PC app from your phone.** Plug the phone into a Windows PC, turn on USB tethering, and download the installer from the phone in the PC's browser (Settings → Install tapbridge on a PC).
 - **Works on macOS and Windows.** The phone app is for Android phones with NFC.
 
+## Status
+
+What works today, and on which platforms. Last checked by hand in October 2026.
+
+| | macOS | Windows | Android |
+|---|---|---|---|
+| Passkeys / security keys in the browser, with PIN | ✅ (Safari, incl. Google sign-in) | ❓ not tested in a while | ✅ |
+| Pairing, unpairing, wake-up notifications | ✅ | ❓ | ✅ |
+| Create a login certificate on your card (from the phone) | ✅ | – | ✅ |
+| Log in, unlock and approve prompts with your card (instead of Touch ID) | ✅ | 🔜 | – |
+| Connect over a USB cable | 🧪 new, barely tested | 🧪 | 🧪 |
+| Mac security settings, nix-darwin module | 🧪 new, barely tested | – | – |
+| Signed / store builds | 🔜 signed | 🔜 | 🔜 Play Store |
+
+✅ works · 🧪 built, needs testing · ❓ might work · 🔜 planned · – doesn't apply
+
+**Maybe someday:** an iPhone app, if Apple ever opens up the NFC APIs it would need.
+
 ## Development
 
 tapbridge has these parts:
