@@ -1,4 +1,5 @@
 # Builds every app on every push to main and every pull request:
+#   nix-docs the nix-darwin options table matches the module
 #   macOS    tests + clippy, tapbridge.app + IFD bundle -> unsigned .pkg
 #   Windows  tests (x64), tapbridge.exe + Inno Setup installer (x64, arm64)
 #   Android  unit tests, debug APK with the Rust JNI library (16 KB checked),
@@ -25,6 +26,21 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  # docs/nix-darwin.md's options table must match the module's option
+  # descriptions (regenerate with: nix run .#docs).
+  nix-docs:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+      - uses: DeterminateSystems/determinate-nix-action@v3
+      - name: Check docs/nix-darwin.md is up to date
+        run: |
+          nix run .#docs
+          git diff --exit-code docs/nix-darwin.md || {
+            echo "::error file=docs/nix-darwin.md::out of date with nix/darwin-module.nix; run: nix run .#docs"
+            exit 1
+          }
+
   macos:
     runs-on: macos-26
     steps:
