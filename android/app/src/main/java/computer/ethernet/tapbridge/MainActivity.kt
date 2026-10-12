@@ -1,10 +1,15 @@
 package computer.ethernet.tapbridge
 
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.hardware.usb.UsbAccessory
+import android.hardware.usb.UsbManager
 import android.nfc.NfcAdapter
 import android.nfc.Tag
 import android.os.Build
@@ -70,6 +75,25 @@ class MainActivity : ComponentActivity() {
      *  before onResume while discovery is still paused). */
     private var forwardedTag: Tag? = null
 
+    // ------------------------------------------------------------ USB link
+    private val usbPermissionAction get() = "$packageName.USB_PERMISSION"
+    /** A USB permission request is showing; don't ask twice. */
+    private var usbPermissionPending = false
+    private val usbReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != usbPermissionAction) return
+            usbPermissionPending = false
+            @Suppress("DEPRECATION")
+            val accessory = intent.getParcelableExtra<UsbAccessory>(UsbManager.EXTRA_ACCESSORY)
+            if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false) && accessory != null) {
+                startUsbService(accessory)
+            } else {
+                state?.usbNotice = "USB access was declined. Unplug the cable and plug it in again to retry."
+                if (IdentityStore.pairedHosts(this@MainActivity).isNotEmpty()) startTapService()
+            }
+        }
+    }
+
     /** Activity-scoped observable state. */
     class UiState {
         var status by mutableStateOf(TapBridgeService.Status.IDLE)
@@ -101,6 +125,12 @@ class MainActivity : ComponentActivity() {
         var pivPrompt by mutableStateOf<PivPrompt?>(null)
         /** A pairing code opened as a tapbridge: link, waiting for "Pair". */
         var linkInvitation by mutableStateOf<String?>(null)
+        /** The live session runs over the USB cable. */
+        var viaUsb by mutableStateOf(false)
+        /** An unpaired PC on the USB cable offers pairing, waiting for "Pair". */
+        var usbPrompt by mutableStateOf<TapBridgeService.UsbPrompt?>(null)
+        /** Why the USB link was refused or failed, shown once. */
+        var usbNotice by mutableStateOf<String?>(null)
     }
 
     /** A new card's PIV state, offered for setup once the card is named. */
@@ -127,6 +157,7 @@ class MainActivity : ComponentActivity() {
                     it.connectedHost = if (connected) service?.targetHost else null
                     it.hostPlatform = if (connected) service?.hostPlatform ?: -1 else -1
                     it.hostPivLogin = connected && service?.hostPivLogin == true
+                    it.viaUsb = connected && service?.viaUsb == true
                     if (!connected) it.loginBusy = null
                 }
             }
@@ -142,6 +173,12 @@ class MainActivity : ComponentActivity() {
         }
         override fun onSetupCerts(uid: ByteArray) {
             runOnUiThread { startHostPivSetup(uid) }
+        }
+        override fun onUsbPairRequest(prompt: TapBridgeService.UsbPrompt?) {
+            runOnUiThread { state?.usbPrompt = prompt }
+        }
+        override fun onUsbNotice(text: String) {
+            runOnUiThread { state?.usbNotice = text }
         }
         override fun onLoginDone(uid: ByteArray, ok: Boolean) {
             runOnUiThread {
@@ -171,6 +208,8 @@ class MainActivity : ComponentActivity() {
             state?.connectedHost = service?.takeIf { it.status == TapBridgeService.Status.CONNECTED }?.targetHost
             state?.hostPlatform = service?.takeIf { it.status == TapBridgeService.Status.CONNECTED }?.hostPlatform ?: -1
             state?.hostPivLogin = service?.takeIf { it.status == TapBridgeService.Status.CONNECTED }?.hostPivLogin == true
+            state?.viaUsb = service?.takeIf { it.status == TapBridgeService.Status.CONNECTED }?.viaUsb == true
+            state?.usbPrompt = service?.usbPrompt
             deliverForwardedTag()
             if (resumed) service?.takePendingPivSetup()?.let { startHostPivSetup(it) }
         }
@@ -444,16 +483,76 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        val usbFilter = IntentFilter(usbPermissionAction)
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(usbReceiver, usbFilter, RECEIVER_NOT_EXPORTED)
+        else @Suppress("UnspecifiedRegisterReceiverFlag") registerReceiver(usbReceiver, usbFilter)
         handleForwardedTag(intent)
         // A recreated activity (rotation, process death) gets the same
         // intent back: the link was already handled then.
         if (savedInstanceState == null) handlePairingLink(intent)
+        handleUsbAttached(intent)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleForwardedTag(intent)
         handlePairingLink(intent)
+        handleUsbAttached(intent)
+    }
+
+    /**
+     * USB_ACCESSORY_ATTACHED: a PC running tapbridge switched the phone to
+     * accessory mode. Launching from this intent grants the USB permission.
+     */
+    private fun handleUsbAttached(intent: Intent?) {
+        if (intent?.action != UsbManager.ACTION_USB_ACCESSORY_ATTACHED) return
+        @Suppress("DEPRECATION")
+        val accessory = intent.getParcelableExtra<UsbAccessory>(UsbManager.EXTRA_ACCESSORY) ?: return
+        if (UsbLink.isOurs(accessory.manufacturer, accessory.model)) startUsbService(accessory)
+    }
+
+    /**
+     * The attached tapbridge accessory, if any, permitted or after asking:
+     * an app opened by hand (not by the attach intent) must request the USB
+     * permission itself. True when one is attached (the cable then owns the
+     * session).
+     */
+    private fun checkAttachedAccessory(): Boolean {
+        val usb = getSystemService(UsbManager::class.java) ?: return false
+        val accessory = usb.accessoryList?.firstOrNull { UsbLink.isOurs(it.manufacturer, it.model) } ?: return false
+        if (usb.hasPermission(accessory)) {
+            startUsbService(accessory)
+        } else if (!usbPermissionPending) {
+            usbPermissionPending = true
+            // The USB service fills in extras, so the PendingIntent is
+            // mutable, but scoped to this package and a private action.
+            val pending = PendingIntent.getBroadcast(
+                this, 0, Intent(usbPermissionAction).setPackage(packageName),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
+            )
+            usb.requestPermission(accessory, pending)
+        }
+        return true
+    }
+
+    private fun startUsbService(accessory: UsbAccessory) {
+        val i = Intent(this, TapBridgeService::class.java)
+            .setAction(TapBridgeService.ACTION_USB)
+            .putExtra(UsbManager.EXTRA_ACCESSORY, accessory)
+        try {
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+        } catch (_: IllegalStateException) {
+            // Not visible yet (locked); onResume checks the cable again.
+        }
+    }
+
+    /** The user's answer to "Pair with this computer?" for the PC on the cable. */
+    internal fun answerUsbPairing(pair: Boolean) {
+        state?.usbPrompt = null
+        service?.answerUsbPairing(pair)
+        if (pair && state?.notificationsGranted == false && Build.VERSION.SDK_INT >= 33) {
+            requestPermissionLauncher?.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
     }
 
     /**
@@ -577,9 +676,12 @@ class MainActivity : ComponentActivity() {
         service?.resumeTagDiscovery()
         service?.onAppVisibility(true)
         service?.takePendingPivSetup()?.let { startHostPivSetup(it) }
-        // DESIGN: opening the app while paired connects immediately (to the
-        // last-used host).
-        if (IdentityStore.pairedHosts(this).isNotEmpty()) {
+        // A tapbridge USB cable is the session while attached; otherwise
+        // (DESIGN) opening the app while paired connects immediately (to
+        // the last-used host). USB goes first: the service then ignores the
+        // network start.
+        val usbAttached = checkAttachedAccessory()
+        if (!usbAttached && IdentityStore.pairedHosts(this).isNotEmpty()) {
             startTapService()
         }
         try {
@@ -607,6 +709,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         Cards.removeListener(cardsListener)
+        runCatching { unregisterReceiver(usbReceiver) }
         pivWorker.shutdownNow()
         if (bound) {
             service?.listener = null
@@ -642,19 +745,28 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
         screen = "home"
     }
     ui.linkInvitation?.let { invitation ->
+        PairConfirmDialog(
+            pcName = null,
+            onPair = { ui.linkInvitation = null; pair(invitation) },
+            onCancel = { ui.linkInvitation = null },
+        )
+    }
+    // An unpaired PC on the USB cable with its pairing window open.
+    ui.usbPrompt?.let { prompt ->
+        if (ui.linkInvitation == null) {
+            PairConfirmDialog(
+                pcName = prompt.hostName,
+                onPair = { activity.answerUsbPairing(true); screen = "home" },
+                onCancel = { activity.answerUsbPairing(false) },
+            )
+        }
+    }
+    ui.usbNotice?.let { text ->
         AlertDialog(
-            onDismissRequest = { ui.linkInvitation = null },
-            title = { Text("Pair with this computer?") },
-            text = {
-                Text(
-                    "Only pair with a code shown by tapbridge on your own computer. " +
-                        "A paired computer can ask to use your cards.",
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = { ui.linkInvitation = null; pair(invitation) }) { Text("Pair") }
-            },
-            dismissButton = { TextButton(onClick = { ui.linkInvitation = null }) { Text("Cancel") } },
+            onDismissRequest = { ui.usbNotice = null },
+            title = { Text("USB connection") },
+            text = { Text(text) },
+            confirmButton = { TextButton(onClick = { ui.usbNotice = null }) { Text("OK") } },
         )
     }
 
@@ -777,6 +889,32 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
             onDismiss = { activity.endPiv() },
         )
     }
+}
+
+/**
+ * "Pair with this computer?" for a scanned/linked code ([pcName] null) or
+ * a PC on the USB cable (named; the name is the PC's own claim, but its
+ * identity key was verified by the USB handshake).
+ */
+@Composable
+private fun PairConfirmDialog(pcName: String?, onPair: () -> Unit, onCancel: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onCancel,
+        title = { Text("Pair with this computer?") },
+        text = {
+            Text(
+                if (pcName != null) {
+                    "\u201C$pcName\u201D is asking to pair over the USB cable. " +
+                        "Only pair with your own computer. A paired computer can ask to use your cards."
+                } else {
+                    "Only pair with a code shown by tapbridge on your own computer. " +
+                        "A paired computer can ask to use your cards."
+                },
+            )
+        },
+        confirmButton = { TextButton(onClick = onPair) { Text("Pair") } },
+        dismissButton = { TextButton(onClick = onCancel) { Text("Cancel") } },
+    )
 }
 
 /**

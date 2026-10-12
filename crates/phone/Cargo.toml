@@ -13,6 +13,7 @@ crate-type = ["rlib", "cdylib"]
 tapbridge-core = { path = "../core" }
 iroh.workspace = true
 tokio.workspace = true
+libc = "0.2"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
