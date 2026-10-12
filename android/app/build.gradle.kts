@@ -98,6 +98,12 @@ android {
         jvmTarget = "17"
     }
 
+    // CI bundles the Windows installers into assets/installer/ (see
+    // build.yml); stored, so the phone streams them straight from the APK.
+    androidResources {
+        noCompress += "exe"
+    }
+
     lint {
         warningsAsErrors = false
         abortOnError = true
