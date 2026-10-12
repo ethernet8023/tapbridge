@@ -44,6 +44,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.view.WindowCompat
 import computer.ethernet.tapbridge.ui.HomeScreen
+import computer.ethernet.tapbridge.ui.InstallerScreen
 import computer.ethernet.tapbridge.ui.AddCardDialogs
 import computer.ethernet.tapbridge.ui.CardsScreen
 import computer.ethernet.tapbridge.ui.LoginTarget
@@ -627,6 +628,8 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
     val context = LocalContext.current
     var screen by rememberSaveable { mutableStateOf("home") }
     var hosts by remember { mutableStateOf(IdentityStore.pairedHosts(context)) }
+    // Bundled by CI only; empty in local builds, which hides the entry.
+    val installers = remember { InstallerAssets.names(context) }
 
     // Pairing from the in-app scanner or a confirmed tapbridge: link.
     val pair: (String) -> Unit = { invitation ->
@@ -659,7 +662,7 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
     }
 
     // System back (and predictive back) returns to home from any sub-screen.
-    BackHandler(enabled = screen != "home") { screen = "home" }
+    BackHandler(enabled = screen != "home") { screen = if (screen == "installer") "settings" else "home" }
 
     AnimatedContent(
         targetState = screen,
@@ -724,6 +727,12 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
                     },
                     onPairAnother = { screen = "pair" },
                     onBack = { screen = "home" },
+                    Modifier.fillMaxSize(),
+                    onInstallOnPc = if (installers.isEmpty()) null else ({ screen = "installer" }),
+                )
+                "installer" -> InstallerScreen(
+                    installers = installers,
+                    onBack = { screen = "settings" },
                     Modifier.fillMaxSize(),
                 )
                 else -> HomeScreen(
