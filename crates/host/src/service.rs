@@ -876,7 +876,7 @@ async fn run_inner(
                 },
                 connection = endpoint.accept() => {
                     let Some(connection) = connection else { break };
-                    if handshakes.len() - usb_pending >= 4 { connection.refuse(); continue; }
+                    if handshakes.len().saturating_sub(usb_pending) >= 4 { connection.refuse(); continue; }
                     handshakes.spawn(async move {
                         let incoming = tokio::time::timeout(Duration::from_secs(10), async {
                             let conn = connection.await.map_err(io::Error::other)?;
@@ -898,8 +898,11 @@ async fn run_inner(
                     });
                 },
                 completed = handshakes.join_next(), if !handshakes.is_empty() => {
+                    // A panicked handshake loses its tag: recount from zero
+                    // once none are left.
+                    if handshakes.is_empty() { usb_pending = 0; }
                     let Some(Ok((usb, incoming))) = completed else { continue; };
-                    if usb { usb_pending -= 1; }
+                    if usb { usb_pending = usb_pending.saturating_sub(1); }
                     let Ok(Incoming { peer, link, mut send, recv, capability, name, push }) = incoming else { continue; };
                     if link.is_usb() && !use_usb { link.close(); continue; }
                     // The paired phone runs one session at a time, so a new
