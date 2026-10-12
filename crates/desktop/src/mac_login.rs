@@ -285,6 +285,142 @@ pub fn pair_present_card(
     classify_pair(succeeded, &output, now_paired)
 }
 
+/// How a "Remove login" attempt ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnpairOutcome {
+    Unpaired,
+    /// The card on the phone isn't paired with any account here.
+    NotPaired,
+    CardLeft,
+    Cancelled,
+    NoIdentity,
+    Ambiguous,
+    Failed(String),
+}
+
+impl UnpairOutcome {
+    pub fn ok(&self) -> bool {
+        matches!(self, Self::Unpaired | Self::NotPaired)
+    }
+
+    /// One plain sentence for the Cards section.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Unpaired => "This card no longer unlocks your Mac.".into(),
+            Self::NotPaired => "This card wasn't set up for your Mac login.".into(),
+            Self::CardLeft => "The card moved away. Keep it on your phone and try again.".into(),
+            Self::Cancelled => "Removing was cancelled.".into(),
+            Self::NoIdentity => "Your Mac can't see this card's login certificate. \
+                 Keep it on your phone and try again."
+                .into(),
+            Self::Ambiguous => {
+                "More than one smart card is connected. Remove the others and try again.".into()
+            }
+            Self::Failed(reason) => format!("Removing didn't work: {reason}"),
+        }
+    }
+}
+
+/// Which paired identities to unpair: every paired identity of the one
+/// inserted card that has any.
+pub fn pick_paired(tokens: &[Token]) -> Result<Vec<String>, UnpairOutcome> {
+    let with_paired: Vec<&Token> = tokens
+        .iter()
+        .filter(|token| token.identities.iter().any(|id| id.paired))
+        .collect();
+    match with_paired.as_slice() {
+        [] if tokens.iter().any(|token| !token.identities.is_empty()) => {
+            Err(UnpairOutcome::NotPaired)
+        }
+        [] => Err(UnpairOutcome::NoIdentity),
+        [token] => Ok(token
+            .identities
+            .iter()
+            .filter(|id| id.paired)
+            .map(|id| id.hash.clone())
+            .collect()),
+        _ => Err(UnpairOutcome::Ambiguous),
+    }
+}
+
+/// The AppleScript that runs `sc_auth unpair` for each hash as admin, in
+/// the user's session (see [`pair_script`]).
+pub fn unpair_script(user: &str, uid: u32, hashes: &[String]) -> Option<String> {
+    if !valid_user(user) || hashes.is_empty() || !hashes.iter().all(|hash| valid_hash(hash)) {
+        return None;
+    }
+    let commands: Vec<String> = hashes
+        .iter()
+        .map(|hash| format!("{LAUNCHCTL} asuser {uid} {SC_AUTH} unpair -u {user} -h {hash} 2>&1"))
+        .collect();
+    Some(format!(
+        "do shell script \"{}\" with administrator privileges",
+        commands.join("; ")
+    ))
+}
+
+/// Unpairs `user` from the card on the phone (its paired identities only;
+/// other cards stay paired). Retries the identity lookup like
+/// [`pair_present_card`].
+pub fn unpair_present_card(
+    runner: &dyn Runner,
+    user: &str,
+    attempts: u32,
+    pause: Duration,
+) -> UnpairOutcome {
+    let mut picked = Err(UnpairOutcome::NoIdentity);
+    for attempt in 0..attempts.max(1) {
+        if attempt > 0 {
+            std::thread::sleep(pause);
+        }
+        picked = match identities(runner) {
+            Ok(tokens) => pick_paired(&tokens),
+            Err(error) => return UnpairOutcome::Failed(error.to_string()),
+        };
+        if picked != Err(UnpairOutcome::NoIdentity) {
+            break;
+        }
+    }
+    let hashes = match picked {
+        Ok(hashes) => hashes,
+        Err(outcome) => return outcome,
+    };
+    let Some(script) = unpair_script(user, current_uid(), &hashes) else {
+        return UnpairOutcome::Failed("unexpected account name".into());
+    };
+    let (succeeded, output) = match runner.run(OSASCRIPT, &["-e", &script]) {
+        Ok(result) => result,
+        Err(error) => return UnpairOutcome::Failed(error.to_string()),
+    };
+    let still_paired = identities(runner).map(|tokens| {
+        tokens
+            .iter()
+            .flat_map(|token| &token.identities)
+            .any(|identity| identity.paired && hashes.contains(&identity.hash))
+    });
+    match still_paired {
+        Ok(false) => UnpairOutcome::Unpaired,
+        _ if output.contains("CryptoTokenKit error -8") => UnpairOutcome::CardLeft,
+        _ if output.contains("(-128)") || output.contains("User canceled") => {
+            UnpairOutcome::Cancelled
+        }
+        _ => UnpairOutcome::Failed(
+            output
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or(if succeeded {
+                    "the card is still paired"
+                } else {
+                    "sc_auth failed"
+                })
+                .chars()
+                .take(200)
+                .collect(),
+        ),
+    }
+}
+
 /// Whether the inserted card's login identity (PIV Authentication,
 /// else its only identity) is paired: `None` while no inserted card has an
 /// identity yet, or several cards make it unclear.
@@ -492,6 +628,53 @@ mod tests {
                 .pop_front()
                 .ok_or_else(|| io::Error::other("unexpected command"))
         }
+    }
+
+    #[test]
+    fn unpair_picks_only_the_paired_card() {
+        let token = |id: &str, ids: &[(&str, bool)]| Token {
+            id: id.into(),
+            identities: ids
+                .iter()
+                .map(|(hash, paired)| Identity {
+                    hash: (*hash).into(),
+                    label: "PIV Authentication".into(),
+                    paired: *paired,
+                })
+                .collect(),
+        };
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        assert_eq!(pick_paired(&[]), Err(UnpairOutcome::NoIdentity));
+        assert_eq!(
+            pick_paired(&[token("x", &[(&a, false)])]),
+            Err(UnpairOutcome::NotPaired)
+        );
+        assert_eq!(
+            pick_paired(&[
+                token("x", &[(&a, true), (&b, false)]),
+                token("y", &[(&b, false)])
+            ]),
+            Ok(vec![a.clone()])
+        );
+        assert_eq!(
+            pick_paired(&[token("x", &[(&a, true)]), token("y", &[(&b, true)])]),
+            Err(UnpairOutcome::Ambiguous)
+        );
+    }
+
+    #[test]
+    fn unpair_script_refuses_unsafe_values() {
+        let hash = "c".repeat(40);
+        assert_eq!(
+            unpair_script("ethernet", 501, std::slice::from_ref(&hash)).unwrap(),
+            format!(
+                "do shell script \"/bin/launchctl asuser 501 /usr/sbin/sc_auth unpair -u ethernet -h {hash} 2>&1\" with administrator privileges"
+            )
+        );
+        assert!(unpair_script("eth\"; rm", 501, std::slice::from_ref(&hash)).is_none());
+        assert!(unpair_script("ethernet", 501, &["nothex".into()]).is_none());
+        assert!(unpair_script("ethernet", 501, &[]).is_none());
     }
 
     #[test]

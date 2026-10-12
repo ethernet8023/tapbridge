@@ -36,6 +36,8 @@ const PANEL_2: u32 = 0x221A30;
 const TITLEBAR_INSET: f32 = if cfg!(target_os = "macos") { 28.0 } else { 0.0 };
 const TEXT: u32 = 0xF2EFFA;
 const ACCENT: u32 = 0x7C5CFF;
+/// Card settings glyph (SF Symbols gearshape), tinted by `text_color`.
+const GEAR_SVG: &[u8] = include_bytes!("../assets/ui/gear.svg");
 const GOOD: u32 = 0x3DDC97;
 /// Light brand lavender: readable on PANEL, still clearly "tapbridge".
 const ACCENT_SOFT: u32 = 0xC4B5FF;
@@ -1019,6 +1021,8 @@ pub enum SettingsAction {
     /// Pair the card's login certificate with this PC's login (where
     /// `login::SUPPORTED`).
     SetUpLogin(Vec<u8>),
+    /// Unpair the card from this PC's login (the card must be on the phone).
+    RemoveLogin(Vec<u8>),
     /// Close the status of the card action (or stop waiting for it).
     DismissCardTask,
 }
@@ -1037,6 +1041,7 @@ impl SettingsAction {
             Self::CheckCard => "check card",
             Self::OpenUrl(_) => "open url",
             Self::SetUpLogin(_) => "set up login",
+            Self::RemoveLogin(_) => "remove login",
             Self::DismissCardTask => "dismiss card task",
         }
     }
@@ -1288,7 +1293,34 @@ impl SettingsView {
                         ))
                     }),
             )
-            .child(badges);
+            .child(badges)
+            // Card settings: the login steps (set up / remove).
+            .when(
+                card.checklist.is_some() && crate::login::SUPPORTED && editing.is_none(),
+                |header| {
+                    let open_uid = card.uid.clone();
+                    header.child(
+                        div()
+                            .id(("card-settings", index))
+                            .flex_none()
+                            .self_start()
+                            .p(px(4.0))
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgba(0xFFFFFF14)))
+                            .child(
+                                gpui::svg()
+                                    .data(GEAR_SVG)
+                                    .size(px(16.0))
+                                    .text_color(rgb(ACCENT_SOFT)),
+                            )
+                            .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
+                                view.dialog = Some(CardDialog::Login(open_uid.clone()));
+                                cx.notify();
+                            })),
+                    )
+                },
+            );
         let uid = card.uid.clone();
         let mut buttons = div().flex().flex_row().flex_wrap().gap(px(8.0));
         if editing.is_some() {
@@ -1340,24 +1372,6 @@ impl SettingsView {
                     cx.notify();
                 })),
             );
-            if let Some(checklist) = card.checklist
-                && crate::login::SUPPORTED
-            {
-                let open_uid = uid.clone();
-                let (label, tint, opacity) = if checklist.ready() {
-                    ("Login", 0xFFFFFF, 0.06)
-                } else {
-                    ("Set up login", ACCENT, 0.6)
-                };
-                buttons = buttons.child(
-                    card_button("card-wizard", index, label, tint, opacity, cx).on_click(
-                        cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
-                            view.dialog = Some(CardDialog::Login(open_uid.clone()));
-                            cx.notify();
-                        }),
-                    ),
-                );
-            }
         }
         let mut panel = glass::panel(&format!("card-{index}"), 14.0, cx)
             .flex()
@@ -1560,13 +1574,26 @@ fn render_checklist<V: ChecklistHost>(
         ));
 
         // 3. OS login (paired on this PC).
-        let mut login_body = div().flex().flex_row();
-        if checklist.login == StepState::Todo && !busy && crate::login::SUPPORTED {
+        let mut login_body = div().flex().flex_row().flex_wrap().gap(px(8.0));
+        let can_act = !busy && crate::login::SUPPORTED && checklist.login != StepState::Locked;
+        if checklist.login == StepState::Todo && can_act {
             let login_uid = uid.clone();
             login_body = login_body.child(
                 card_button("step-login", index, "Set up login", ACCENT, 0.6, cx).on_click(
                     cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
                         view.checklist_action(SettingsAction::SetUpLogin(login_uid.clone()), cx)
+                    }),
+                ),
+            );
+        }
+        if can_act {
+            // Also offered while "Todo": a pairing made outside tapbridge
+            // (or one we don't know about yet) can be removed too.
+            let remove_uid = uid.clone();
+            login_body = login_body.child(
+                card_button("step-unlogin", index, "Remove login", 0xFFFFFF, 0.06, cx).on_click(
+                    cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
+                        view.checklist_action(SettingsAction::RemoveLogin(remove_uid.clone()), cx)
                     }),
                 ),
             );

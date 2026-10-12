@@ -19,6 +19,8 @@ pub enum Effect {
     RequestTap,
     /// Run the login pairing now: the card is on the phone.
     RunPairing,
+    /// Remove the login pairing now: the card is on the phone.
+    RunUnpairing,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +41,8 @@ pub enum Step {
     },
     /// `sc_auth` is running (macOS may be showing its password dialog).
     Pairing,
+    /// `sc_auth unpair` is running.
+    Unpairing,
     Finished {
         ok: bool,
         text: String,
@@ -49,6 +53,8 @@ pub enum Step {
 pub struct CardTask {
     pub uid: Vec<u8>,
     pub step: Step,
+    /// A login task removes the pairing instead of adding it.
+    pub unpair: bool,
 }
 
 impl CardTask {
@@ -58,6 +64,7 @@ impl CardTask {
             Self {
                 uid,
                 step: Step::OnPhone,
+                unpair: false,
             },
             Effect::SendSetup,
         )
@@ -106,12 +113,37 @@ impl CardTask {
         } else {
             (Step::WaitingCard { since: now }, Effect::RequestTap)
         };
-        (Self { uid, step }, effect)
+        (
+            Self {
+                uid,
+                step,
+                unpair: false,
+            },
+            effect,
+        )
     }
 
-    /// The pairing finished.
+    /// "Remove login": runs at once when the card is on the phone (macOS
+    /// needs the card to know which identity to unpair).
+    pub fn unpair(uid: Vec<u8>, present: bool, now: Instant) -> (Self, Effect) {
+        let (step, effect) = if present {
+            (Step::Unpairing, Effect::RunUnpairing)
+        } else {
+            (Step::WaitingCard { since: now }, Effect::RequestTap)
+        };
+        (
+            Self {
+                uid,
+                step,
+                unpair: true,
+            },
+            effect,
+        )
+    }
+
+    /// The pairing (or unpairing) finished.
     pub fn paired(&mut self, ok: bool, text: String) {
-        if self.step == Step::Pairing {
+        if matches!(self.step, Step::Pairing | Step::Unpairing) {
             self.step = Step::Finished { ok, text };
         }
     }
@@ -126,8 +158,13 @@ impl CardTask {
                 None
             }
             Step::WaitingCard { .. } if present_uid == self.uid.as_slice() => {
-                self.step = Step::Pairing;
-                Some(Effect::RunPairing)
+                if self.unpair {
+                    self.step = Step::Unpairing;
+                    Some(Effect::RunUnpairing)
+                } else {
+                    self.step = Step::Pairing;
+                    Some(Effect::RunPairing)
+                }
             }
             Step::WaitingCard { since } if now.duration_since(since) >= CARD_WAIT => {
                 self.finish(false, "No card was tapped. Try again.");
@@ -144,7 +181,7 @@ impl CardTask {
 
     /// Whether this step can be dismissed (nothing is running behind it).
     pub fn dismissable(&self) -> bool {
-        !matches!(self.step, Step::Pairing)
+        !matches!(self.step, Step::Pairing | Step::Unpairing)
     }
 
     /// The status line under the card.
@@ -156,6 +193,10 @@ impl CardTask {
             Step::SetupDone { ok: false } => "Setup didn't finish on the phone.".into(),
             Step::WaitingCard { .. } => "Hold the card to your phone.".into(),
             Step::Pairing => format!("Pairing with your {} login\u{2026}", crate::login::OS_NAME),
+            Step::Unpairing => format!(
+                "Removing it from your {} login\u{2026}",
+                crate::login::OS_NAME
+            ),
             Step::Finished { text, .. } => text.clone(),
         }
     }
@@ -437,6 +478,20 @@ mod tests {
         );
         let (task, effect) = CardTask::login(UID.to_vec(), true, now);
         assert_eq!((task.step, effect), (Step::Pairing, Effect::RunPairing));
+    }
+
+    #[test]
+    fn unpair_waits_for_the_right_card() {
+        let now = Instant::now();
+        let (mut task, effect) = CardTask::unpair(UID.to_vec(), false, now);
+        assert_eq!(effect, Effect::RequestTap);
+        assert_eq!(task.tick(now, true, &[9, 9, 9, 9]), None);
+        assert_eq!(task.tick(now, true, &UID), Some(Effect::RunUnpairing));
+        assert!(!task.dismissable());
+        task.paired(true, "gone".into());
+        assert_eq!(task.text(), "gone");
+        let (task, effect) = CardTask::unpair(UID.to_vec(), true, now);
+        assert_eq!((task.step, effect), (Step::Unpairing, Effect::RunUnpairing));
     }
 
     #[test]

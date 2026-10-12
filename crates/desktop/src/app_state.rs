@@ -687,7 +687,10 @@ fn handle_event(event: UiEvent, cx: &mut App) {
                     task.paired(ok, text);
                     if let Some(service) = shell.service.as_ref() {
                         if ok {
-                            service.edit_card(task.uid.clone(), service::CardEdit::SetLogin(true));
+                            service.edit_card(
+                                task.uid.clone(),
+                                service::CardEdit::SetLogin(!task.unpair),
+                            );
                         }
                         if shell.phone_asked_login.as_ref() == Some(&task.uid) {
                             service.card_action_done(
@@ -795,6 +798,14 @@ fn run_card_effect(effect: Effect, cx: &mut App) {
             logging::log("login: pairing the card on the phone");
             std::thread::spawn(move || {
                 let (ok, message) = login::pair_present_card();
+                let _ = events.send(UiEvent::LoginDone(ok, message));
+            });
+        }
+        Effect::RunUnpairing => {
+            let events = cx.global::<Shell>().events.clone();
+            logging::log("login: unpairing the card on the phone");
+            std::thread::spawn(move || {
+                let (ok, message) = login::unpair_present_card();
                 let _ = events.send(UiEvent::LoginDone(ok, message));
             });
         }
@@ -929,6 +940,11 @@ fn settings_action(action: ui::SettingsAction, cx: &mut App) {
                 start_login(uid, cx);
             }
         }
+        ui::SettingsAction::RemoveLogin(uid) => {
+            if login::SUPPORTED {
+                start_unpair(uid, cx);
+            }
+        }
         ui::SettingsAction::CheckCard => {
             logging::log("cards: asking for a tap to check the card");
             request_tap(cx);
@@ -966,6 +982,30 @@ fn start_login(uid: Vec<u8>, cx: &mut App) -> bool {
     cx.update_global::<Shell, _>(|shell, _| shell.card_task = Some(task));
     run_card_effect(effect, cx);
     true
+}
+
+/// Starts removing the card from this PC's login unless another card
+/// task is running.
+fn start_unpair(uid: Vec<u8>, cx: &mut App) {
+    if cx
+        .global::<Shell>()
+        .card_task
+        .as_ref()
+        .is_some_and(CardTask::busy)
+    {
+        return;
+    }
+    let status = cx
+        .global::<Shell>()
+        .service
+        .as_ref()
+        .map(ServiceHandle::status)
+        .unwrap_or_default();
+    let present = status.card_present && status.card_uid == uid;
+    logging::log("login: removing a card from the login");
+    let (task, effect) = CardTask::unpair(uid, present, Instant::now());
+    cx.update_global::<Shell, _>(|shell, _| shell.card_task = Some(task));
+    run_card_effect(effect, cx);
 }
 
 /// The phone asks this PC to do something for a card. Only the login
