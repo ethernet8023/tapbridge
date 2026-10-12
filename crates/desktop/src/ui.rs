@@ -2128,11 +2128,16 @@ impl Render for SettingsView {
             .when(snapshot.phone.is_some(), |column| {
                 column.child(self.render_cards(cx))
             })
-            .child(general)
-            .children(self.render_security(cx));
+            .child(general);
+        let (security, security_footer) = match self.render_security(cx) {
+            Some((section, footer)) => (Some(section), footer),
+            None => (None, None),
+        };
+        let column = column.children(security);
         #[cfg(windows)]
         let column = column.child(self.passkeys.clone());
         let dialog = self.render_dialog(cx);
+        // Settings scroll; Apply / Revert stay pinned at the bottom.
         div()
             .relative()
             .size_full()
@@ -2140,12 +2145,29 @@ impl Render for SettingsView {
             .child(glass::backdrop())
             .child(
                 div()
-                    .id("settings")
-                    .track_focus(&self.focus)
                     .absolute()
                     .inset_0()
-                    .overflow_y_scroll()
-                    .child(column),
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .id("settings")
+                            .track_focus(&self.focus)
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .overflow_y_scroll()
+                            .child(column),
+                    )
+                    .children(security_footer.map(|footer| {
+                        div()
+                            .flex_none()
+                            .px(px(22.0))
+                            .py(px(14.0))
+                            .border_t_1()
+                            .border_color(rgba(0xFFFFFF1A))
+                            .bg(rgba(0x1A142680))
+                            .child(footer)
+                    })),
             )
             .children(dialog)
     }
@@ -2202,7 +2224,14 @@ impl SettingsView {
 
     /// "Mac security": every smart card setting from Apple's article, with
     /// one Apply for all of them.
-    fn render_security(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    ///
+    /// Returns the section (scrolls with the rest) and its footer (status,
+    /// Apply / Revert), which the window pins below the scroll area so the
+    /// buttons stay visible. The footer is `None` when there's nothing to say.
+    fn render_security(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<(gpui::AnyElement, Option<gpui::AnyElement>)> {
         let security = self.snapshot.security.clone()?;
         let live = security.live;
         let managed = self.snapshot.managed;
@@ -2289,6 +2318,7 @@ impl SettingsView {
                 .child(levels),
         );
         let mut footer = div().flex().flex_col().gap(px(8.0));
+        let mut has_footer = security.status.is_some();
         if let Some(status) = security.status.clone() {
             footer = footer.child(
                 div()
@@ -2298,6 +2328,7 @@ impl SettingsView {
             );
         }
         if security.busy {
+            has_footer = true;
             footer = footer.child(
                 div()
                     .text_size(px(12.5))
@@ -2306,6 +2337,7 @@ impl SettingsView {
             );
         } else if draft.enforce_smart_card && !use_usb {
             // Possible only if USB went off under a draft; Apply would refuse.
+            has_footer = true;
             footer = footer.child(
                 div()
                     .text_size(px(12.5))
@@ -2321,6 +2353,7 @@ impl SettingsView {
                 _ => "Apply",
             };
             let apply_tint = if enforcing { WARN } else { ACCENT };
+            has_footer = true;
             footer = footer
                 .when(enforcing && confirm, |footer| {
                     footer.child(div().text_size(px(12.5)).text_color(rgb(WARN)).child(
@@ -2355,7 +2388,10 @@ impl SettingsView {
                         )),
                 );
         }
-        Some(section.child(footer).into_any_element())
+        Some((
+            section.into_any_element(),
+            has_footer.then(|| footer.into_any_element()),
+        ))
     }
 
     /// The card dialog over a blurred window: frosted scrim, glass sheet.

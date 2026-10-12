@@ -68,8 +68,10 @@ pub enum UiEvent {
     /// tap (`login::present_card_paired`).
     LoginChecked(Vec<u8>, bool),
     /// macOS: the smart card settings as read from the system.
+    #[cfg(target_os = "macos")]
     SecurityRead(ui::SecurityOptions),
     /// macOS: an Apply finished; the text says how.
+    #[cfg(target_os = "macos")]
     SecurityApplied(String),
 }
 
@@ -804,11 +806,13 @@ fn handle_event(event: UiEvent, cx: &mut App) {
                 }
             });
         }
+        #[cfg(target_os = "macos")]
         UiEvent::SecurityRead(live) => {
             cx.update_global::<Shell, _>(|shell, _| {
                 shell.security.get_or_insert_with(Default::default).live = live;
             });
         }
+        #[cfg(target_os = "macos")]
         UiEvent::SecurityApplied(text) => {
             cx.update_global::<Shell, _>(|shell, _| {
                 let security = shell.security.get_or_insert_with(Default::default);
