@@ -30,6 +30,7 @@ mod single;
 mod text_input;
 mod tray;
 mod ui;
+mod usb_link;
 #[cfg(windows)]
 mod usbip;
 mod wake;

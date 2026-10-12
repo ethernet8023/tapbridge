@@ -170,6 +170,8 @@ pub fn preview_ui() {
             health: crate::ui::Health::Good,
             phone: Some("Pixel 9 Pro XL".into()),
             phone_connected: true,
+            usb: true,
+            use_usb: true,
             autostart: true,
             cards: vec![
                 {
@@ -382,6 +384,7 @@ fn spawn_service(state_dir: PathBuf, trace: bool, events: mpsc::Sender<UiEvent>)
         }));
         match started {
             Ok(handle) => {
+                crate::usb_link::spawn(handle.clone(), runtime.handle().clone());
                 #[cfg(target_os = "macos")]
                 spawn_ifd_server(&handle, &events);
                 #[cfg(target_os = "macos")]
@@ -866,6 +869,15 @@ fn settings_action(action: ui::SettingsAction, cx: &mut App) {
                 shell.refresh_tray();
             });
         }
+        ui::SettingsAction::SetUseUsb(enabled) => {
+            logging::log(&format!("use usb cable -> {enabled}"));
+            cx.update_global::<Shell, _>(|shell, _| {
+                if let Some(service) = shell.service.as_ref() {
+                    service.set_use_usb(enabled);
+                }
+                shell.refresh_tray();
+            });
+        }
         ui::SettingsAction::SetAutostart(enabled) => {
             let result = autostart::set_enabled(enabled);
             logging::log(&format!("start at login -> {enabled}: {result:?}"));
@@ -1182,6 +1194,8 @@ impl Shell {
             (format!("Card present ({phone})"), TrayState::Card)
         } else if self.waiting_since.is_some() {
             (format!("Tap your key on {phone}"), TrayState::Waiting)
+        } else if status.phone_connected && status.usb {
+            (format!("{phone} connected (USB)"), TrayState::Connected)
         } else if status.phone_connected {
             (format!("{phone} connected"), TrayState::Connected)
         } else if status.paired {
@@ -1215,6 +1229,8 @@ impl Shell {
                     .unwrap_or_else(|| "Phone".to_owned())
             }),
             phone_connected: status.phone_connected,
+            usb: status.usb,
+            use_usb: status.use_usb,
             autostart: self.autostart,
             cards: self.card_rows(&status),
             card_busy: self.card_task.as_ref().is_some_and(CardTask::busy),
@@ -1247,6 +1263,18 @@ impl Shell {
                 lines.push(format!(
                     "Phone can be woken: {}",
                     if status.push_stored { "yes" } else { "no" }
+                ));
+                lines.push(format!(
+                    "Connection: {}",
+                    match (status.phone_connected, status.usb) {
+                        (false, _) => "none",
+                        (true, true) => "USB cable",
+                        (true, false) => "network",
+                    }
+                ));
+                lines.push(format!(
+                    "USB cable: {}",
+                    if status.use_usb { "on" } else { "off" }
                 ));
             }
             None => lines.push(match &self.service_error {

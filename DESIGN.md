@@ -45,6 +45,10 @@ Max APDU 65536 bytes, ATR <=33, total frame <=65600. Strict decode: unknown vers
 
 `tapbridge_core::wake::Hint { host: EndpointId, relay: Option<RelayUrl>, direct: Vec<SocketAddr> }`. Text form `HOSTID[;r=RELAYURL][;d=IP:PORT]*`, at most 8 direct addresses, at most 1024 bytes. `Hint::endpoint_addr()` builds the iroh `EndpointAddr`. The phone caches the last hint.
 
+## USB cable link (no network)
+
+See `docs/USB-PLAN.md` and `crates/core/src/usb.rs`. The desktop (`crates/desktop/src/usb_link.rs`, nusb) probes only phone-like USB devices (MTP/PTP or ADB interface), once per plug-in, switches them to Android Open Accessory mode and hands the accessory bulk endpoints to the service (`ServiceHandle::attach_usb`). The service runs the signed USB handshake (offering the pairing capability only while the pairing window is open) and then the same `Hello` authorization as for iroh; the handshake's verified phone key is the peer id. One session at a time: a USB session replaces a live iroh session from the pinned phone. Unplug ends the session (card absent). "Use USB cable" (default on) is persisted as the absence of `usb-off` in the state directory. Windows binds Microsoft's inbox WinUSB/usbccgp drivers to the accessory after a one-time prompt and UAC (untested).
+
 ## Pairing and persistence
 
 Invitation (QR) `tapbridge:1:HOSTID:CAPHEX`: 32-byte CSPRNG capability, 5 min, single use, minting another revokes the previous one, only on explicit user request. The core pairing gate is pure in-memory state; the caller persists the authenticated phone id BEFORE `Accepted`. Persist failure rejects. A lost acknowledgement is recoverable by pinned identity. Reject unknown peers, wrong/expired/replayed capability, and a second active session without replacing the first.
