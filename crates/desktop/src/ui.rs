@@ -38,6 +38,8 @@ const TEXT: u32 = 0xF2EFFA;
 const ACCENT: u32 = 0x7C5CFF;
 /// Card settings glyph (SF Symbols gearshape), tinted by `text_color`.
 const GEAR_SVG: &[u8] = include_bytes!("../assets/ui/gear.svg");
+/// Forget card glyph (SF Symbols trash).
+const TRASH_SVG: &[u8] = include_bytes!("../assets/ui/trash.svg");
 const GOOD: u32 = 0x3DDC97;
 /// Light brand lavender: readable on PANEL, still clearly "tapbridge".
 const ACCENT_SOFT: u32 = 0xC4B5FF;
@@ -1708,22 +1710,22 @@ fn render_checklist<V: ChecklistHost>(
                 ),
             );
         }
-        if can_act {
-            // Also offered while "Todo": a pairing made outside tapbridge
-            // (or one we don't know about yet) can be removed too.
+        // Right of the step's title. Also offered while "Todo": a pairing
+        // made outside tapbridge (or one we don't know about yet) can be
+        // removed too.
+        let remove = can_act.then(|| {
             let remove_uid = uid.clone();
-            login_body = login_body.child(
-                card_button("step-unlogin", index, "Remove login", 0xFFFFFF, 0.06, cx).on_click(
-                    cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
-                        view.checklist_action(SettingsAction::RemoveLogin(remove_uid.clone()), cx)
-                    }),
-                ),
-            );
-        }
+            card_button("step-unlogin", index, "Remove login", 0xFFFFFF, 0.06, cx)
+                .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
+                    view.checklist_action(SettingsAction::RemoveLogin(remove_uid.clone()), cx)
+                }))
+                .into_any_element()
+        });
         let unlocks = format!("This card unlocks your {}.", crate::login::OS_NAME);
-        list.child(step_row(
+        list.child(step_row_with(
             3,
             &format!("{} login", crate::login::OS_NAME),
+            remove,
             match checklist.login {
                 StepState::Done => &unlocks,
                 StepState::Locked => "Needs certificates.",
@@ -1782,6 +1784,18 @@ fn capability_marks(two_factor: bool, login: bool) -> gpui::Div {
 /// One checklist row: mark, then title, detail and `body` (actions,
 /// instructions) stacked beside it.
 fn step_row(number: u8, title: &str, detail: &str, state: StepState, body: gpui::Div) -> gpui::Div {
+    step_row_with(number, title, None, detail, state, body)
+}
+
+/// [`step_row`] with something right-aligned on the title line.
+fn step_row_with(
+    number: u8,
+    title: &str,
+    trailing: Option<gpui::AnyElement>,
+    detail: &str,
+    state: StepState,
+    body: gpui::Div,
+) -> gpui::Div {
     let (mark, color) = match state {
         StepState::Done => ("\u{2713}".to_owned(), GOOD),
         StepState::Problem => ("!".to_owned(), WARN),
@@ -1817,10 +1831,19 @@ fn step_row(number: u8, title: &str, detail: &str, state: StepState, body: gpui:
                 .gap(px(6.0))
                 .child(
                     div()
-                        .text_size(px(13.5))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(rgb(if dim { 0x8A84A3 } else { TEXT }))
-                        .child(title.to_owned()),
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .text_size(px(13.5))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(rgb(if dim { 0x8A84A3 } else { TEXT }))
+                                .child(title.to_owned()),
+                        )
+                        .children(trailing),
                 )
                 .child(
                     div()
@@ -2355,7 +2378,61 @@ impl SettingsView {
                 None => editable_name(("dialog-name", index), &card.uid, &card.label, 17.0, cx)
                     .into_any_element(),
             };
-        let mut sheet = glass::dialog("card-dialog", 18.0, cx)
+        let confirming = self.confirm_forget_card.as_ref() == Some(&card.uid);
+        let forget_uid = card.uid.clone();
+        // Forget: a trash icon beside the name; the first click arms it.
+        let forget = div()
+            .id(("card-forget", index))
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(6.0))
+            .py(px(4.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .when(confirming, |icon| icon.bg(rgba(0xE0455A40)))
+            .hover(|style| style.bg(rgba(0xFFFFFF14)))
+            .child(
+                gpui::svg()
+                    .data(TRASH_SVG)
+                    .size(px(15.0))
+                    .text_color(rgb(if confirming { 0xFF6B7D } else { ACCENT_SOFT })),
+            )
+            .when(confirming, |icon| {
+                icon.child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(0xFF6B7D))
+                        .child("Click again to forget"),
+                )
+            })
+            .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
+                if view.confirm_forget_card.as_ref() == Some(&forget_uid) {
+                    view.confirm_forget_card = None;
+                    view.act(SettingsAction::ForgetCard(forget_uid.clone()), cx);
+                    view.close_dialog(cx);
+                } else {
+                    view.confirm_forget_card = Some(forget_uid.clone());
+                }
+                cx.notify();
+            }));
+        let close = div()
+            .id("dialog-close")
+            .flex_none()
+            .size(px(24.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .cursor_pointer()
+            .hover(|style| style.bg(rgba(0xFFFFFF14)))
+            .text_size(px(14.0))
+            .text_color(rgb(ACCENT_SOFT))
+            .child("\u{2715}")
+            .on_click(cx.listener(|view, _: &gpui::ClickEvent, _, cx| view.close_dialog(cx)));
+        let sheet = glass::dialog("card-dialog", 18.0, cx)
             .id("card-dialog")
             .occlude()
             .w(px(400.0))
@@ -2367,57 +2444,43 @@ impl SettingsView {
             .p(px(20.0))
             .child(
                 div()
-                    .text_size(px(12.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(rgb(ACCENT_SOFT))
-                    .child(if is_new { "NEW CARD" } else { "CARD SETTINGS" }),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(ACCENT_SOFT))
+                            .child(if is_new { "NEW CARD" } else { "CARD SETTINGS" }),
+                    )
+                    .child(close),
             )
-            .child(name)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(div().flex_1().min_w(px(0.0)).child(name))
+                    .child(forget),
+            )
             .child(card_details(
                 self,
                 index,
                 &card,
                 self.snapshot.card_busy,
                 cx,
-            ));
-        let done = if is_new { "Done" } else { "Close" };
-        let confirming = self.confirm_forget_card.as_ref() == Some(&card.uid);
-        let forget_uid = card.uid.clone();
-        let forget = card_button(
-            "card-forget",
-            index,
-            if confirming {
-                "Click again to forget"
-            } else {
-                "Forget card"
-            },
-            if confirming { 0xE0455A } else { 0xFFFFFF },
-            if confirming { 0.55 } else { 0.06 },
-            cx,
-        )
-        .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
-            if view.confirm_forget_card.as_ref() == Some(&forget_uid) {
-                view.confirm_forget_card = None;
-                view.act(SettingsAction::ForgetCard(forget_uid.clone()), cx);
-                view.close_dialog(cx);
-            } else {
-                view.confirm_forget_card = Some(forget_uid.clone());
-            }
-            cx.notify();
-        }));
-        sheet = sheet.child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .child(forget)
-                .child(
-                    card_button("dialog-close", index, done, 0xFFFFFF, 0.08, cx).on_click(
+            ))
+            // A new card still ends with Done (it keeps the typed name).
+            .when(is_new, |sheet| {
+                sheet.child(div().flex().flex_row().justify_end().child(
+                    card_button("dialog-done", index, "Done", 0xFFFFFF, 0.08, cx).on_click(
                         cx.listener(|view, _: &gpui::ClickEvent, _, cx| view.close_dialog(cx)),
                     ),
-                ),
-        );
+                ))
+            });
         Some(
             div()
                 .id("card-dialog-scrim")
