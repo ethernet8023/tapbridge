@@ -102,7 +102,93 @@ pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_connect(
     }
 }
 
-/// Host display name from the `Accepted` handshake reply.
+/// USB step 1 (worker thread): runs the signed USB handshake on the
+/// accessory fd. Kotlin keeps owning `fd` (Rust uses a dup). Returns a
+/// handle whose host is verified (`hostId`, `hostName`, `pairingOpen`)
+/// but that may not carry frames until `usbHello` succeeded.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_usbOpen(
+    mut env: JNIEnv,
+    _class: JClass,
+    fd: jint,
+    key: JByteArray,
+) -> jlong {
+    let result = (|| -> Result<Session, Box<dyn std::error::Error>> {
+        let bytes = env.convert_byte_array(key)?;
+        let key: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| "identity must contain 32 bytes")?;
+        Ok(Session::usb_open(fd, key)?)
+    })();
+    match result {
+        Ok(session) => Box::into_raw(Box::new(session)) as jlong,
+        Err(error) => {
+            report(&mut env, error);
+            0
+        }
+    }
+}
+
+/// USB step 2 (worker thread): sends Hello (with the host's pairing
+/// capability when `use_pairing`) and waits for Accepted.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_usbHello(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    use_pairing: jboolean,
+    name: JString,
+    push_token: JString,
+) {
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let name: String = env.get_string(&name)?.into();
+        let push_token: String = env.get_string(&push_token)?.into();
+        let push = (!push_token.is_empty()).then_some(push_token);
+        unsafe { session(handle)? }.usb_hello(use_pairing != 0, &name, push)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        report(&mut env, error);
+    }
+}
+
+/// Verified host id (64 hex) of the session's peer (null on error).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_hostId(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jstring {
+    let result = unsafe { session(handle) }
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+        .and_then(|s| Ok(env.new_string(s.host_id())?));
+    match result {
+        Ok(text) => text.into_raw(),
+        Err(error) => {
+            report(&mut env, error);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// The PC's pairing window is open (USB handshake carried a capability).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_pairingOpen(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jboolean {
+    match unsafe { session(handle) } {
+        Ok(s) => s.pairing_open().into(),
+        Err(error) => {
+            report(&mut env, error);
+            0
+        }
+    }
+}
+
+/// Host display name from the `Accepted` handshake reply (over USB before
+/// `usbHello`: the name from the USB handshake).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_computer_ethernet_tapbridge_NativeBridge_hostName(
     mut env: JNIEnv,

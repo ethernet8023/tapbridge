@@ -7646,6 +7646,7 @@ dependencies = [
  "android_logger",
  "iroh",
  "jni 0.21.1",
+ "libc",
  "log",
  "ndk-context",
  "tapbridge-core",
