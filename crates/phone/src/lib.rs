@@ -4,9 +4,10 @@ use iroh::{
     Endpoint, SecretKey,
     endpoint::{Connection, RecvStream, SendStream},
 };
+#[cfg(unix)]
+use std::os::fd::RawFd;
 use std::{
     io,
-    os::fd::RawFd,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
@@ -18,6 +19,9 @@ use tapbridge_core::{
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
+// The USB accessory link works on a file descriptor: Android in the app,
+// Unix hosts for its tests. (The workspace also builds on Windows.)
+#[cfg(unix)]
 mod usb;
 
 #[cfg(test)]
@@ -48,6 +52,7 @@ enum Transport {
         reader: Mutex<RecvStream>,
         writer: Mutex<SendStream>,
     },
+    #[cfg(unix)]
     Usb(usb::UsbLink),
 }
 
@@ -185,10 +190,12 @@ impl Session {
     /// session whose host is verified but not yet greeted. The caller
     /// checks [`Session::host_id`] / [`Session::pairing_open`], asks the
     /// user if needed, then calls [`Session::usb_hello`].
+    #[cfg(unix)]
     pub fn usb_open(fd: RawFd, key: [u8; 32]) -> io::Result<Self> {
         Self::usb_open_link(Arc::new(usb::FdLink::dup(fd)?), key)
     }
 
+    #[cfg(unix)]
     fn usb_open_link(link: Arc<usb::FdLink>, key: [u8; 32]) -> io::Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -236,6 +243,7 @@ impl Session {
     /// USB step 2: sends `Hello` (with the host's pairing capability when
     /// `use_pairing`, i.e. the user confirmed pairing) and waits for
     /// `Accepted`. Afterwards the session works exactly like a network one.
+    #[cfg(unix)]
     pub fn usb_hello(&self, use_pairing: bool, name: &str, push: Option<String>) -> io::Result<()> {
         let Transport::Usb(link) = &self.transport else {
             return Err(io::Error::other("not a usb session"));
@@ -288,6 +296,7 @@ impl Session {
     /// network session (its host id is the dialed hint's).
     pub fn host_id(&self) -> String {
         match &self.transport {
+            #[cfg(unix)]
             Transport::Usb(link) => link.info.host.to_string(),
             Transport::Iroh { connection, .. } => connection.remote_id().to_string(),
         }
@@ -295,12 +304,18 @@ impl Session {
 
     /// The PC's pairing window is open (USB handshake carried a capability).
     pub fn pairing_open(&self) -> bool {
-        matches!(&self.transport, Transport::Usb(link) if link.info.capability.is_some())
+        #[cfg(unix)]
+        return matches!(&self.transport, Transport::Usb(link) if link.info.capability.is_some());
+        #[cfg(not(unix))]
+        false
     }
 
     /// Whether this session runs over the USB cable.
     pub fn is_usb(&self) -> bool {
-        matches!(self.transport, Transport::Usb(_))
+        #[cfg(unix)]
+        return matches!(self.transport, Transport::Usb(_));
+        #[cfg(not(unix))]
+        false
     }
 
     /// Host display name from the `Accepted` reply (1..=64 UTF-8 bytes);
@@ -308,6 +323,7 @@ impl Session {
     pub fn host_name(&self) -> &str {
         match (self.accepted.get(), &self.transport) {
             (Some(accepted), _) => &accepted.host_name,
+            #[cfg(unix)]
             (None, Transport::Usb(link)) => &link.info.name,
             (None, Transport::Iroh { .. }) => "",
         }
@@ -351,6 +367,7 @@ impl Session {
                 let mut reader = lock(reader, "reader")?;
                 self.runtime.block_on(wire::read_frame(&mut *reader))?
             }
+            #[cfg(unix)]
             Transport::Usb(link) => {
                 let mut reader = lock(&link.reader, "reader")?;
                 let mut closed = self.closed.subscribe();
@@ -391,6 +408,7 @@ impl Session {
                 let mut writer = lock(writer, "writer")?;
                 self.runtime.block_on(write_timed(&mut *writer, frame))
             }
+            #[cfg(unix)]
             Transport::Usb(link) => {
                 let mut writer = lock(&link.writer, "writer")?;
                 self.runtime.block_on(write_timed(&mut *writer, frame))
@@ -407,6 +425,7 @@ impl Session {
         self.closed.send_replace(true);
         match &self.transport {
             Transport::Iroh { connection, .. } => transport::close(connection),
+            #[cfg(unix)]
             Transport::Usb(link) => link.close(),
         }
     }

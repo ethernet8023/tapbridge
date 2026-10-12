@@ -157,6 +157,7 @@ fn rejects_invalid_or_mismatched_invitation_without_network() {
 
 // ------------------------------------------------------------- USB link
 
+#[cfg(unix)]
 mod usb_link {
     use super::*;
     use std::os::fd::AsRawFd;
