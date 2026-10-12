@@ -3,6 +3,7 @@
 pub mod cards;
 pub mod pairing;
 pub mod transport;
+pub mod usb;
 pub mod wake;
 pub mod wire;
 
