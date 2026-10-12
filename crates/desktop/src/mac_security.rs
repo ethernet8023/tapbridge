@@ -246,10 +246,18 @@ fn pam_script(file: &str, on: bool) -> String {
     }
 }
 
+/// Quotes `text` for sh: inside single quotes nothing is special, and a
+/// single quote itself becomes `'\''`.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
 fn file_script(path: &str, text: Option<&str>) -> String {
     match text {
-        // The text is ours and has no single quotes.
-        Some(text) => format!("printf '%s' '{text}' > {path}; chmod 644 {path}"),
+        Some(text) => format!(
+            "printf '%s' {} > {path}; chmod 644 {path}",
+            shell_quote(text)
+        ),
         None => format!("rm -f {path}"),
     }
 }
@@ -530,6 +538,63 @@ mod tests {
         assert!(!pam_has_smartcard(&text));
         assert!(text.contains("pam_opendirectory.so"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The SSH texts contain a quote ("card's"): unquoted, the shell ran
+    /// the next line as a command (`Host *` -> /usr/bin/host).
+    #[test]
+    fn file_script_writes_the_exact_text() {
+        let dir = std::env::temp_dir().join(format!("tb-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, text) in [
+            ("client", SSH_CLIENT_TEXT),
+            ("server", SSHD_TEXT),
+            ("odd", "a'b\"c$d `e` \\n\n"),
+        ] {
+            let path = dir.join(name);
+            let script = file_script(path.to_str().unwrap(), Some(text));
+            let status = std::process::Command::new("/bin/sh")
+                .args(["-ec", &script])
+                .current_dir("/")
+                .status()
+                .unwrap();
+            assert!(status.success(), "{name}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{name}");
+            // And through AppleScript's string escaping, as `apply` runs it.
+            let applescript = admin_applescript(&script);
+            assert!(applescript.starts_with("do shell script \""));
+        }
+        let path = dir.join("client");
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-ec", &file_script(path.to_str().unwrap(), None)])
+            .status()
+            .unwrap();
+        assert!(status.success() && !path.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The whole script, with every change on, must at least parse.
+    #[test]
+    fn apply_script_parses() {
+        let all = SecurityConfig {
+            enforce_smart_card: true,
+            sudo: true,
+            su: true,
+            login: true,
+            ssh_client: true,
+            sshd_cards_only: true,
+            ..SecurityConfig::macos_default()
+        };
+        for (want, live) in [
+            (all, SecurityConfig::macos_default()),
+            (SecurityConfig::macos_default(), all),
+        ] {
+            let status = std::process::Command::new("/bin/sh")
+                .args(["-n", "-c", &apply_script(&want, &live)])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
     }
 
     #[test]
