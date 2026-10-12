@@ -1116,7 +1116,7 @@ pub struct SettingsView {
     /// Cards showing the applet install instructions.
     show_install: std::collections::HashSet<Vec<u8>>,
     /// Card being renamed, its text field, and the field's event subscription.
-    editing: Option<(Vec<u8>, gpui::Entity<TextInput>, gpui::Subscription)>,
+    editing: Option<(Vec<u8>, gpui::Entity<TextInput>, Vec<gpui::Subscription>)>,
     focus: FocusHandle,
     #[cfg(windows)]
     passkeys: Entity<PasskeyView>,
@@ -1196,8 +1196,10 @@ impl SettingsView {
             InputEvent::Cancel => view.finish_rename(false, cx),
         });
         let handle = gpui::Focusable::focus_handle(input.read(cx), cx);
+        // Clicking elsewhere keeps the typed name, like Return.
+        let blur = cx.on_blur(&handle, window, |view, _, cx| view.finish_rename(true, cx));
         handle.focus(window, cx);
-        self.editing = Some((uid, input, subscription));
+        self.editing = Some((uid, input, vec![subscription, blur]));
         self.confirm_forget_card = None;
         cx.notify();
     }
@@ -1247,10 +1249,7 @@ impl SettingsView {
             .map(|(_, input, _)| input.clone());
         let title = match &editing {
             Some(input) => div().child(input.clone()),
-            None => div()
-                .text_size(px(15.0))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .child(card.label.clone()),
+            None => editable_name(("card-name", index), &card.uid, &card.label, 15.0, cx),
         };
         let mut badges = div().flex().flex_row().gap(px(6.0));
         for (shown, text) in [(card.passkey, "Passkey"), (card.smart_card, "Smart card")] {
@@ -1294,85 +1293,31 @@ impl SettingsView {
                     }),
             )
             .child(badges)
-            // Card settings: the login steps (set up / remove).
-            .when(
-                card.checklist.is_some() && crate::login::SUPPORTED && editing.is_none(),
-                |header| {
-                    let open_uid = card.uid.clone();
-                    header.child(
-                        div()
-                            .id(("card-settings", index))
-                            .flex_none()
-                            .self_start()
-                            .p(px(4.0))
-                            .rounded(px(6.0))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgba(0xFFFFFF14)))
-                            .child(
-                                gpui::svg()
-                                    .data(GEAR_SVG)
-                                    .size(px(16.0))
-                                    .text_color(rgb(ACCENT_SOFT)),
-                            )
-                            .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
-                                view.dialog = Some(CardDialog::Login(open_uid.clone()));
-                                cx.notify();
-                            })),
-                    )
-                },
-            );
-        let uid = card.uid.clone();
-        let mut buttons = div().flex().flex_row().flex_wrap().gap(px(8.0));
-        if editing.is_some() {
-            buttons = buttons
-                .child(
-                    card_button("card-save", index, "Save", ACCENT, 0.6, cx).on_click(cx.listener(
-                        |view, _: &gpui::ClickEvent, _, cx| view.finish_rename(true, cx),
-                    )),
+            // Card settings: login steps and Forget.
+            .when(editing.is_none(), |header| {
+                let open_uid = card.uid.clone();
+                header.child(
+                    div()
+                        .id(("card-settings", index))
+                        .flex_none()
+                        .self_start()
+                        .p(px(4.0))
+                        .rounded(px(6.0))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgba(0xFFFFFF14)))
+                        .child(
+                            gpui::svg()
+                                .data(GEAR_SVG)
+                                .size(px(16.0))
+                                .text_color(rgb(ACCENT_SOFT)),
+                        )
+                        .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
+                            view.confirm_forget_card = None;
+                            view.dialog = Some(CardDialog::Settings(open_uid.clone()));
+                            cx.notify();
+                        })),
                 )
-                .child(
-                    card_button("card-cancel", index, "Cancel", 0xFFFFFF, 0.06, cx).on_click(
-                        cx.listener(|view, _: &gpui::ClickEvent, _, cx| {
-                            view.finish_rename(false, cx)
-                        }),
-                    ),
-                );
-        } else {
-            let label = card.label.clone();
-            let rename_uid = uid.clone();
-            buttons = buttons.child(
-                card_button("card-rename", index, "Rename", 0xFFFFFF, 0.06, cx).on_click(
-                    cx.listener(move |view, _: &gpui::ClickEvent, window, cx| {
-                        view.start_rename(rename_uid.clone(), &label, window, cx)
-                    }),
-                ),
-            );
-            let confirming = self.confirm_forget_card.as_ref() == Some(&card.uid);
-            let forget_uid = uid.clone();
-            buttons = buttons.child(
-                card_button(
-                    "card-forget",
-                    index,
-                    if confirming {
-                        "Click again to forget"
-                    } else {
-                        "Forget"
-                    },
-                    if confirming { 0xE0455A } else { 0xFFFFFF },
-                    if confirming { 0.55 } else { 0.06 },
-                    cx,
-                )
-                .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
-                    if view.confirm_forget_card.as_ref() == Some(&forget_uid) {
-                        view.confirm_forget_card = None;
-                        view.act(SettingsAction::ForgetCard(forget_uid.clone()), cx);
-                    } else {
-                        view.confirm_forget_card = Some(forget_uid.clone());
-                    }
-                    cx.notify();
-                })),
-            );
-        }
+            });
         let mut panel = glass::panel(&format!("card-{index}"), 14.0, cx)
             .flex()
             .flex_col()
@@ -1400,8 +1345,39 @@ impl SettingsView {
             }
             panel = panel.child(line);
         }
-        panel.child(buttons)
+        panel
     }
+}
+
+/// A card's name that shows a box on hover; clicking it turns it into a
+/// text field (Return or clicking away saves, Escape cancels).
+fn editable_name(
+    id: (&'static str, usize),
+    uid: &[u8],
+    label: &str,
+    size: f32,
+    cx: &mut Context<SettingsView>,
+) -> gpui::Div {
+    let uid = uid.to_vec();
+    let text = label.to_owned();
+    div().flex().child(
+        div()
+            .id(id)
+            .px(px(6.0))
+            .py(px(2.0))
+            .ml(px(-7.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(rgba(0x00000000))
+            .cursor_text()
+            .hover(|style| style.border_color(rgba(0xFFFFFF40)).bg(rgba(0xFFFFFF0A)))
+            .text_size(px(size))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .child(label.to_owned())
+            .on_click(cx.listener(move |view, _: &gpui::ClickEvent, window, cx| {
+                view.start_rename(uid.clone(), &text, window, cx)
+            })),
+    )
 }
 
 /// A window that shows a card's login checklist and carries out its
@@ -1617,8 +1593,8 @@ fn render_checklist<V: ChecklistHost>(
 /// What the card dialog shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CardDialog {
-    /// "Set up login": the three steps for this card.
-    Login(Vec<u8>),
+    /// "Card settings": login steps and Forget for this card.
+    Settings(Vec<u8>),
     /// A card tapped for the first time: name it, then the same steps.
     New(Vec<u8>),
 }
@@ -1626,7 +1602,7 @@ enum CardDialog {
 impl CardDialog {
     fn uid(&self) -> &[u8] {
         match self {
-            Self::Login(uid) | Self::New(uid) => uid,
+            Self::Settings(uid) | Self::New(uid) => uid,
         }
     }
 }
@@ -1972,6 +1948,7 @@ impl SettingsView {
     }
 
     fn close_dialog(&mut self, cx: &mut Context<Self>) {
+        self.confirm_forget_card = None;
         if let Some(dialog) = self.dialog.take()
             && self
                 .editing
@@ -2002,10 +1979,7 @@ impl SettingsView {
         let name: gpui::AnyElement =
             match self.editing.as_ref().filter(|(uid, ..)| *uid == card.uid) {
                 Some((_, input, _)) => div().child(input.clone()).into_any_element(),
-                None => div()
-                    .text_size(px(17.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(card.label.clone())
+                None => editable_name(("dialog-name", index), &card.uid, &card.label, 17.0, cx)
                     .into_any_element(),
             };
         let mut sheet = glass::dialog("card-dialog", 18.0, cx)
@@ -2023,7 +1997,7 @@ impl SettingsView {
                     .text_size(px(12.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(rgb(ACCENT_SOFT))
-                    .child(if is_new { "NEW CARD" } else { "SET UP LOGIN" }),
+                    .child(if is_new { "NEW CARD" } else { "CARD SETTINGS" }),
             )
             .child(name)
             .child(card_details(
@@ -2034,12 +2008,43 @@ impl SettingsView {
                 cx,
             ));
         let done = if is_new { "Done" } else { "Close" };
-        sheet =
-            sheet.child(div().flex().flex_row().justify_end().child(
-                card_button("dialog-close", index, done, 0xFFFFFF, 0.08, cx).on_click(
-                    cx.listener(|view, _: &gpui::ClickEvent, _, cx| view.close_dialog(cx)),
+        let confirming = self.confirm_forget_card.as_ref() == Some(&card.uid);
+        let forget_uid = card.uid.clone();
+        let forget = card_button(
+            "card-forget",
+            index,
+            if confirming {
+                "Click again to forget"
+            } else {
+                "Forget card"
+            },
+            if confirming { 0xE0455A } else { 0xFFFFFF },
+            if confirming { 0.55 } else { 0.06 },
+            cx,
+        )
+        .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
+            if view.confirm_forget_card.as_ref() == Some(&forget_uid) {
+                view.confirm_forget_card = None;
+                view.act(SettingsAction::ForgetCard(forget_uid.clone()), cx);
+                view.close_dialog(cx);
+            } else {
+                view.confirm_forget_card = Some(forget_uid.clone());
+            }
+            cx.notify();
+        }));
+        sheet = sheet.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .child(forget)
+                .child(
+                    card_button("dialog-close", index, done, 0xFFFFFF, 0.08, cx).on_click(
+                        cx.listener(|view, _: &gpui::ClickEvent, _, cx| view.close_dialog(cx)),
+                    ),
                 ),
-            ));
+        );
         Some(
             div()
                 .id("card-dialog-scrim")
@@ -2148,7 +2153,7 @@ pub fn settings_new_card(handle: WindowHandle<SettingsView>, uid: Vec<u8>, cx: &
 pub fn settings_open_login(handle: WindowHandle<SettingsView>, uid: Vec<u8>, cx: &mut App) {
     let _ = handle.update(cx, |view, window, cx| {
         if view.dialog.is_none() {
-            view.dialog = Some(CardDialog::Login(uid));
+            view.dialog = Some(CardDialog::Settings(uid));
             cx.notify();
         }
         window.activate();
