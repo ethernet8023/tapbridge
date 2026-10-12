@@ -187,6 +187,16 @@ impl PairingGate {
         }
     }
 
+    /// The outstanding invitation's capability while it is still valid
+    /// (unexpired, unconsumed); `None` when no pairing window is open.
+    /// Read-only: the USB handshake offers it to a phone on the cable.
+    pub fn outstanding_capability(&self) -> Option<[u8; 32]> {
+        self.outstanding
+            .as_ref()
+            .filter(|outstanding| Instant::now() < outstanding.expires)
+            .map(|outstanding| outstanding.capability)
+    }
+
     /// Authorize a pairing attempt from the iroh-authenticated `peer`
     /// presenting `capability`. Validation only: nothing is consumed.
     pub fn authorize(

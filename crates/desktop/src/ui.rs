@@ -984,6 +984,8 @@ pub enum SettingsAction {
     Pair,
     Forget,
     SetAutostart(bool),
+    /// "Use USB cable" (persisted by the host service).
+    SetUseUsb(bool),
     RenameCard(Vec<u8>, String),
     ForgetCard(Vec<u8>),
     SetUpCard(Vec<u8>),
@@ -1005,6 +1007,7 @@ impl SettingsAction {
             Self::Pair => "pair",
             Self::Forget => "forget phone",
             Self::SetAutostart(_) => "set autostart",
+            Self::SetUseUsb(_) => "set use usb",
             Self::RenameCard(..) => "rename card",
             Self::ForgetCard(_) => "forget card",
             Self::SetUpCard(_) => "set up certificates",
@@ -1060,6 +1063,10 @@ pub struct SettingsSnapshot {
     /// Display name of the paired phone.
     pub phone: Option<String>,
     pub phone_connected: bool,
+    /// The live session runs over the USB cable.
+    pub usb: bool,
+    /// "Use USB cable".
+    pub use_usb: bool,
     pub autostart: bool,
     /// Known cards, shown once a phone is paired.
     pub cards: Vec<CardRow>,
@@ -1727,11 +1734,11 @@ impl Render for SettingsView {
             );
 
         let (phone_title, phone_detail) = match &snapshot.phone {
+            Some(name) if snapshot.phone_connected && snapshot.usb => {
+                (name.clone(), Some("Paired & connected by USB"))
+            }
             Some(name) if snapshot.phone_connected => (name.clone(), Some("Paired & online")),
-            Some(name) => (
-                name.clone(),
-                Some("Paired"),
-            ),
+            Some(name) => (name.clone(), Some("Paired")),
             None => ("No phone paired".to_owned(), None),
         };
         let phone_button = if snapshot.phone.is_some() {
@@ -1806,6 +1813,7 @@ impl Render for SettingsView {
             "Open tapbridge in the notification area when you sign in."
         };
         let autostart = snapshot.autostart;
+        let use_usb = snapshot.use_usb;
         let general = div()
             .flex()
             .flex_col()
@@ -1824,6 +1832,23 @@ impl Render for SettingsView {
                     // Optimistic; the shell's next snapshot has the real state.
                     view.snapshot.autostart = !autostart;
                     view.act(SettingsAction::SetAutostart(!autostart), cx);
+                    cx.notify();
+                })),
+            )
+            .child(
+                option_row(
+                    "opt-usb",
+                    use_usb,
+                    true,
+                    "Use USB cable",
+                    "Connect to your phone over its USB cable when it is plugged in, \
+                     with no network needed."
+                        .to_owned(),
+                    cx,
+                )
+                .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
+                    view.snapshot.use_usb = !use_usb;
+                    view.act(SettingsAction::SetUseUsb(!use_usb), cx);
                     cx.notify();
                 })),
             );
