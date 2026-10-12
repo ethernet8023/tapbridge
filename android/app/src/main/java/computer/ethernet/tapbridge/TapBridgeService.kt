@@ -670,7 +670,7 @@ class TapBridgeService : Service() {
             try {
                 NativeBridge.initialize(applicationContext)
                 val pfd = getSystemService(UsbManager::class.java)?.openAccessory(accessory)
-                    ?: throw IOException("couldn't open the USB connection; unplug and plug in again")
+                    ?: throw UsbNotice("couldn't open the USB connection; unplug and plug in again")
                 usbPfd = pfd
                 val key = IdentityStore.getOrCreateKey(this@TapBridgeService)
                 pointer = try { NativeBridge.usbOpen(pfd.fd, key) } finally { key.fill(0) }
@@ -696,11 +696,14 @@ class TapBridgeService : Service() {
                         }
                     }
                     is UsbLink.Decision.OpenPairingFirst ->
-                        throw IOException(UsbLink.openPairingFirstMessage(decision.hostName))
+                        throw UsbNotice(UsbLink.openPairingFirstMessage(decision.hostName))
                 }
             } catch (error: Exception) {
                 if (pointer != 0L) { NativeBridge.close(pointer); NativeBridge.release(pointer); pointer = 0L }
-                if (requested.get() == attempt) failUsb(attempt, error.message ?: "USB connection failed")
+                if (requested.get() == attempt) {
+                    if (error is UsbNotice) failUsb(attempt, error.message)
+                    else retryUsbQuietly(attempt, error)
+                }
             } finally {
                 // Superseded (unplugged, stopped) between steps.
                 if (pointer != 0L) { NativeBridge.close(pointer); NativeBridge.release(pointer) }
@@ -786,6 +789,9 @@ class TapBridgeService : Service() {
      * a failure (PC not ready, pairing window closed) retries slowly and
      * tells the user once per plug-in.
      */
+    /** A USB failure the user should hear about (shown once per plug-in). */
+    private class UsbNotice(message: String) : IOException(message)
+
     private fun failUsb(attempt: Long, error: String?) {
         releaseUsbHandles()
         main.post {
@@ -802,6 +808,25 @@ class TapBridgeService : Service() {
             }
             // The refusal message stays up; the network path still resumes.
             resumeAfterUsb(keepError = error != null)
+        }
+    }
+
+    /**
+     * A USB attempt fell through for a reason nobody can act on (handshake
+     * timed out, the PC end went away mid-handshake): log it, retry the
+     * cable in the background and let the network path carry on. No popup,
+     * no error status. Lifecycle thread.
+     */
+    private fun retryUsbQuietly(attempt: Long, error: Exception) {
+        android.util.Log.i("tapbridge", "usb: attempt failed, retrying quietly: ${error.message}")
+        releaseUsbHandles()
+        main.post {
+            if (requested.get() != attempt) return@post
+            val accessory = usbAccessory
+            usbAccessory = null
+            show(Status.IDLE)
+            accessory?.let { scheduleUsbReopen(it, USB_RETRY_MS) }
+            resumeAfterUsb()
         }
     }
 
