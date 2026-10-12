@@ -8,7 +8,11 @@ With tapbridge you tap your card on your Android phone, and your computer acts a
 
 Your card does all the secret work. Your phone and computer only pass messages between each other, over a private, encrypted connection. Nothing stays connected while you aren't using it, so it won't drain your phone's battery.
 
-![The tapbridge pairing window, showing a card and its login setup steps](docs/screenshot.png)
+<p align="center">
+  <img src="docs/screenshots/pairing.png" width="32%" alt="Pairing: scan the code with the tapbridge app on your phone">
+  <img src="docs/screenshots/preferences.png" width="32%" alt="Preferences: your phone, your cards and what each can do">
+  <img src="docs/screenshots/login-setup.png" width="32%" alt="Setting up Mac login with a card, step by step">
+</p>
 
 ## Features
 
@@ -71,6 +75,7 @@ nix develop
 | Build, install and launch the Mac app | `build-and-run-macos-pkg` (asks for your password to install) |
 | Build the Mac installer only | `build-and-run-macos-pkg --no-install` → `dist/tapbridge-<version>-macos.pkg` |
 | Desktop windows with sample data | `cargo run -p tapbridge-desktop -- --preview-ui` (set `TAPBRIDGE_PREVIEW_DIALOG` to `new`, `paired` or `about` for other screens) |
+| README screenshots (`docs/screenshots/`) | `scripts/screenshots.sh` |
 | Android tests and debug APK | `build-android testDebugUnitTest assembleDebug` |
 | Install the APK on a phone | `adb install -r android/app/build/outputs/apk/debug/app-debug.apk` |
 | Play bundle (AAB) | in `android/`: `./gradlew bundleRelease` |

@@ -294,7 +294,51 @@ pub fn preview_ui() {
             }
         }
         cx.activate(true);
+        #[cfg(feature = "screenshots")]
+        if let Ok(dir) = std::env::var("TAPBRIDGE_SCREENSHOTS") {
+            save_screenshots(std::path::PathBuf::from(dir), cx);
+        }
     });
+}
+
+/// `--preview-ui` with `TAPBRIDGE_SCREENSHOTS=<dir>`: once the windows have
+/// drawn, renders each one offscreen to `<dir>/<title>.png`, then quits.
+#[cfg(feature = "screenshots")]
+fn save_screenshots(dir: std::path::PathBuf, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        // Let layout, images and the glass settle.
+        cx.background_executor()
+            .timer(std::time::Duration::from_millis(1500))
+            .await;
+        cx.update(|cx| {
+            let _ = std::fs::create_dir_all(&dir);
+            for window in cx.windows() {
+                let _ = window.update(cx, |_, window, _| {
+                    let title = window.window_title();
+                    let name: String = title
+                        .to_lowercase()
+                        .chars()
+                        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                        .collect();
+                    if name.trim_matches('-').is_empty() {
+                        return; // The invisible anchor window.
+                    }
+                    match window.render_to_image() {
+                        Ok(image) => {
+                            let path = dir.join(format!("{}.png", name.trim_matches('-')));
+                            match image.save(&path) {
+                                Ok(()) => eprintln!("screenshot: {}", path.display()),
+                                Err(error) => eprintln!("screenshot {name}: {error}"),
+                            }
+                        }
+                        Err(error) => eprintln!("screenshot {name}: {error}"),
+                    }
+                });
+            }
+            cx.quit();
+        });
+    })
+    .detach();
 }
 
 /// Shared shell bootstrap (both platforms): tray, anchor window, global.

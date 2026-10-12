@@ -9,7 +9,13 @@ license.workspace = true
 name = "tapbridge"
 path = "src/main.rs"
 
+[features]
+# `--preview-ui` saves every window to docs/screenshots/*.png when
+# TAPBRIDGE_SCREENSHOTS is set (gpui's offscreen render; no screen access).
+screenshots = ["gpui/test-support", "gpui_platform/test-support", "dep:image"]
+
 [dependencies]
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 tapbridge-host = { path = "../host" }
 tapbridge-core = { path = "../core" }
 tokio.workspace = true
