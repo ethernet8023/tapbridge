@@ -9,7 +9,7 @@
     };
   };
 
-  outputs = { nixpkgs, rust-overlay, ... }:
+  outputs = { self, nixpkgs, rust-overlay, ... }:
     let
       systems = [ "aarch64-darwin" "x86_64-darwin" "x86_64-linux" "aarch64-linux" ];
       forAll = f: nixpkgs.lib.genAttrs systems (system: f (import nixpkgs {
@@ -33,6 +33,39 @@
         rec {
           tapbridge = tapbridgeFor pkgs;
           default = tapbridge;
+          # The programs.tapbridge options table, from the module itself.
+          options-doc = import ./nix/options-doc.nix { inherit (pkgs) lib; inherit pkgs; };
+        });
+
+      # `nix run .#docs`: rewrites the options table in docs/nix-darwin.md.
+      apps = nixpkgs.lib.genAttrs darwinSystems (system:
+        let pkgs = nixpkgs.legacyPackages.${system}; in
+        {
+          docs = {
+            type = "app";
+            program = toString (pkgs.writeShellScript "tapbridge-docs" ''
+              set -euo pipefail
+              root="$(git rev-parse --show-toplevel)"
+              ${pkgs.python3}/bin/python3 ${./nix/splice-doc.py} \
+                "$root/docs/nix-darwin.md" ${self.packages.${system}.options-doc}
+            '');
+          };
+        });
+
+      # Fails when docs/nix-darwin.md's table is out of date.
+      checks = nixpkgs.lib.genAttrs darwinSystems (system:
+        let pkgs = nixpkgs.legacyPackages.${system}; in
+        {
+          docs = pkgs.runCommand "tapbridge-docs-check" { } ''
+            cp ${./docs/nix-darwin.md} doc.md
+            chmod +w doc.md
+            ${pkgs.python3}/bin/python3 ${./nix/splice-doc.py} doc.md ${self.packages.${system}.options-doc}
+            if ! diff -u ${./docs/nix-darwin.md} doc.md; then
+              echo "docs/nix-darwin.md is out of date: run nix run .#docs" >&2
+              exit 1
+            fi
+            touch $out
+          '';
         });
 
       # nix-darwin: `programs.tapbridge`. See docs/nix-darwin.md.

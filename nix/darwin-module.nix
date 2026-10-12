@@ -59,55 +59,75 @@ in
       description = "The tapbridge package (set by the flake's module).";
     };
 
-    startAtLogin = bool true "Start tapbridge in the menu bar when you log in.";
+    startAtLogin = bool true "Start at login. Open tapbridge in the menu bar when you log in.";
 
     alwaysPresent = bool false ''
-      "Card always ready": your login card shows as inserted before you tap
-      it, so the lock screen and sudo ask for it straight away. If you don't
-      tap within 25 seconds, the card is reported gone and the password works.
+      Card always ready. Your login card shows as inserted even before you
+      tap it, so the lock screen and sudo ask for it straight away. If you
+      don't tap within 25 seconds, you can use your password.
     '';
 
     useUsb = bool true ''
-      "Connect to phone via USB": the phone can also reach the Mac over a
-      USB cable, which works without a network. Required by
+      Connect to phone via USB. The phone can also reach the Mac over a USB
+      cable, which works without a network. Required by
       `smartCard.enforceSmartCard`.
     '';
 
     smartCard = {
       allowSmartCard = bool true ''
-        `allowSmartCard`: cards can log in, unlock the screen and approve
-        admin prompts. Takes effect after a restart.
+        Log in with smart cards. Cards can log in, unlock the screen and
+        approve admin prompts. Needs a reboot. (`allowSmartCard`)
       '';
       userPairing = bool true ''
-        `UserPairing`: macOS offers to pair a card with your account when it's inserted.
+        Offer to pair new cards. macOS asks to link a card to your account
+        when it's tapped or inserted. (`UserPairing`)
       '';
       checkCertificateTrust = mkOption {
         type = types.ints.between 0 3;
         default = 0;
         description = ''
-          `checkCertificateTrust`: 0 off, 1 check, 2 check with soft
-          revocation, 3 check with hard revocation. tapbridge makes
-          self-signed certificates, so keep 0 unless you use your own CA.
+          Certificate check: only accept cards whose certificate a trusted
+          authority issued. 0 off, 1 check, 2 check + soft revocation, 3
+          check + hard revocation. tapbridge makes self-signed certificates,
+          so leave this at 0. (`checkCertificateTrust`)
         '';
       };
-      oneCardPerUser = bool false "`oneCardPerUser`: each account can be paired with only one card.";
-      lockOnRemoval = bool false "`tokenRemovalAction`: lock the screen when the card goes away.";
-      enforceSmartCard = bool false ''
-        `enforceSmartCard`: passwords stop working; only a card can log in or
-        authenticate. tapbridge must be running and your phone reachable.
-        Make sure card login works first, and know how to undo this from
-        macOS Recovery.
+      oneCardPerUser = bool false ''
+        One card per user. Each user account can be paired with only one
+        card. (`oneCardPerUser`)
+      '';
+      lockOnRemoval = bool false ''
+        Lock when the card is removed. The screen locks when your card goes
+        away. (`tokenRemovalAction`)
       '';
       sudo = bool true ''
-        Allow your card for `sudo` (`pam_smartcard.so` in /etc/pam.d/sudo).
-        macOS ships with this on; `false` removes it.
+        Card for sudo. Approve sudo prompts with your card. macOS ships with
+        this on; `false` removes it. (`pam_smartcard.so` in /etc/pam.d/sudo)
       '';
-      su = bool false "Allow your card for `su`.";
-      login = bool false "Allow your card for the `login` command.";
+      su = bool false ''
+        Card for su. Approve su prompts with your card. (`pam_smartcard.so`
+        in /etc/pam.d/su)
+      '';
+      login = bool false ''
+        Card for login. Approve the login command with your card.
+        (`pam_smartcard.so` in /etc/pam.d/login)
+      '';
       ssh = {
-        client = bool false "ssh offers the card's key (`PKCS11Provider /usr/lib/ssh-keychain.dylib`).";
-        serverCardsOnly = bool false "This Mac's SSH server refuses passwords (keys and cards only).";
+        client = bool false ''
+          SSH with your card. ssh offers your card's key to servers.
+          (`PKCS11Provider /usr/lib/ssh-keychain.dylib`)
+        '';
+        serverCardsOnly = bool false ''
+          Don't accept passwords in SSHD. This Mac's SSH server only accepts
+          keys and cards.
+        '';
       };
+      enforceSmartCard = bool false ''
+        Smart card only. Passwords stop working: no card, no login.
+        tapbridge must be running and your phone reachable. Make sure card
+        login works first. This option requires tapbridge's USB support to
+        be enabled (`useUsb`). (`enforceSmartCard`)
+      '';
     };
   };
 

@@ -43,25 +43,27 @@ If you installed the `.pkg` before, remove that copy first so there aren't two: 
 
 ## Options
 
-Everything is under `programs.tapbridge`. The defaults match a fresh macOS install, except that tapbridge starts at login.
+Everything is under `programs.tapbridge`. The defaults match a fresh macOS install, except that tapbridge starts at login. The table below is generated from the module's option descriptions (`nix run .#docs`); edit those, not the table.
 
+<!-- BEGIN generated options: nix run .#docs -->
 | Option | Default | What it does |
 |---|---|---|
-| `enable` | `false` | Install tapbridge. |
-| `startAtLogin` | `true` | Start tapbridge in the menu bar when you log in. |
-| `alwaysPresent` | `false` | "Card always ready": your login card shows as inserted before you tap it, so the lock screen and `sudo` ask for it straight away. If you don't tap within 25 seconds, you can use your password instead. |
-| `useUsb` | `true` | "Connect to phone via USB": the phone can also reach the Mac over a USB cable, which works without a network. Must stay on with `enforceSmartCard`. |
-| `smartCard.allowSmartCard` | `true` | Cards can log in, unlock the screen and approve admin prompts. Needs a restart. |
-| `smartCard.userPairing` | `true` | macOS offers to pair a card with your account when it's inserted. |
-| `smartCard.checkCertificateTrust` | `0` | `0` off, `1` check the certificate, `2` also check revocation (soft), `3` also check revocation (hard). tapbridge makes self-signed certificates, so leave this at `0` unless you use your own certificate authority. |
-| `smartCard.oneCardPerUser` | `false` | Each account can be paired with only one card. |
-| `smartCard.lockOnRemoval` | `false` | Lock the screen when the card goes away. |
-| `smartCard.sudo` | `true` | Your card works for `sudo`. macOS ships with this on. |
-| `smartCard.su` | `false` | Your card works for `su`. |
-| `smartCard.login` | `false` | Your card works for the `login` command. |
-| `smartCard.ssh.client` | `false` | `ssh` offers your card's key to servers. |
-| `smartCard.ssh.serverCardsOnly` | `false` | This Mac's SSH server refuses passwords (keys and cards only). |
-| `smartCard.enforceSmartCard` | `false` | **Smart card only.** Passwords stop working. Read the warning below first. |
+| `enable` | `false` | Whether to enable tapbridge, your phone as the Mac's NFC card reader. |
+| `startAtLogin` | `true` | Start at login. Open tapbridge in the menu bar when you log in. |
+| `useUsb` | `true` | Connect to phone via USB. The phone can also reach the Mac over a USB cable, which works without a network. Required by `smartCard.enforceSmartCard`. |
+| `alwaysPresent` | `false` | Card always ready. Your login card shows as inserted even before you tap it, so the lock screen and sudo ask for it straight away. If you don't tap within 25 seconds, you can use your password. |
+| `smartCard.allowSmartCard` | `true` | Log in with smart cards. Cards can log in, unlock the screen and approve admin prompts. Needs a reboot. (`allowSmartCard`) |
+| `smartCard.userPairing` | `true` | Offer to pair new cards. macOS asks to link a card to your account when it's tapped or inserted. (`UserPairing`) |
+| `smartCard.oneCardPerUser` | `false` | One card per user. Each user account can be paired with only one card. (`oneCardPerUser`) |
+| `smartCard.lockOnRemoval` | `false` | Lock when the card is removed. The screen locks when your card goes away. (`tokenRemovalAction`) |
+| `smartCard.sudo` | `true` | Card for sudo. Approve sudo prompts with your card. macOS ships with this on; `false` removes it. (`pam_smartcard.so` in /etc/pam.d/sudo) |
+| `smartCard.su` | `false` | Card for su. Approve su prompts with your card. (`pam_smartcard.so` in /etc/pam.d/su) |
+| `smartCard.login` | `false` | Card for login. Approve the login command with your card. (`pam_smartcard.so` in /etc/pam.d/login) |
+| `smartCard.ssh.client` | `false` | SSH with your card. ssh offers your card's key to servers. (`PKCS11Provider /usr/lib/ssh-keychain.dylib`) |
+| `smartCard.ssh.serverCardsOnly` | `false` | Don't accept passwords in SSHD. This Mac's SSH server only accepts keys and cards. |
+| `smartCard.enforceSmartCard` | `false` | Smart card only. Passwords stop working: no card, no login. tapbridge must be running and your phone reachable. Make sure card login works first. This option requires tapbridge's USB support to be enabled (`useUsb`). (`enforceSmartCard`) |
+| `smartCard.checkCertificateTrust` | `0` | Certificate check: only accept cards whose certificate a trusted authority issued. 0 off, 1 check, 2 check + soft revocation, 3 check + hard revocation. tapbridge makes self-signed certificates, so leave this at 0. (`checkCertificateTrust`) |
+<!-- END generated options -->
 
 These follow Apple's guide, [Configure macOS for smart card-only authentication](https://support.apple.com/en-us/101438).
 

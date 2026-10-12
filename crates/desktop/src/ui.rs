@@ -1161,22 +1161,22 @@ struct SecurityRow {
 const SECURITY_ROWS: &[SecurityRow] = &[
     SecurityRow {
         id: "sec-allow",
-        title: "Allow smart card login",
-        detail: "Cards can log in, unlock the screen and approve admin prompts. Needs a restart.",
+        title: "Log in with smart cards",
+        detail: "Cards can log in, unlock the screen and approve admin prompts. Needs a reboot.",
         get: |o| o.allow_smart_card,
         set: |o, v| o.allow_smart_card = v,
     },
     SecurityRow {
         id: "sec-pairing",
         title: "Offer to pair new cards",
-        detail: "macOS asks to link a card to your account when it's inserted.",
+        detail: "macOS asks to link a card to your account when it's tapped or inserted.",
         get: |o| o.user_pairing,
         set: |o, v| o.user_pairing = v,
     },
     SecurityRow {
         id: "sec-one",
         title: "One card per user",
-        detail: "Each account can be paired with only one card.",
+        detail: "Each user account can be paired with only one card.",
         get: |o| o.one_card_per_user,
         set: |o, v| o.one_card_per_user = v,
     },
@@ -1190,21 +1190,21 @@ const SECURITY_ROWS: &[SecurityRow] = &[
     SecurityRow {
         id: "sec-sudo",
         title: "Card for sudo",
-        detail: "Your card works for sudo in Terminal.",
+        detail: "Approve sudo prompts with your card.",
         get: |o| o.sudo,
         set: |o, v| o.sudo = v,
     },
     SecurityRow {
         id: "sec-su",
         title: "Card for su",
-        detail: "Your card works for su in Terminal.",
+        detail: "Approve su prompts with your card.",
         get: |o| o.su,
         set: |o, v| o.su = v,
     },
     SecurityRow {
         id: "sec-login",
         title: "Card for login",
-        detail: "Your card works for the login command in Terminal.",
+        detail: "Approve the login command with your card.",
         get: |o| o.login,
         set: |o, v| o.login = v,
     },
@@ -1217,7 +1217,7 @@ const SECURITY_ROWS: &[SecurityRow] = &[
     },
     SecurityRow {
         id: "sec-sshd",
-        title: "No passwords over SSH",
+        title: "Don't accept passwords in SSHD",
         detail: "This Mac's SSH server only accepts keys and cards.",
         get: |o| o.sshd_cards_only,
         set: |o, v| o.sshd_cards_only = v,
@@ -1226,7 +1226,8 @@ const SECURITY_ROWS: &[SecurityRow] = &[
         id: "sec-enforce",
         title: "Smart card only",
         detail: "Passwords stop working: no card, no login. tapbridge must be \
-                 running and your phone reachable. Make sure card login works first.",
+                 running and your phone reachable. Make sure card login works first. \
+                 This option requires tapbridge's USB support to be enabled.",
         get: |o| o.enforce_smart_card,
         set: |o, v| o.enforce_smart_card = v,
     },
