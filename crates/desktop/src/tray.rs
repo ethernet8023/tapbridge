@@ -196,9 +196,10 @@ fn use_svg_icon(menu: &Menu, title: &str, svg: &[u8]) {
     let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else {
         return;
     };
-    // Menu item images are 16 pt; keep the glyph's aspect ratio.
+    // About the size of an SF Symbol at the menu font size (these SVG
+    // exports are tight to the glyph); keep the aspect ratio.
     let natural = image.size();
-    let scale = 16.0 / natural.width.max(natural.height).max(1.0);
+    let scale = 13.0 / natural.width.max(natural.height).max(1.0);
     image.setSize(NSSize::new(natural.width * scale, natural.height * scale));
     image.setTemplate(true);
     item.setImage(Some(&image));

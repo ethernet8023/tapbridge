@@ -890,12 +890,14 @@ fn option_row(
                         .text_color(rgb(if enabled { TEXT } else { 0x8A8199 }))
                         .child(title.to_owned()),
                 )
-                .child(
-                    div()
-                        .text_size(px(12.5))
-                        .text_color(rgb(ACCENT_SOFT))
-                        .child(detail),
-                ),
+                .when(!detail.is_empty(), |column| {
+                    column.child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(rgb(ACCENT_SOFT))
+                            .child(detail),
+                    )
+                }),
         )
 }
 
@@ -1833,11 +1835,6 @@ impl Render for SettingsView {
                     .child(phone_button),
             );
 
-        let login_detail = if cfg!(target_os = "macos") {
-            "Open tapbridge in the menu bar when you log in."
-        } else {
-            "Open tapbridge in the notification area when you sign in."
-        };
         let autostart = snapshot.autostart;
         let use_usb = snapshot.use_usb;
         let general = div()
@@ -1851,7 +1848,7 @@ impl Render for SettingsView {
                     autostart,
                     true,
                     "Start at login",
-                    login_detail.to_owned(),
+                    String::new(),
                     cx,
                 )
                 .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
@@ -1862,21 +1859,13 @@ impl Render for SettingsView {
                 })),
             )
             .child(
-                option_row(
-                    "opt-usb",
-                    use_usb,
-                    true,
-                    "Use USB cable",
-                    "Connect to your phone over its USB cable when it is plugged in, \
-                     with no network needed."
-                        .to_owned(),
-                    cx,
-                )
-                .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
-                    view.snapshot.use_usb = !use_usb;
-                    view.act(SettingsAction::SetUseUsb(!use_usb), cx);
-                    cx.notify();
-                })),
+                option_row("opt-usb", use_usb, true, "Use USB cable", String::new(), cx).on_click(
+                    cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
+                        view.snapshot.use_usb = !use_usb;
+                        view.act(SettingsAction::SetUseUsb(!use_usb), cx);
+                        cx.notify();
+                    }),
+                ),
             );
 
         let column = div()
