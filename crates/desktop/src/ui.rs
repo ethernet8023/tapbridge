@@ -167,7 +167,7 @@ impl Render for PairingView {
         }
 
         // One canvas paints every dark module: the QR costs one element per
-        // frame while the ring animates, not one div per module.
+        // frame, not one div per module.
         let dark = self.dark.clone();
         let grid = canvas(
             |_, _, _| {},
@@ -181,22 +181,6 @@ impl Render for PairingView {
             },
         )
         .size(side);
-        // A soft accent ring breathes around the card. Motion stays outside
-        // the code: a coloured line over the modules can read as dark.
-        let ring = div()
-            .absolute()
-            .inset_0()
-            .rounded(px(20.0))
-            .border_2()
-            .border_color(rgb(ACCENT))
-            .with_animation(
-                "pairing-ring",
-                Animation::new(Duration::from_millis(2200)).repeat(),
-                |ring, delta| {
-                    let wave = 0.5 - 0.5 * (std::f32::consts::TAU * delta).cos();
-                    ring.opacity(0.25 + 0.75 * wave)
-                },
-            );
         let header = div()
             .text_size(px(18.0))
             .font_weight(gpui::FontWeight::MEDIUM)
@@ -237,7 +221,6 @@ impl Render for PairingView {
             .flex()
             .items_center()
             .justify_center()
-            .child(ring)
             .child(
                 div()
                     .size(side)
