@@ -4,20 +4,22 @@ use iroh::{
     Endpoint, SecretKey,
     endpoint::{Connection, RecvStream, SendStream},
 };
-#[cfg(unix)]
-use std::os::fd::RawFd;
 use std::{
     io,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Mutex, OnceLock},
     time::Duration,
 };
+#[cfg(unix)]
+use std::{os::fd::RawFd, sync::Arc};
 use tapbridge_core::{
     pairing::Invitation,
     transport,
     wake::Hint,
     wire::{self, Frame},
 };
-use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(unix)]
+use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
 
 // The USB accessory link works on a file descriptor: Android in the app,
 // Unix hosts for its tests. (The workspace also builds on Windows.)
@@ -66,6 +68,7 @@ struct Accepted {
 }
 
 /// How long the USB handshake and the Hello exchange may take.
+#[cfg(unix)]
 const USB_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl Session {
@@ -434,6 +437,8 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.close();
+        // (Irrefutable where the USB variant isn't built.)
+        #[allow(irrefutable_let_patterns)]
         if let Transport::Iroh { endpoint, .. } = &self.transport {
             self.runtime.block_on(endpoint.close());
         }
@@ -458,6 +463,7 @@ async fn write_timed<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -> io
 
 /// `Hello` then `Accepted`/`Rejected`, as [`transport::client_hello`] does
 /// over iroh.
+#[cfg(unix)]
 async fn hello_exchange<R, W>(reader: &mut R, writer: &mut W, hello: &Frame) -> io::Result<Accepted>
 where
     R: AsyncRead + Unpin,
