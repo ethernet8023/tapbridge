@@ -50,6 +50,7 @@ Everything is under `programs.tapbridge`. The defaults match a fresh macOS insta
 | `enable` | `false` | Install tapbridge. |
 | `startAtLogin` | `true` | Start tapbridge in the menu bar when you log in. |
 | `alwaysPresent` | `false` | "Card always ready": your login card shows as inserted before you tap it, so the lock screen and `sudo` ask for it straight away. If you don't tap within 25 seconds, you can use your password instead. |
+| `useUsb` | `true` | "Connect to phone via USB": the phone can also reach the Mac over a USB cable, which works without a network. Must stay on with `enforceSmartCard`. |
 | `smartCard.allowSmartCard` | `true` | Cards can log in, unlock the screen and approve admin prompts. Needs a restart. |
 | `smartCard.userPairing` | `true` | macOS offers to pair a card with your account when it's inserted. |
 | `smartCard.checkCertificateTrust` | `0` | `0` off, `1` check the certificate, `2` also check revocation (soft), `3` also check revocation (hard). tapbridge makes self-signed certificates, so leave this at `0` unless you use your own certificate authority. |
@@ -84,6 +85,8 @@ With `enforceSmartCard = true`, a card is the only way to log in, unlock or use 
 - tapbridge is running, which it isn't at the login screen after a restart,
 - your phone is on and can be reached over the network, and
 - your phone and Mac are still paired.
+
+tapbridge won't let you turn this on without `useUsb` (in the app, or in nix-darwin, where it fails the build): with a USB cable, the phone can still reach the Mac when the network is down.
 
 If any of these fail, you're locked out. So:
 

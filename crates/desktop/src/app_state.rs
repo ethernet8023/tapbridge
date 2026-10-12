@@ -412,6 +412,15 @@ fn managed_apply() -> bool {
     false
 }
 
+/// Is "Smart card only" (`enforceSmartCard`) on? Read from the system, so
+/// it holds even before Preferences has read the settings.
+fn smart_card_only() -> bool {
+    #[cfg(target_os = "macos")]
+    return crate::mac_security::read_live().enforce_smart_card;
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+
 /// Start at login: nix-darwin's setting when managed, else our LaunchAgent.
 fn autostart_load() -> bool {
     #[cfg(target_os = "macos")]
@@ -682,6 +691,15 @@ fn handle_event(event: UiEvent, cx: &mut App) {
     match event {
         UiEvent::ServiceStarted(handle) => {
             cx.update_global::<Shell, _>(|shell, _| {
+                #[cfg(target_os = "macos")]
+                if let Some((security, app)) = crate::mac_security::managed() {
+                    // nix-darwin's module asserts this pairing; a hand-edited
+                    // file still never turns USB off under smart card only.
+                    let use_usb = app.use_usb || security.enforce_smart_card;
+                    if handle.status().use_usb != use_usb {
+                        handle.set_use_usb(use_usb);
+                    }
+                }
                 shell.service = Some(handle);
                 shell.reload_cards();
                 #[cfg(windows)]
@@ -991,6 +1009,13 @@ fn settings_action(action: ui::SettingsAction, cx: &mut App) {
             });
         }
         ui::SettingsAction::SetUseUsb(enabled) => {
+            if cx.global::<Shell>().managed {
+                return;
+            }
+            if !enabled && smart_card_only() {
+                logging::log("use usb cable: kept on, smart card only is on");
+                return;
+            }
             logging::log(&format!("use usb cable -> {enabled}"));
             cx.update_global::<Shell, _>(|shell, _| {
                 if let Some(service) = shell.service.as_ref() {
@@ -1029,8 +1054,19 @@ fn settings_action(action: ui::SettingsAction, cx: &mut App) {
                 if shell.managed {
                     return;
                 }
+                let use_usb = shell
+                    .service
+                    .as_ref()
+                    .is_some_and(|service| service.status().use_usb);
                 let security = shell.security.get_or_insert_with(Default::default);
                 if security.busy {
+                    return;
+                }
+                if want.enforce_smart_card && !use_usb {
+                    security.status = Some(
+                        "Not applied: \"Smart card only\" needs \"Connect to phone via USB\"."
+                            .to_owned(),
+                    );
                     return;
                 }
                 security.busy = true;

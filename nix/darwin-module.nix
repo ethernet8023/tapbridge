@@ -21,6 +21,7 @@ let
   configText = concatStringsSep "\n" (lib.mapAttrsToList (k: v: "${k} = ${toString v}") {
     start_at_login = lib.boolToString cfg.startAtLogin;
     always_present = lib.boolToString cfg.alwaysPresent;
+    use_usb = lib.boolToString cfg.useUsb;
     allow_smart_card = lib.boolToString sc.allowSmartCard;
     user_pairing = lib.boolToString sc.userPairing;
     check_certificate_trust = sc.checkCertificateTrust;
@@ -66,6 +67,12 @@ in
       tap within 25 seconds, the card is reported gone and the password works.
     '';
 
+    useUsb = bool true ''
+      "Connect to phone via USB": the phone can also reach the Mac over a
+      USB cable, which works without a network. Required by
+      `smartCard.enforceSmartCard`.
+    '';
+
     smartCard = {
       allowSmartCard = bool true ''
         `allowSmartCard`: cards can log in, unlock the screen and approve
@@ -105,10 +112,19 @@ in
   };
 
   config = mkIf cfg.enable {
-    assertions = [{
-      assertion = !(sc.enforceSmartCard && !sc.allowSmartCard);
-      message = "programs.tapbridge.smartCard.enforceSmartCard needs allowSmartCard.";
-    }];
+    assertions = [
+      {
+        assertion = !(sc.enforceSmartCard && !sc.allowSmartCard);
+        message = "programs.tapbridge.smartCard.enforceSmartCard needs allowSmartCard.";
+      }
+      {
+        assertion = !(sc.enforceSmartCard && !cfg.useUsb);
+        message = ''
+          programs.tapbridge.smartCard.enforceSmartCard needs useUsb: without
+          the USB cable, a network problem would lock you out of the Mac.
+        '';
+      }
+    ];
 
     environment.systemPackages = [ cfg.package ];
     environment.etc."tapbridge/config".text = configText;

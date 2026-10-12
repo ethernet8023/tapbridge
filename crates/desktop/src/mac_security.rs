@@ -74,10 +74,21 @@ impl SecurityConfig {
 }
 
 /// tapbridge's own options, as set by nix-darwin.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AppConfig {
     pub start_at_login: bool,
     pub always_present: bool,
+    pub use_usb: bool,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            start_at_login: false,
+            always_present: false,
+            use_usb: true,
+        }
+    }
 }
 
 /// Reads the `key = value` file the nix-darwin module writes. Unknown keys
@@ -102,6 +113,7 @@ pub fn parse_config(text: &str) -> (SecurityConfig, AppConfig) {
         let slot = match key.trim() {
             "start_at_login" => &mut app.start_at_login,
             "always_present" => &mut app.always_present,
+            "use_usb" => &mut app.use_usb,
             "allow_smart_card" => &mut security.allow_smart_card,
             "user_pairing" => &mut security.user_pairing,
             "one_card_per_user" => &mut security.one_card_per_user,
@@ -398,6 +410,8 @@ mod tests {
                     check_certificate_trust = 9\nbogus = true\nsu = maybe\n";
         let (security, app) = parse_config(text);
         assert!(app.start_at_login && app.always_present);
+        assert!(app.use_usb, "USB is on unless the file says otherwise");
+        assert!(!parse_config("use_usb = false").1.use_usb);
         assert!(security.enforce_smart_card && security.sudo);
         assert_eq!(security.check_certificate_trust, 2, "9 is ignored");
         assert!(!security.su, "bad values keep the default");

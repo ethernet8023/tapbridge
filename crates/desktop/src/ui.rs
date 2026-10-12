@@ -2011,11 +2011,19 @@ impl Render for SettingsView {
         let autostart = snapshot.autostart;
         let managed = snapshot.managed;
         let use_usb = snapshot.use_usb;
+        // "Smart card only" needs the cable as a way in when the network
+        // is down, so USB can't be turned off while it's on.
+        let enforced = snapshot
+            .security
+            .as_ref()
+            .is_some_and(|security| security.live.enforce_smart_card);
+        let usb_locked = enforced && use_usb;
         let general = div()
             .flex()
             .flex_col()
             .gap(px(10.0))
             .child(section_title("General"))
+            .when(managed, |general| general.child(managed_notice(cx)))
             .child(
                 option_row(
                     "opt-login",
@@ -2039,13 +2047,19 @@ impl Render for SettingsView {
                 option_row(
                     "opt-usb",
                     use_usb,
-                    !managed,
-                    "Use USB cable",
-                    String::new(),
+                    !managed && !usb_locked,
+                    "Connect to phone via USB",
+                    if usb_locked {
+                        "Needed while \"Smart card only\" is on: the cable still works \
+                         when the network doesn't."
+                            .to_owned()
+                    } else {
+                        String::new()
+                    },
                     cx,
                 )
                 .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
-                    if managed {
+                    if managed || usb_locked {
                         return;
                     }
                     view.snapshot.use_usb = !use_usb;
@@ -2091,7 +2105,6 @@ impl Render for SettingsView {
                 column.child(self.render_cards(cx))
             })
             .child(general)
-            .when(managed, |column| column.child(managed_notice(cx)))
             .children(self.render_security(cx));
         #[cfg(windows)]
         let column = column.child(self.passkeys.clone());
@@ -2176,27 +2189,31 @@ impl SettingsView {
             .flex_col()
             .gap(px(10.0))
             .child(section_title("Mac security"));
+        let use_usb = self.snapshot.use_usb;
         for (index, row) in SECURITY_ROWS.iter().enumerate() {
             let checked = (row.get)(&draft);
+            // "Smart card only" can't be turned on without the USB link.
+            let needs_usb = row.id == "sec-enforce" && !use_usb && !checked;
+            let editable = editable && !needs_usb;
+            let detail = if needs_usb {
+                "Turn on \"Connect to phone via USB\" first: without the cable, \
+                 a network problem would lock you out."
+            } else {
+                row.detail
+            };
             section = section.child(
-                option_row(
-                    row.id,
-                    checked,
-                    editable,
-                    row.title,
-                    row.detail.to_owned(),
-                    cx,
-                )
-                .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
-                    if !editable {
-                        return;
-                    }
-                    let mut draft = view.security_draft.unwrap_or(live);
-                    (SECURITY_ROWS[index].set)(&mut draft, !checked);
-                    view.security_draft = Some(draft);
-                    view.confirm_enforce = false;
-                    cx.notify();
-                })),
+                option_row(row.id, checked, editable, row.title, detail.to_owned(), cx).on_click(
+                    cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
+                        if !editable {
+                            return;
+                        }
+                        let mut draft = view.security_draft.unwrap_or(live);
+                        (SECURITY_ROWS[index].set)(&mut draft, !checked);
+                        view.security_draft = Some(draft);
+                        view.confirm_enforce = false;
+                        cx.notify();
+                    }),
+                ),
             );
         }
         let level = usize::from(draft.check_certificate_trust.min(3));
@@ -2262,6 +2279,14 @@ impl SettingsView {
                     .text_size(px(12.5))
                     .text_color(rgb(ACCENT_SOFT))
                     .child("Applying…"),
+            );
+        } else if draft.enforce_smart_card && !use_usb {
+            // Possible only if USB went off under a draft; Apply would refuse.
+            footer = footer.child(
+                div()
+                    .text_size(px(12.5))
+                    .text_color(rgb(WARN))
+                    .child("\"Smart card only\" needs \"Connect to phone via USB\"."),
             );
         } else if draft != live && !managed {
             let enforcing = draft.enforce_smart_card && !live.enforce_smart_card;
