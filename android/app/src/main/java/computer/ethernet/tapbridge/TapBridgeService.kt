@@ -44,6 +44,10 @@ class TapBridgeService : Service() {
         const val ACTION_USB = "computer.ethernet.tapbridge.USB"
         /** How long an unanswered USB pairing question holds the cable. */
         const val USB_PAIR_PROMPT_MS = 60_000L
+        /** Reopen a cable link that ended while plugged in. */
+        const val USB_REOPEN_MS = 2_000L
+        /** Retry a cable link that failed (PC not ready, pairing closed). */
+        const val USB_RETRY_MS = 8_000L
         /** Wake target host id (64 hex chars); the hint alone no longer names a PC. */
         const val EXTRA_HOST = "computer.ethernet.tapbridge.HOST"
         const val EXTRA_HINT = "computer.ethernet.tapbridge.HINT"
@@ -188,6 +192,8 @@ class TapBridgeService : Service() {
     /** An accessory whose link already ended (refused, failed): not reopened
      *  until it detaches, since the PC probes once per plug-in. */
     @Volatile private var usbEnded: UsbAccessory? = null
+    /** A USB failure was already shown for this plug-in (retries stay quiet). */
+    @Volatile private var usbNoticeShown = false
     /** The live session runs over the USB cable (status "via USB"). */
     @Volatile var viaUsb = false
         private set
@@ -620,16 +626,18 @@ class TapBridgeService : Service() {
             if (requested.get() == attempt) {
                 cleanup()
                 if (usb) {
-                    // The PC ended the link (or it failed) while still
-                    // plugged in: don't reopen this plug-in; go back to the
-                    // network path.
+                    // The PC ended the link (tapbridge restarted, cable
+                    // setting toggled) while still plugged in: go back to
+                    // the network path and reopen the cable shortly; the
+                    // PC keeps retrying too.
                     releaseUsbHandles()
                     main.post {
                         if (requested.get() != attempt) return@post
-                        usbEnded = usbAccessory
+                        val accessory = usbAccessory
                         usbAccessory = null
                         show(if (error == null) Status.IDLE else Status.ERROR, error)
                         resumeAfterUsb()
+                        accessory?.let { scheduleUsbReopen(it, USB_REOPEN_MS) }
                     }
                 } else {
                     show(if (error == null) Status.IDLE else Status.ERROR, error)
@@ -772,23 +780,45 @@ class TapBridgeService : Service() {
         }
     }
 
-    /** Lifecycle thread: the USB attempt ended without a session. */
+    /**
+     * Lifecycle thread: the USB attempt ended without a session. The user
+     * saying no (null error) leaves this plug-in alone until it's replugged;
+     * a failure (PC not ready, pairing window closed) retries slowly and
+     * tells the user once per plug-in.
+     */
     private fun failUsb(attempt: Long, error: String?) {
         releaseUsbHandles()
         main.post {
             if (requested.get() != attempt) return@post
-            usbEnded = usbAccessory
+            val accessory = usbAccessory
             usbAccessory = null
             show(if (error == null) Status.IDLE else Status.ERROR, error)
-            if (error != null) listener?.onUsbNotice(error)
+            if (error == null) {
+                usbEnded = accessory
+            } else {
+                if (!usbNoticeShown) listener?.onUsbNotice(error)
+                usbNoticeShown = true
+                accessory?.let { scheduleUsbReopen(it, USB_RETRY_MS) }
+            }
             // The refusal message stays up; the network path still resumes.
             resumeAfterUsb(keepError = error != null)
         }
     }
 
+    /** Reopens [accessory] after [delayMs] if it's still plugged in and idle. Main thread. */
+    private fun scheduleUsbReopen(accessory: UsbAccessory, delayMs: Long) {
+        main.postDelayed({
+            if (destroyed || usbAccessory != null || usbEnded == accessory) return@postDelayed
+            val manager = getSystemService(UsbManager::class.java) ?: return@postDelayed
+            val attached = manager.accessoryList?.any { it == accessory } == true
+            if (attached && manager.hasPermission(accessory)) connectUsb(accessory)
+        }, delayMs)
+    }
+
     /** The cable was unplugged: end the USB session, resume the network. Main thread. */
     private fun onUsbDetached() {
         usbEnded = null
+        usbNoticeShown = false
         if (usbAccessory == null) return
         usbAccessory = null
         val attempt = requested.incrementAndGet()
