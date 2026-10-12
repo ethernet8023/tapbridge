@@ -67,6 +67,10 @@ pub enum UiEvent {
     /// Whether this card's identity is paired with the login, read after a
     /// tap (`login::present_card_paired`).
     LoginChecked(Vec<u8>, bool),
+    /// macOS: the smart card settings as read from the system.
+    SecurityRead(ui::SecurityOptions),
+    /// macOS: an Apply finished; the text says how.
+    SecurityApplied(String),
 }
 
 #[cfg(windows)]
@@ -94,6 +98,10 @@ struct Shell {
     /// macOS: the login card always shows as present (see
     /// [`crate::macos::AlwaysPresent`]).
     always_present: bool,
+    /// macOS: the smart card settings, once read.
+    security: Option<ui::Security>,
+    /// Installed through nix-darwin: settings are read-only.
+    managed: bool,
     /// Shown in the tray until the next state change (e.g. relay problems).
     notice: Option<String>,
     /// Why the host service failed to start, shown in Settings → Details.
@@ -175,6 +183,16 @@ pub fn preview_ui() {
             phone_connected: true,
             autostart: true,
             always_present: Some(false),
+            security: cfg!(target_os = "macos").then(|| crate::ui::Security {
+                live: crate::ui::SecurityOptions {
+                    allow_smart_card: true,
+                    user_pairing: true,
+                    sudo: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            managed: std::env::var_os("TAPBRIDGE_PREVIEW_MANAGED").is_some(),
             cards: vec![
                 {
                     let flex = [
@@ -314,8 +332,10 @@ fn shell_setup(
         pairing: None,
         settings: None,
         about: None,
-        autostart: autostart::is_enabled(),
+        managed: managed_apply(),
+        autostart: autostart_load(),
         always_present: always_present_load(&state_dir),
+        security: None,
         notice: None,
         service_error: None,
         waiting_since: None,
@@ -367,10 +387,44 @@ impl InstanceGuard for NoopInstance {
     // macOS: no second-instance signaling; host.lock guards single runs.
 }
 
+/// nix-darwin: applies the app options from `/etc/tapbridge/config`.
+/// True when that file exists (the app is managed).
+fn managed_apply() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let Some((_, app)) = crate::mac_security::managed() else {
+            return false;
+        };
+        // nix-darwin starts the app itself (launchd.user.agents); the
+        // app's own LaunchAgent would start a second copy.
+        if autostart::is_enabled() {
+            let result = autostart::set_enabled(false);
+            logging::log(&format!("nix-darwin: removing our LaunchAgent: {result:?}"));
+        }
+        crate::macos::ALWAYS_PRESENT.set_enabled(app.always_present);
+        true
+    }
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+
+/// Start at login: nix-darwin's setting when managed, else our LaunchAgent.
+fn autostart_load() -> bool {
+    #[cfg(target_os = "macos")]
+    if let Some((_, app)) = crate::mac_security::managed() {
+        return app.start_at_login;
+    }
+    autostart::is_enabled()
+}
+
 /// Reads the saved always-present setting and applies it to the IFD server.
 fn always_present_load(state_dir: &std::path::Path) -> bool {
     #[cfg(target_os = "macos")]
     {
+        if let Some((_, app)) = crate::mac_security::managed() {
+            crate::macos::ALWAYS_PRESENT.load_cache(state_dir);
+            return app.always_present;
+        }
         let enabled = crate::macos::always_present_saved(state_dir);
         crate::macos::ALWAYS_PRESENT.load_cache(state_dir);
         crate::macos::ALWAYS_PRESENT.set_enabled(enabled);
@@ -724,6 +778,19 @@ fn handle_event(event: UiEvent, cx: &mut App) {
                 }
             });
         }
+        UiEvent::SecurityRead(live) => {
+            cx.update_global::<Shell, _>(|shell, _| {
+                shell.security.get_or_insert_with(Default::default).live = live;
+            });
+        }
+        UiEvent::SecurityApplied(text) => {
+            cx.update_global::<Shell, _>(|shell, _| {
+                let security = shell.security.get_or_insert_with(Default::default);
+                security.busy = false;
+                security.status = Some(text);
+            });
+            read_security(cx);
+        }
         UiEvent::LoginChecked(uid, paired) => {
             cx.update_global::<Shell, _>(|shell, _| {
                 if let Some(service) = shell.service.as_ref() {
@@ -869,7 +936,22 @@ fn open_about(cx: &mut App) {
     cx.update_global::<Shell, _>(|shell, _| shell.about = Some(window));
 }
 
+/// macOS: reads the smart card settings in the background (it runs
+/// `defaults`); the answer arrives as [`UiEvent::SecurityRead`].
+fn read_security(cx: &mut App) {
+    #[cfg(target_os = "macos")]
+    {
+        let events = cx.global::<Shell>().events.clone();
+        std::thread::spawn(move || {
+            let _ = events.send(UiEvent::SecurityRead(crate::mac_security::read_live()));
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = cx;
+}
+
 fn open_settings(cx: &mut App) {
+    read_security(cx);
     let (snapshot, existing) = {
         let shell = cx.global::<Shell>();
         (shell.settings_snapshot(), shell.settings)
@@ -893,13 +975,19 @@ fn settings_action(action: ui::SettingsAction, cx: &mut App) {
             });
         }
         ui::SettingsAction::SetAutostart(enabled) => {
+            if cx.global::<Shell>().managed {
+                return;
+            }
             let result = autostart::set_enabled(enabled);
             logging::log(&format!("start at login -> {enabled}: {result:?}"));
-            cx.update_global::<Shell, _>(|shell, _| shell.autostart = autostart::is_enabled());
+            cx.update_global::<Shell, _>(|shell, _| shell.autostart = autostart_load());
         }
         ui::SettingsAction::SetAlwaysPresent(enabled) => {
             #[cfg(target_os = "macos")]
             cx.update_global::<Shell, _>(|shell, _| {
+                if shell.managed {
+                    return;
+                }
                 let result = crate::macos::always_present_save(&shell.state_dir, enabled);
                 logging::log(&format!("always-present card -> {enabled}: {result:?}"));
                 if result.is_ok() {
@@ -909,6 +997,37 @@ fn settings_action(action: ui::SettingsAction, cx: &mut App) {
             });
             #[cfg(not(target_os = "macos"))]
             let _ = enabled;
+        }
+        ui::SettingsAction::ApplySecurity(want) => {
+            #[cfg(target_os = "macos")]
+            cx.update_global::<Shell, _>(|shell, _| {
+                if shell.managed {
+                    return;
+                }
+                let security = shell.security.get_or_insert_with(Default::default);
+                if security.busy {
+                    return;
+                }
+                security.busy = true;
+                security.status = None;
+                let events = shell.events.clone();
+                let dir = shell.state_dir.clone();
+                std::thread::spawn(move || {
+                    let text = match crate::mac_security::apply(&want, &dir) {
+                        crate::mac_security::Applied::Done => "Applied.".to_owned(),
+                        crate::mac_security::Applied::ApproveProfile => {
+                            "Almost done: approve \"tapbridge smart card settings\" in System \
+                             Settings → General → Device Management."
+                                .to_owned()
+                        }
+                        crate::mac_security::Applied::Failed(why) => format!("Not applied: {why}"),
+                    };
+                    logging::log(&format!("mac security: {text}"));
+                    let _ = events.send(UiEvent::SecurityApplied(text));
+                });
+            });
+            #[cfg(not(target_os = "macos"))]
+            let _ = want;
         }
         ui::SettingsAction::RenameCard(uid, label) => {
             cx.update_global::<Shell, _>(|shell, _| {
@@ -1266,6 +1385,8 @@ impl Shell {
             phone_connected: status.phone_connected,
             autostart: self.autostart,
             always_present: cfg!(target_os = "macos").then_some(self.always_present),
+            security: self.security.clone(),
+            managed: self.managed,
             cards: self.card_rows(&status),
             card_busy: self.card_task.as_ref().is_some_and(CardTask::busy),
         }

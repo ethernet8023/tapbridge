@@ -19,6 +19,7 @@ Your card does all the secret work. Your phone and computer only pass messages b
 - **Easy pairing.** Scan a code on your computer with your phone, then tap a card to check that everything works.
 - **One phone, many computers.** Pair the same phone with your desktop and your laptop.
 - **Careful with your card.** tapbridge never replaces certificates already on your card unless you clearly ask it to, and it never guesses your PIN.
+- **Mac security settings in one place.** Use your card for `sudo`, `su` and SSH, lock the screen when the card goes away, or turn off passwords entirely.
 - **Works on macOS and Windows.** The phone app is for Android phones with NFC.
 
 ## Development
@@ -54,6 +55,10 @@ nix develop
 | Android tests and debug APK | `build-android testDebugUnitTest assembleDebug` |
 | Install the APK on a phone | `adb install -r android/app/build/outputs/apk/debug/app-debug.apk` |
 | Play bundle (AAB) | in `android/`: `./gradlew bundleRelease` |
+
+### nix-darwin
+
+You can install tapbridge and set all its options from your nix-darwin config instead of using the installer: see [docs/nix-darwin.md](docs/nix-darwin.md). `nix build .#tapbridge` builds the app on its own.
 
 ### Windows
 

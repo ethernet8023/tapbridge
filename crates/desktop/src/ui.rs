@@ -985,6 +985,7 @@ pub enum SettingsAction {
     Forget,
     SetAutostart(bool),
     SetAlwaysPresent(bool),
+    ApplySecurity(SecurityOptions),
     RenameCard(Vec<u8>, String),
     ForgetCard(Vec<u8>),
     SetUpCard(Vec<u8>),
@@ -1007,6 +1008,7 @@ impl SettingsAction {
             Self::Forget => "forget phone",
             Self::SetAutostart(_) => "set autostart",
             Self::SetAlwaysPresent(_) => "set always present",
+            Self::ApplySecurity(_) => "apply mac security",
             Self::RenameCard(..) => "rename card",
             Self::ForgetCard(_) => "forget card",
             Self::SetUpCard(_) => "set up certificates",
@@ -1065,11 +1067,138 @@ pub struct SettingsSnapshot {
     pub autostart: bool,
     /// The login card always shows as present; `None` where unsupported.
     pub always_present: Option<bool>,
+    /// The Mac's smart card settings as they are now; `None` off macOS.
+    pub security: Option<Security>,
+    /// Installed through nix-darwin: settings are shown, not changed.
+    pub managed: bool,
     /// Known cards, shown once a phone is paired.
     pub cards: Vec<CardRow>,
     /// A card action is running: no new one can start.
     pub card_busy: bool,
 }
+
+/// The Mac's smart card settings (Apple's support article 101438), kept
+/// platform-free here so the UI builds everywhere. `Default` is all off;
+/// see `mac_security::SecurityConfig::macos_default` for macOS's own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct SecurityOptions {
+    /// `allowSmartCard`: cards may log in, unlock and authorize.
+    pub allow_smart_card: bool,
+    /// `UserPairing`: macOS offers to pair a new card when it's inserted.
+    pub user_pairing: bool,
+    /// `checkCertificateTrust`, 0 to 3.
+    pub check_certificate_trust: u8,
+    /// `oneCardPerUser`.
+    pub one_card_per_user: bool,
+    /// `tokenRemovalAction = 1`: lock the screen when the card goes away.
+    pub lock_on_removal: bool,
+    /// `enforceSmartCard`: passwords stop working.
+    pub enforce_smart_card: bool,
+    pub sudo: bool,
+    pub su: bool,
+    pub login: bool,
+    pub ssh_client: bool,
+    pub sshd_cards_only: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Security {
+    pub live: SecurityOptions,
+    /// Applying (admin prompt or profile approval) is in progress.
+    pub busy: bool,
+    /// How the last apply went.
+    pub status: Option<String>,
+}
+
+/// One checkbox of the security section.
+struct SecurityRow {
+    id: &'static str,
+    title: &'static str,
+    detail: &'static str,
+    get: fn(&SecurityOptions) -> bool,
+    set: fn(&mut SecurityOptions, bool),
+}
+
+const SECURITY_ROWS: &[SecurityRow] = &[
+    SecurityRow {
+        id: "sec-allow",
+        title: "Allow smart card login",
+        detail: "Cards can log in, unlock the screen and approve admin prompts. Needs a restart.",
+        get: |o| o.allow_smart_card,
+        set: |o, v| o.allow_smart_card = v,
+    },
+    SecurityRow {
+        id: "sec-pairing",
+        title: "Offer to pair new cards",
+        detail: "macOS asks to link a card to your account when it's inserted.",
+        get: |o| o.user_pairing,
+        set: |o, v| o.user_pairing = v,
+    },
+    SecurityRow {
+        id: "sec-one",
+        title: "One card per user",
+        detail: "Each account can be paired with only one card.",
+        get: |o| o.one_card_per_user,
+        set: |o, v| o.one_card_per_user = v,
+    },
+    SecurityRow {
+        id: "sec-lock",
+        title: "Lock when the card is removed",
+        detail: "The screen locks when your card goes away.",
+        get: |o| o.lock_on_removal,
+        set: |o, v| o.lock_on_removal = v,
+    },
+    SecurityRow {
+        id: "sec-sudo",
+        title: "Card for sudo",
+        detail: "Your card works for sudo in Terminal.",
+        get: |o| o.sudo,
+        set: |o, v| o.sudo = v,
+    },
+    SecurityRow {
+        id: "sec-su",
+        title: "Card for su",
+        detail: "Your card works for su in Terminal.",
+        get: |o| o.su,
+        set: |o, v| o.su = v,
+    },
+    SecurityRow {
+        id: "sec-login",
+        title: "Card for login",
+        detail: "Your card works for the login command in Terminal.",
+        get: |o| o.login,
+        set: |o, v| o.login = v,
+    },
+    SecurityRow {
+        id: "sec-ssh",
+        title: "SSH with your card",
+        detail: "ssh offers your card's key to servers.",
+        get: |o| o.ssh_client,
+        set: |o, v| o.ssh_client = v,
+    },
+    SecurityRow {
+        id: "sec-sshd",
+        title: "No passwords over SSH",
+        detail: "This Mac's SSH server only accepts keys and cards.",
+        get: |o| o.sshd_cards_only,
+        set: |o, v| o.sshd_cards_only = v,
+    },
+    SecurityRow {
+        id: "sec-enforce",
+        title: "Smart card only",
+        detail: "Passwords stop working: no card, no login. tapbridge must be \
+                 running and your phone reachable. Make sure card login works first.",
+        get: |o| o.enforce_smart_card,
+        set: |o, v| o.enforce_smart_card = v,
+    },
+];
+
+const TRUST_LEVELS: [&str; 4] = [
+    "Off",
+    "Check",
+    "Check + soft revocation",
+    "Check + hard revocation",
+];
 
 type OnSettingsAction = Rc<dyn Fn(SettingsAction, &mut App)>;
 
@@ -1084,6 +1213,10 @@ pub struct SettingsView {
     dialog: Option<CardDialog>,
     /// Cards showing the applet install instructions.
     show_install: std::collections::HashSet<Vec<u8>>,
+    /// Security settings being edited, before Apply.
+    security_draft: Option<SecurityOptions>,
+    /// "Smart card only" asks once more before applying.
+    confirm_enforce: bool,
     /// Card being renamed, its text field, and the field's event subscription.
     editing: Option<(Vec<u8>, gpui::Entity<TextInput>, gpui::Subscription)>,
     focus: FocusHandle,
@@ -1104,6 +1237,8 @@ impl SettingsView {
             confirm_forget_card: None,
             dialog: None,
             show_install: Default::default(),
+            security_draft: None,
+            confirm_enforce: false,
             editing: None,
             focus: cx.focus_handle(),
             #[cfg(windows)]
@@ -1133,6 +1268,11 @@ impl SettingsView {
                 .is_some_and(|uid| !known(uid))
             {
                 self.confirm_forget_card = None;
+            }
+            if let Some(security) = snapshot.security.as_ref()
+                && self.security_draft == Some(security.live)
+            {
+                self.security_draft = None;
             }
             self.snapshot = snapshot;
             cx.notify();
@@ -1682,6 +1822,35 @@ fn card_button(
         .child(label.into())
 }
 
+/// The nix-darwin guide in the tapbridge repo.
+pub const MANAGED_GUIDE: &str =
+    "https://github.com/ethernet8023/tapbridge/blob/main/docs/nix-darwin.md";
+
+/// Shown above the (grayed out) settings when nix-darwin manages them.
+fn managed_notice(cx: &mut App) -> impl IntoElement {
+    glass::panel("managed", 14.0, cx)
+        .id("managed")
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .p(px(14.0))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgba(0xFFFFFF0A)))
+        .child(
+            div()
+                .text_size(px(15.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .child("Managed by nix-darwin"),
+        )
+        .child(
+            div()
+                .text_size(px(12.5))
+                .text_color(rgb(ACCENT_SOFT))
+                .child("Change these settings in programs.tapbridge in your nix-darwin config. Open the guide →"),
+        )
+        .on_click(|_, _, cx| cx.open_url(MANAGED_GUIDE))
+}
+
 fn section_title(title: &str) -> impl IntoElement {
     div()
         .text_size(px(12.0))
@@ -1807,6 +1976,7 @@ impl Render for SettingsView {
             "Open tapbridge in the notification area when you sign in."
         };
         let autostart = snapshot.autostart;
+        let managed = snapshot.managed;
         let general = div()
             .flex()
             .flex_col()
@@ -1816,12 +1986,15 @@ impl Render for SettingsView {
                 option_row(
                     "opt-login",
                     autostart,
-                    true,
+                    !managed,
                     "Start at login",
                     login_detail.to_owned(),
                     cx,
                 )
                 .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
+                    if managed {
+                        return;
+                    }
                     // Optimistic; the shell's next snapshot has the real state.
                     view.snapshot.autostart = !autostart;
                     view.act(SettingsAction::SetAutostart(!autostart), cx);
@@ -1833,7 +2006,7 @@ impl Render for SettingsView {
                     option_row(
                         "opt-always-present",
                         always,
-                        true,
+                        !managed,
                         "Card always ready",
                         "Your login card shows as inserted even before you tap it, so \
                          the lock screen and sudo ask for it straight away. If you \
@@ -1843,6 +2016,9 @@ impl Render for SettingsView {
                     )
                     .on_click(cx.listener(
                         move |view, _: &gpui::ClickEvent, _, cx| {
+                            if managed {
+                                return;
+                            }
                             view.snapshot.always_present = Some(!always);
                             view.act(SettingsAction::SetAlwaysPresent(!always), cx);
                             cx.notify();
@@ -1862,7 +2038,9 @@ impl Render for SettingsView {
             .when(snapshot.phone.is_some(), |column| {
                 column.child(self.render_cards(cx))
             })
-            .child(general);
+            .child(general)
+            .when(managed, |column| column.child(managed_notice(cx)))
+            .children(self.render_security(cx));
         #[cfg(windows)]
         let column = column.child(self.passkeys.clone());
         let dialog = self.render_dialog(cx);
@@ -1930,6 +2108,152 @@ impl SettingsView {
             self.finish_rename(matches!(dialog, CardDialog::New(_)), cx);
         }
         cx.notify();
+    }
+
+    /// "Mac security": every smart card setting from Apple's article, with
+    /// one Apply for all of them.
+    fn render_security(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let security = self.snapshot.security.clone()?;
+        let live = security.live;
+        let managed = self.snapshot.managed;
+        let editable = !managed && !security.busy;
+        let draft = self.security_draft.unwrap_or(live);
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .child(section_title("Mac security"));
+        for (index, row) in SECURITY_ROWS.iter().enumerate() {
+            let checked = (row.get)(&draft);
+            section = section.child(
+                option_row(
+                    row.id,
+                    checked,
+                    editable,
+                    row.title,
+                    row.detail.to_owned(),
+                    cx,
+                )
+                .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
+                    if !editable {
+                        return;
+                    }
+                    let mut draft = view.security_draft.unwrap_or(live);
+                    (SECURITY_ROWS[index].set)(&mut draft, !checked);
+                    view.security_draft = Some(draft);
+                    view.confirm_enforce = false;
+                    cx.notify();
+                })),
+            );
+        }
+        let level = usize::from(draft.check_certificate_trust.min(3));
+        let trust_ids = ["trust-0", "trust-1", "trust-2", "trust-3"];
+        let mut levels = div().flex().flex_row().flex_wrap().gap(px(6.0));
+        for (value, label) in TRUST_LEVELS.iter().enumerate() {
+            let chosen = level == value;
+            let (tint, opacity) = if chosen {
+                (ACCENT, 0.6)
+            } else {
+                (0xFFFFFF, 0.08)
+            };
+            levels = levels.child(
+                button(trust_ids[value], *label, tint, opacity, cx).on_click(cx.listener(
+                    move |view, _: &gpui::ClickEvent, _, cx| {
+                        if !editable {
+                            return;
+                        }
+                        let mut draft = view.security_draft.unwrap_or(live);
+                        draft.check_certificate_trust = value as u8;
+                        view.security_draft = Some(draft);
+                        cx.notify();
+                    },
+                )),
+            );
+        }
+        section = section.child(
+            glass::panel("sec-trust", 14.0, cx)
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .p(px(14.0))
+                .child(
+                    div()
+                        .text_size(px(15.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(if editable { TEXT } else { 0x8A8199 }))
+                        .child("Certificate check"),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(rgb(ACCENT_SOFT))
+                        .child(
+                            "Only accept cards whose certificate a trusted authority issued. \
+                     tapbridge makes self-signed certificates, so leave this off.",
+                        ),
+                )
+                .child(levels),
+        );
+        let mut footer = div().flex().flex_col().gap(px(8.0));
+        if let Some(status) = security.status.clone() {
+            footer = footer.child(
+                div()
+                    .text_size(px(12.5))
+                    .text_color(rgb(ACCENT_SOFT))
+                    .child(status),
+            );
+        }
+        if security.busy {
+            footer = footer.child(
+                div()
+                    .text_size(px(12.5))
+                    .text_color(rgb(ACCENT_SOFT))
+                    .child("Applying…"),
+            );
+        } else if draft != live && !managed {
+            let enforcing = draft.enforce_smart_card && !live.enforce_smart_card;
+            let confirm = self.confirm_enforce;
+            let label = match (enforcing, confirm) {
+                (true, false) => "Apply…",
+                (true, true) => "Turn off passwords",
+                _ => "Apply",
+            };
+            let apply_tint = if enforcing { WARN } else { ACCENT };
+            footer = footer
+                .when(enforcing && confirm, |footer| {
+                    footer.child(div().text_size(px(12.5)).text_color(rgb(WARN)).child(
+                        "Passwords will stop working on this Mac. If tapbridge or your \
+                         phone can't reach the card, you'll need macOS Recovery to get \
+                         back in.",
+                    ))
+                })
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(button("sec-revert", "Revert", 0xFFFFFF, 0.08, cx).on_click(
+                            cx.listener(|view, _: &gpui::ClickEvent, _, cx| {
+                                view.security_draft = None;
+                                view.confirm_enforce = false;
+                                cx.notify();
+                            }),
+                        ))
+                        .child(button("sec-apply", label, apply_tint, 0.6, cx).on_click(
+                            cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
+                                if enforcing && !view.confirm_enforce {
+                                    view.confirm_enforce = true;
+                                } else {
+                                    view.confirm_enforce = false;
+                                    view.act(SettingsAction::ApplySecurity(draft), cx);
+                                }
+                                cx.notify();
+                            }),
+                        )),
+                );
+        }
+        Some(section.child(footer).into_any_element())
     }
 
     /// The card dialog over a blurred window: frosted scrim, glass sheet.

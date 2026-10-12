@@ -8,6 +8,8 @@
 #[cfg(target_os = "macos")]
 mod mac_login;
 #[cfg(target_os = "macos")]
+mod mac_security;
+#[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
 mod security_key;
