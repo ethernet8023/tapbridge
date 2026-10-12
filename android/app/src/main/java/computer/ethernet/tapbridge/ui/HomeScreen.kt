@@ -74,7 +74,7 @@ fun HomeScreen(
             }
         }
         Spacer(Modifier.height(12.dp))
-        StatusCard(status, hostName, ui.error)
+        StatusCard(status, if (ui.viaUsb) pcName else hostName, ui.error, viaUsb = ui.viaUsb)
         Box(
             Modifier
                 .weight(1f)

@@ -2,8 +2,12 @@ package computer.ethernet.tapbridge
 
 import android.app.*
 import android.content.Context
+import android.content.BroadcastReceiver
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.hardware.usb.UsbAccessory
+import android.hardware.usb.UsbManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -19,7 +23,11 @@ import java.util.concurrent.atomic.AtomicLong
  * connectedDevice foreground service that connects only when:
  *  - the app UI is open and paired (cached hint, visible-retry backoff
  *    0.25/0.5/1/2/3s cap + immediate retry on network change), or
- *  - an FCM wake arrives (ACTION_WAKE with the pushed hint).
+ *  - an FCM wake arrives (ACTION_WAKE with the pushed hint), or
+ *  - a PC running tapbridge is plugged in over USB (ACTION_USB, AOA; see
+ *    docs/USB-PLAN.md). While the accessory is attached there is no idle
+ *    timeout and network connects/retries are suspended; detach ends the
+ *    session and the network path resumes.
  *
  * Idle timeout: 60 s after the last card/APDU activity the service
  * disconnects, disables the tap gate and stops itself.
@@ -32,6 +40,10 @@ class TapBridgeService : Service() {
         const val ACTION_START = "computer.ethernet.tapbridge.START"
         const val ACTION_STOP = "computer.ethernet.tapbridge.STOP"
         const val ACTION_WAKE = "computer.ethernet.tapbridge.WAKE"
+        /** A tapbridge USB accessory is attached (EXTRA_ACCESSORY) and permitted. */
+        const val ACTION_USB = "computer.ethernet.tapbridge.USB"
+        /** How long an unanswered USB pairing question holds the cable. */
+        const val USB_PAIR_PROMPT_MS = 60_000L
         /** Wake target host id (64 hex chars); the hint alone no longer names a PC. */
         const val EXTRA_HOST = "computer.ethernet.tapbridge.HOST"
         const val EXTRA_HINT = "computer.ethernet.tapbridge.HINT"
@@ -94,7 +106,14 @@ class TapBridgeService : Service() {
         fun onSetupCerts(uid: ByteArray) {}
         /** The login setup the phone asked a PC for ended. */
         fun onLoginDone(uid: ByteArray, ok: Boolean) {}
+        /** An unpaired PC on the USB cable offers pairing (null: question withdrawn). */
+        fun onUsbPairRequest(prompt: UsbPrompt?) {}
+        /** The USB link was refused or failed; tell the user why. */
+        fun onUsbNotice(text: String) {}
     }
+
+    /** A verified, unpaired PC on the cable whose pairing window is open. */
+    data class UsbPrompt(val hostId: String, val hostName: String)
     inner class LocalBinder : Binder() { val service get() = this@TapBridgeService }
     private val binder = LocalBinder()
     private val gate = NativeGate()
@@ -162,6 +181,35 @@ class TapBridgeService : Service() {
     @Volatile var hostPivLogin: Boolean = false
         private set
 
+    // ------------------------------------------------------------ USB link
+    /** The attached tapbridge accessory being served; null when none. While
+     *  set: no idle timeout, no network connect/retry. Main thread writes. */
+    @Volatile private var usbAccessory: UsbAccessory? = null
+    /** An accessory whose link already ended (refused, failed): not reopened
+     *  until it detaches, since the PC probes once per plug-in. */
+    @Volatile private var usbEnded: UsbAccessory? = null
+    /** The live session runs over the USB cable (status "via USB"). */
+    @Volatile var viaUsb = false
+        private set
+    /** The pairing question waiting for the user; null when none. */
+    @Volatile var usbPrompt: UsbPrompt? = null
+        private set
+    /** Lifecycle thread only: the accessory PFD (Kotlin owns the fd; Rust
+     *  uses a dup) and a handshaken handle awaiting the pairing answer. */
+    private var usbPfd: ParcelFileDescriptor? = null
+    private var usbPendingPointer = 0L
+    private val usbPromptTimeout = Runnable { answerUsbPairing(false) }
+    private val usbReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != UsbManager.ACTION_USB_ACCESSORY_DETACHED) return
+            @Suppress("DEPRECATION")
+            val gone = intent.getParcelableExtra<UsbAccessory>(UsbManager.EXTRA_ACCESSORY)
+            if (gone != null && !UsbLink.isOurs(gone.manufacturer, gone.model)) return
+            onUsbDetached()
+        }
+    }
+    private var usbReceiverRegistered = false
+
     /** Cards read on a tap since the app started (hex UID). */
     private val readThisRun: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
 
@@ -173,6 +221,12 @@ class TapBridgeService : Service() {
     override fun onCreate() {
         super.onCreate()
         Cards.addListener(cardSync)
+        val filter = IntentFilter(UsbManager.ACTION_USB_ACCESSORY_DETACHED)
+        runCatching {
+            if (Build.VERSION.SDK_INT >= 33) registerReceiver(usbReceiver, filter, RECEIVER_NOT_EXPORTED)
+            else @Suppress("UnspecifiedRegisterReceiverFlag") registerReceiver(usbReceiver, filter)
+            usbReceiverRegistered = true
+        }
     }
     private var retryAttempt = 0
 
@@ -181,6 +235,30 @@ class TapBridgeService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> { stopSession(); stopSelf() }
+            ACTION_USB -> {
+                @Suppress("DEPRECATION")
+                val accessory = intent.getParcelableExtra<UsbAccessory>(UsbManager.EXTRA_ACCESSORY)
+                startedFromUi = true
+                foreground(TapNotice.QUIET)
+                // Declined (already served this plug-in, or not ours): the
+                // app was opened, so behave like an app-open start.
+                if ((accessory == null || !connectUsb(accessory)) && !usbBusy &&
+                    IdentityStore.pairedHosts(this).isNotEmpty()
+                ) onStartNetwork(null)
+            }
+            // The PC on the cable asks for taps itself (ReadCard); a wake
+            // or app-open must not retarget the live USB session.
+            ACTION_WAKE, ACTION_START, null -> if (usbBusy) {
+                startedFromUi = startedFromUi || intent?.action != ACTION_WAKE
+                if (notice == null) foreground(TapNotice.QUIET)
+            } else onStartNetwork(intent)
+            else -> onStartNetwork(intent)
+        }
+        return START_NOT_STICKY
+    }
+
+    private fun onStartNetwork(intent: Intent?) {
+        when (intent?.action) {
             ACTION_WAKE -> {
                 targetHost = intent.getStringExtra(EXTRA_HOST)
                 wakeHint = intent.getStringExtra(EXTRA_HINT)
@@ -201,7 +279,6 @@ class TapBridgeService : Service() {
                 connectAsync()
             }
         }
-        return START_NOT_STICKY
     }
 
     /**
@@ -314,8 +391,13 @@ class TapBridgeService : Service() {
         main.post { listener?.onStatusChanged(value, error) }
     }
 
+    /** A USB accessory is being served (opening, asking, or live). */
+    private val usbBusy get() = usbAccessory != null
+
     @Synchronized
     fun connectAsync() {
+        // The cable is the session while it is attached; no network dialing.
+        if (usbBusy) return
         if (wantsConnection && status == Status.CONNECTED) return
         wantsConnection = true
         val attempt = requested.incrementAndGet()
@@ -415,7 +497,7 @@ class TapBridgeService : Service() {
 
     /** Visible retry backoff: 0.25/0.5/1/2/3s cap. Wake attempts retry once. */
     private fun scheduleRetry(attempt: Long) {
-        if (!wantsConnection || destroyed) return
+        if (!wantsConnection || destroyed || usbBusy) return
         val delay = when {
             // Visible app: keep trying, fast.
             visible -> RETRY_DELAYS_MS[retryAttempt.coerceAtMost(RETRY_DELAYS_MS.size - 1)].also { retryAttempt++ }
@@ -455,7 +537,7 @@ class TapBridgeService : Service() {
         } catch (_: Exception) {}
     }
 
-    private fun readLoop(epoch: Long, attempt: Long) {
+    private fun readLoop(epoch: Long, attempt: Long, usb: Boolean = false) {
         val callbacks = object : NativeBridge.Callbacks {
             override fun request(id: Long, generation: Long, data: ByteArray) {
                 bumpActivity()
@@ -537,10 +619,222 @@ class TapBridgeService : Service() {
         lifecycle.execute {
             if (requested.get() == attempt) {
                 cleanup()
-                show(if (error == null) Status.IDLE else Status.ERROR, error)
-                scheduleRetry(attempt)
+                if (usb) {
+                    // The PC ended the link (or it failed) while still
+                    // plugged in: don't reopen this plug-in; go back to the
+                    // network path.
+                    releaseUsbHandles()
+                    main.post {
+                        if (requested.get() != attempt) return@post
+                        usbEnded = usbAccessory
+                        usbAccessory = null
+                        show(if (error == null) Status.IDLE else Status.ERROR, error)
+                        resumeAfterUsb()
+                    }
+                } else {
+                    show(if (error == null) Status.IDLE else Status.ERROR, error)
+                    scheduleRetry(attempt)
+                }
             }
         }
+    }
+
+    /**
+     * Serves a permitted tapbridge accessory (MainActivity checked the USB
+     * permission; a USB_ACCESSORY_ATTACHED launch carries it). Replaces any
+     * network session: one session at a time. Main thread.
+     */
+    @Synchronized
+    fun connectUsb(accessory: UsbAccessory): Boolean {
+        if (destroyed || !UsbLink.isOurs(accessory.manufacturer, accessory.model)) return false
+        if (usbAccessory != null) return usbAccessory == accessory
+        if (usbEnded == accessory) return false
+        usbAccessory = accessory
+        wantsConnection = true
+        val attempt = requested.incrementAndGet()
+        show(Status.CONNECTING)
+        main.removeCallbacks(idleRunnable)
+        lifecycle.execute {
+            cleanup()
+            releaseUsbHandles()
+            if (requested.get() != attempt) return@execute
+            var pointer = 0L
+            try {
+                NativeBridge.initialize(applicationContext)
+                val pfd = getSystemService(UsbManager::class.java)?.openAccessory(accessory)
+                    ?: throw IOException("couldn't open the USB connection; unplug and plug in again")
+                usbPfd = pfd
+                val key = IdentityStore.getOrCreateKey(this@TapBridgeService)
+                pointer = try { NativeBridge.usbOpen(pfd.fd, key) } finally { key.fill(0) }
+                if (requested.get() != attempt) return@execute
+                val hostId = NativeBridge.hostId(pointer) ?: throw IOException("USB handshake failed")
+                val hostName = NativeBridge.hostName(pointer) ?: "PC"
+                val paired = IdentityStore.pairedHosts(this@TapBridgeService).map { it.hostId }
+                when (val decision = UsbLink.decide(paired, hostId, hostName, NativeBridge.pairingOpen(pointer))) {
+                    is UsbLink.Decision.Reconnect -> {
+                        finishUsb(pointer, attempt, decision.hostId, usePairing = false)
+                        pointer = 0L
+                    }
+                    is UsbLink.Decision.AskToPair -> {
+                        usbPendingPointer = pointer
+                        pointer = 0L
+                        val prompt = UsbPrompt(decision.hostId, decision.hostName)
+                        main.post {
+                            if (requested.get() != attempt) return@post
+                            usbPrompt = prompt
+                            listener?.onUsbPairRequest(prompt)
+                            main.removeCallbacks(usbPromptTimeout)
+                            main.postDelayed(usbPromptTimeout, USB_PAIR_PROMPT_MS)
+                        }
+                    }
+                    is UsbLink.Decision.OpenPairingFirst ->
+                        throw IOException(UsbLink.openPairingFirstMessage(decision.hostName))
+                }
+            } catch (error: Exception) {
+                if (pointer != 0L) { NativeBridge.close(pointer); NativeBridge.release(pointer); pointer = 0L }
+                if (requested.get() == attempt) failUsb(attempt, error.message ?: "USB connection failed")
+            } finally {
+                // Superseded (unplugged, stopped) between steps.
+                if (pointer != 0L) { NativeBridge.close(pointer); NativeBridge.release(pointer) }
+            }
+        }
+        return true
+    }
+
+    /**
+     * The user's answer to the USB pairing question. Yes: Hello with the
+     * PC's capability; no (or no answer): the cable stays unused until it
+     * is plugged in again. Main thread.
+     */
+    fun answerUsbPairing(pair: Boolean) {
+        main.removeCallbacks(usbPromptTimeout)
+        val prompt = usbPrompt ?: return
+        usbPrompt = null
+        listener?.onUsbPairRequest(null)
+        val attempt = requested.get()
+        lifecycle.execute {
+            val pointer = usbPendingPointer
+            usbPendingPointer = 0L
+            if (pointer == 0L || requested.get() != attempt) {
+                if (pointer != 0L) { NativeBridge.close(pointer); NativeBridge.release(pointer) }
+                return@execute
+            }
+            if (!pair) {
+                NativeBridge.close(pointer); NativeBridge.release(pointer)
+                failUsb(attempt, null)
+                return@execute
+            }
+            try {
+                finishUsb(pointer, attempt, prompt.hostId, usePairing = true)
+            } catch (error: Exception) {
+                if (requested.get() == attempt) failUsb(attempt, error.message ?: "pairing failed")
+            }
+        }
+    }
+
+    /**
+     * Lifecycle thread. Hello/Accepted on a handshaken USB handle, then the
+     * same session setup as a network connect. Takes ownership of [pointer]
+     * (released on failure).
+     */
+    private fun finishUsb(pointer: Long, attempt: Long, hostId: String, usePairing: Boolean) {
+        var owned = pointer
+        try {
+            NativeBridge.usbHello(
+                owned, usePairing,
+                IdentityStore.phoneName(this),
+                // No network on the cable: the cached token, never a fetch.
+                IdentityStore.pushToken(this) ?: "",
+            )
+            if (requested.get() != attempt) return
+            val platform = NativeBridge.hostPlatform(owned)
+            val pivLogin = NativeBridge.hostPivLogin(owned)
+            // Persist the pairing before any session use. The bare host id is
+            // the hint, so network wakes and reconnects can find this PC.
+            IdentityStore.saveAcceptedHost(
+                this, hostId, NativeBridge.hostName(owned) ?: "PC", platform.coerceAtLeast(0), pivLogin,
+            )
+            UsbLink.hintToSave(IdentityStore.cachedHint(this, hostId), hostId)?.let {
+                IdentityStore.saveHint(this, hostId, it)
+            }
+            targetHost = hostId
+            hostPlatform = platform
+            hostPivLogin = pivLogin
+            viaUsb = true
+            val epoch = gate.install(owned)
+            owned = 0L
+            session.bindHandle(epoch)
+            Cards.records(this).forEach { session.sendCardInfo(it) }
+            show(Status.CONNECTED)
+            reader = Thread({ readLoop(epoch, attempt, usb = true) }, "tapbridge-usb-reader").apply { start() }
+        } finally {
+            if (owned != 0L) { NativeBridge.close(owned); NativeBridge.release(owned) }
+        }
+    }
+
+    /** Lifecycle thread: the USB attempt ended without a session. */
+    private fun failUsb(attempt: Long, error: String?) {
+        releaseUsbHandles()
+        main.post {
+            if (requested.get() != attempt) return@post
+            usbEnded = usbAccessory
+            usbAccessory = null
+            show(if (error == null) Status.IDLE else Status.ERROR, error)
+            if (error != null) listener?.onUsbNotice(error)
+            // The refusal message stays up; the network path still resumes.
+            resumeAfterUsb(keepError = error != null)
+        }
+    }
+
+    /** The cable was unplugged: end the USB session, resume the network. Main thread. */
+    private fun onUsbDetached() {
+        usbEnded = null
+        if (usbAccessory == null) return
+        usbAccessory = null
+        val attempt = requested.incrementAndGet()
+        main.removeCallbacks(usbPromptTimeout)
+        if (usbPrompt != null) { usbPrompt = null; listener?.onUsbPairRequest(null) }
+        gate.closeIfActive(); session.close()
+        main.post { clearAuthState(); setTapRequested(false) }
+        lifecycle.execute {
+            cleanup()
+            releaseUsbHandles()
+            main.post {
+                if (requested.get() != attempt) return@post
+                show(Status.IDLE)
+                resumeAfterUsb()
+            }
+        }
+    }
+
+    /**
+     * After a USB session (or attempt): an open app reconnects over the
+     * network as usual; nothing runs at rest otherwise. Main thread.
+     */
+    private fun resumeAfterUsb(keepError: Boolean = false) {
+        if (destroyed) return
+        retryAttempt = 0
+        when {
+            visible && IdentityStore.pairedHosts(this).isNotEmpty() -> {
+                targetHost = null
+                wakeHint = null
+                registerNetworkRetry()
+                if (!keepError) connectAsync()
+                else main.postDelayed({ if (!usbBusy && status == Status.ERROR) connectAsync() }, FAILED_HOLD_MS)
+            }
+            visible -> {}
+            else -> { stopSession(); stopSelf() }
+        }
+    }
+
+    /** Lifecycle thread: closes an unanswered USB handle and the accessory PFD. */
+    private fun releaseUsbHandles() {
+        viaUsb = false
+        val pending = usbPendingPointer
+        usbPendingPointer = 0L
+        if (pending != 0L) { NativeBridge.close(pending); NativeBridge.release(pending) }
+        usbPfd?.let { runCatching { it.close() } }
+        usbPfd = null
     }
 
     /** Idle timeout: 60 s after the last card/APDU activity, disconnect. */
@@ -550,7 +844,8 @@ class TapBridgeService : Service() {
             if (destroyed) return
             val idleFor = SystemClock.elapsedRealtime() - activity.get()
             when {
-                visible -> main.postDelayed(this, IDLE_TIMEOUT_MS)
+                // A visible app or an attached cable keeps the session.
+                visible || usbBusy -> main.postDelayed(this, IDLE_TIMEOUT_MS)
                 idleFor >= IDLE_TIMEOUT_MS -> { stopSession(); stopSelf() }
                 else -> main.postDelayed(this, IDLE_TIMEOUT_MS - idleFor)
             }
@@ -637,6 +932,11 @@ class TapBridgeService : Service() {
         notice = null
         wantsConnection = false
         requested.incrementAndGet()
+        // Stopping ends a USB session too; this plug-in is not reopened.
+        usbAccessory?.let { usbEnded = it }
+        usbAccessory = null
+        main.removeCallbacks(usbPromptTimeout)
+        if (usbPrompt != null) { usbPrompt = null; listener?.onUsbPairRequest(null) }
         gate.closeIfActive(); session.close(); nfcWorker.queue.clear()
         closeWakeWindow()
         setTapRequested(false)
@@ -644,7 +944,7 @@ class TapBridgeService : Service() {
         unregisterNetworkRetry()
         main.removeCallbacks(idleRunnable)
         show(Status.IDLE)
-        lifecycle.execute { cleanup() }
+        lifecycle.execute { cleanup(); releaseUsbHandles() }
         stopForeground(STOP_FOREGROUND_REMOVE)
         // Covers the plain-notification fallback in foreground().
         getSystemService(NotificationManager::class.java)?.cancel(FOREGROUND_ID)
@@ -747,10 +1047,11 @@ class TapBridgeService : Service() {
 
     override fun onDestroy() {
         Cards.removeListener(cardSync)
+        if (usbReceiverRegistered) runCatching { unregisterReceiver(usbReceiver) }
         destroyed = true
         stopSession()
         listener = null
-        lifecycle.execute { cleanup(); nfcWorker.shutdownNow(); session.shutdownWriter() }
+        lifecycle.execute { cleanup(); releaseUsbHandles(); nfcWorker.shutdownNow(); session.shutdownWriter() }
         lifecycle.shutdown()
         super.onDestroy()
     }

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Must match tapbridge_core::usb::aoa (MANUFACTURER, MODEL, VERSION): the
+     PC's AOA identity strings. Android opens tapbridge when it sees it. -->
+<resources>
+    <usb-accessory manufacturer="tapbridge" model="tapbridge" version="1" />
+</resources>
