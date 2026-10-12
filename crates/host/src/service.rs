@@ -11,10 +11,26 @@ use crate::{
     trace::Tracer,
 };
 use iroh::{
-    Endpoint,
+    Endpoint, EndpointId,
     endpoint::{Connection, SendStream},
 };
-use std::{io, net::SocketAddr, path::PathBuf, sync::mpsc, thread, time::Duration};
+use std::{
+    io,
+    net::SocketAddr,
+    path::PathBuf,
+    pin::Pin,
+    sync::mpsc,
+    task::{Context, Poll},
+    thread,
+    time::Duration,
+};
+use tokio::io::{AsyncRead, AsyncWrite};
+
+/// Marker file in the state directory: present = "Use USB cable" is off.
+const USB_OFF_FILE: &str = "usb-off";
+/// How long a phone on the cable may take between the verified USB
+/// handshake and its `Hello`: an unpaired phone asks its user first.
+const USB_HELLO_WAIT: Duration = Duration::from_secs(120);
 
 /// PIV APDU deadline on the macOS IFD path, matching the usbip reader's
 /// `APDU_DEADLINE` (2 s) plus its allowed extensions bound.
@@ -47,6 +63,8 @@ pub struct Settings {
 pub enum Event {
     PhoneConnected {
         name: String,
+        /// Over the USB cable rather than the network.
+        usb: bool,
     },
     PhoneDisconnected,
     /// `uid` is the card's stable NFC UID; empty when absent, unknown or
@@ -103,6 +121,150 @@ pub struct Status {
     /// Stable NFC UID of the current card; empty when absent, unknown or
     /// random.
     pub card_uid: Vec<u8>,
+    /// The live session runs over the USB cable (not the network).
+    pub usb: bool,
+    /// The "Use USB cable" setting (persisted; on by default).
+    pub use_usb: bool,
+}
+
+/// A phone on the USB cable, already in accessory mode with its bulk
+/// endpoints bridged to a byte stream (see [`tapbridge_core::usb::pump`]).
+/// Hand it to [`ServiceHandle::attach_usb`]; the service runs the signed
+/// USB handshake and then the same `Hello` authorization as for iroh.
+pub struct UsbLink {
+    read: Box<dyn AsyncRead + Send + Unpin>,
+    write: Box<dyn AsyncWrite + Send + Unpin>,
+    /// Kept alive as long as the link is in use (e.g. the pump guard and
+    /// the claimed USB interface); dropping it ends the link.
+    guard: Box<dyn Send>,
+}
+
+impl UsbLink {
+    pub fn new<S>(stream: S, guard: impl Send + 'static) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Send + 'static,
+    {
+        let (read, write) = tokio::io::split(stream);
+        Self {
+            read: Box::new(read),
+            write: Box::new(write),
+            guard: Box::new(guard),
+        }
+    }
+}
+
+impl std::fmt::Debug for UsbLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UsbLink")
+    }
+}
+
+/// What carries a session: an iroh connection or the USB cable.
+enum Link {
+    Network(Connection),
+    Usb(Box<dyn Send>),
+}
+
+impl Link {
+    fn is_usb(&self) -> bool {
+        matches!(self, Self::Usb(_))
+    }
+
+    /// Ends the link at once (no pending data is drained).
+    fn close(self) {
+        match self {
+            Self::Network(conn) => transport::close(&conn),
+            Self::Usb(guard) => drop(guard),
+        }
+    }
+}
+
+/// The session's write half.
+enum Sink {
+    Network(SendStream),
+    Usb(Box<dyn AsyncWrite + Send + Unpin>),
+}
+
+impl AsyncWrite for Sink {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Network(send) => Pin::new(send).poll_write(cx, buf).map_err(io::Error::other),
+            Self::Usb(write) => Pin::new(write).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Network(send) => Pin::new(send).poll_flush(cx),
+            Self::Usb(write) => Pin::new(write).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Network(send) => Pin::new(send).poll_shutdown(cx),
+            Self::Usb(write) => Pin::new(write).poll_shutdown(cx),
+        }
+    }
+}
+
+/// The live phone session, over either link.
+struct Session {
+    link: Link,
+    send: Sink,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl Session {
+    async fn close(self) {
+        let Self { link, send, reader } = self;
+        drop(send);
+        link.close();
+        reader.abort();
+        let _ = reader.await;
+    }
+}
+
+/// An authenticated connection waiting for its `Hello` to be authorized.
+struct Incoming {
+    peer: EndpointId,
+    link: Link,
+    send: Sink,
+    recv: Box<dyn AsyncRead + Send + Unpin>,
+    capability: Option<[u8; 32]>,
+    name: String,
+    push: Option<String>,
+}
+
+/// Tells the peer `Rejected` and ends the link. Rejection is terminal; no
+/// arbitrary sleep before close on the network path.
+async fn reject(link: Link, mut send: Sink) {
+    let _ = tokio::time::timeout(
+        Duration::from_secs(1),
+        wire::write_frame(&mut send, &Frame::Rejected),
+    )
+    .await;
+    match (link, send) {
+        (Link::Network(conn), Sink::Network(mut send)) => {
+            let _ = send.finish();
+            let _ = tokio::time::timeout(Duration::from_secs(1), send.stopped()).await;
+            transport::close(&conn);
+        }
+        (link, send) => {
+            // USB: closing the stream lets the pump forward the queued
+            // `Rejected` before it sees EOF; stopping the pump (the guard)
+            // right away could drop it, so the guard goes a moment later.
+            drop(send);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                link.close();
+            });
+        }
+    }
 }
 
 /// A change the user (or this PC) makes to one card.
@@ -157,6 +319,10 @@ enum Command {
         reply: std::sync::mpsc::SyncSender<bool>,
     },
     EndpointAddr(std::sync::mpsc::SyncSender<iroh::EndpointAddr>),
+    /// A phone on the cable: run the USB handshake and its Hello.
+    AttachUsb(UsbLink),
+    /// The "Use USB cable" setting; off also ends a live USB session.
+    SetUseUsb(bool, std::sync::mpsc::SyncSender<()>),
     /// macOS PIV path: relay one APDU to the phone card and reply with the
     /// R-APDU. Mirrors the usbip reader's single-in-flight model.
     #[cfg(target_os = "macos")]
@@ -246,6 +412,26 @@ impl ServiceHandle {
         {
             let _ = sender.send(Command::AuthState(state));
         }
+    }
+
+    /// Hands the service a phone that is on the USB cable in accessory
+    /// mode. The service proves identities over it
+    /// ([`tapbridge_core::usb::host_handshake`], offering the pairing
+    /// capability only while the pairing window is open), then authorizes
+    /// the phone's `Hello` exactly like an iroh peer. Fire-and-forget:
+    /// dropped when the service is gone or "Use USB cable" is off.
+    pub fn attach_usb(&self, link: UsbLink) {
+        if let Ok(commands) = self.commands.lock()
+            && let Some(sender) = commands.as_ref()
+        {
+            let _ = sender.send(Command::AttachUsb(link));
+        }
+    }
+
+    /// Turns "Use USB cable" on or off (persisted). Off ends a live USB
+    /// session; the desktop stops probing the cable.
+    pub fn set_use_usb(&self, enabled: bool) {
+        let _ = self.reply_option(|reply| Command::SetUseUsb(enabled, reply));
     }
 
     /// The user's cards, oldest first.
@@ -448,7 +634,11 @@ async fn run_inner(
     ));
     // Frames received from the phone over iroh.
     let (received_tx, mut received) = tokio_mpsc::channel::<io::Result<Frame>>(8);
-    let mut active: Option<(Connection, SendStream, tokio::task::JoinHandle<()>)> = None;
+    let mut active: Option<Session> = None;
+    let mut use_usb = !settings.state_dir.join(USB_OFF_FILE).exists();
+    // Handshakes in flight over USB (the rest are iroh), so a slow phone
+    // on the cable never blocks network dialers and vice versa.
+    let mut usb_pending: usize = 0;
     let mut card_present = false;
     // The current card's stable UID (empty: none), the remembered cards and
     // the passive capability probe over the PC's own APDUs.
@@ -528,6 +718,35 @@ async fn run_inner(
                         Command::EndpointAddr(reply) => {
                             let _ = reply.send(endpoint.addr());
                         },
+                        Command::AttachUsb(link) => {
+                            if !use_usb || usb_pending >= 2 { continue; }
+                            usb_pending += 1;
+                            // Offered only while the pairing window is open;
+                            // the handshake sends it only after the phone's
+                            // proof verified.
+                            let capability = gate.outstanding_capability();
+                            let secret = store.key.clone();
+                            let host_name = settings.host_name.clone();
+                            handshakes.spawn(async move {
+                                (true, usb_handshake(link, secret, host_name, capability).await)
+                            });
+                        },
+                        Command::SetUseUsb(enabled, reply) => {
+                            let marker = settings.state_dir.join(USB_OFF_FILE);
+                            let saved = if enabled {
+                                match std::fs::remove_file(&marker) {
+                                    Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+                                    _ => Ok(()),
+                                }
+                            } else {
+                                std::fs::write(&marker, b"")
+                            };
+                            if saved.is_ok() { use_usb = enabled; }
+                            if !use_usb && active.as_ref().is_some_and(|session| session.link.is_usb()) {
+                                disconnect(&mut active, &mut received, &to_reader, &events, &mut card_present).await?;
+                            }
+                            let _ = reply.send(());
+                        },
                         Command::Status(reply) => {
                             let _ = reply.send(Status {
                                 paired: store.peer.is_some(),
@@ -538,6 +757,8 @@ async fn run_inner(
                                 atr: if card_present { latest_atr.clone() } else { Vec::new() },
                                 card_generation,
                                 card_uid: if card_present { card_uid.clone() } else { Vec::new() },
+                                usb: active.as_ref().is_some_and(|session| session.link.is_usb()),
+                                use_usb,
                             });
                         },
                         Command::KnownCards(reply) => {
@@ -655,24 +876,39 @@ async fn run_inner(
                 },
                 connection = endpoint.accept() => {
                     let Some(connection) = connection else { break };
-                    if handshakes.len() >= 4 { connection.refuse(); continue; }
+                    if handshakes.len() - usb_pending >= 4 { connection.refuse(); continue; }
                     handshakes.spawn(async move {
-                        tokio::time::timeout(Duration::from_secs(10), async {
+                        let incoming = tokio::time::timeout(Duration::from_secs(10), async {
                             let conn = connection.await.map_err(io::Error::other)?;
                             let (send, recv, hello) = transport::host_receive_hello(&conn).await?;
-                            Ok::<_, io::Error>((conn, send, recv, hello))
-                        }).await.map_err(io::Error::other)?
+                            let Frame::Hello { capability, name, push } = hello else {
+                                return Err(io::Error::new(io::ErrorKind::InvalidData, "expected Hello"));
+                            };
+                            Ok::<_, io::Error>(Incoming {
+                                peer: conn.remote_id(),
+                                link: Link::Network(conn),
+                                send: Sink::Network(send),
+                                recv: Box::new(recv),
+                                capability,
+                                name,
+                                push,
+                            })
+                        }).await.map_err(io::Error::other).flatten();
+                        (false, incoming)
                     });
                 },
                 completed = handshakes.join_next(), if !handshakes.is_empty() => {
-                    let Some(Ok(Ok((conn, mut send, recv, Frame::Hello { capability, name, push })))) = completed else { continue; };
-                    let peer = conn.remote_id();
+                    let Some(Ok((usb, incoming))) = completed else { continue; };
+                    if usb { usb_pending -= 1; }
+                    let Ok(Incoming { peer, link, mut send, recv, capability, name, push }) = incoming else { continue; };
+                    if link.is_usb() && !use_usb { link.close(); continue; }
                     // The paired phone runs one session at a time, so a new
                     // authenticated connection from it means the old one is
-                    // dead (app restarted, network switched) even if QUIC has
-                    // not noticed yet. Replace it instead of making the phone
-                    // wait out the idle timeout. Any other peer is still
-                    // refused while a session is live.
+                    // dead (app restarted, network switched, cable plugged
+                    // in) even if the old link has not noticed yet. Replace
+                    // it instead of making the phone wait out the idle
+                    // timeout. Any other peer is still refused while a
+                    // session is live.
                     if active.is_some() && store.peer == Some(peer) {
                         disconnect(&mut active, &mut received, &to_reader, &events, &mut card_present).await?;
                     }
@@ -702,22 +938,23 @@ async fn run_inner(
                         }
                     };
                     if !authorized {
-                        // Rejection is terminal; no arbitrary sleep before close.
-                        let _ = tokio::time::timeout(Duration::from_secs(1), transport::reply_rejected(&mut send)).await;
-                        let _ = send.finish();
-                        let _ = tokio::time::timeout(Duration::from_secs(1), send.stopped()).await;
-                        transport::close(&conn);
+                        reject(link, send).await;
                         continue;
                     }
                     if paired_now {
                         let _ = events.send(Event::PairingCompleted { name: name.clone() });
                     }
                     if let Err(error) = store.set_phone_info(None, Some(&name), push.as_deref()) {
-                        transport::close(&conn);
+                        link.close();
                         return Err(error);
                     }
-                    if !matches!(tokio::time::timeout(Duration::from_secs(2), transport::reply_accepted(&mut send, settings.host_name.clone())).await, Ok(Ok(()))) {
-                        transport::close(&conn);
+                    let accepted = Frame::Accepted {
+                        name: settings.host_name.clone(),
+                        platform: wire::platform::current(),
+                        piv_login: wire::platform::piv_login(),
+                    };
+                    if !matches!(tokio::time::timeout(Duration::from_secs(2), wire::write_frame(&mut send, &accepted)).await, Ok(Ok(()))) {
+                        link.close();
                         continue;
                     }
                     let tx = received_tx.clone();
@@ -729,8 +966,9 @@ async fn run_inner(
                             if tx.send(frame).await.is_err() || failed { break; }
                         }
                     });
-                    active = Some((conn, send, reader));
-                    let _ = events.send(Event::PhoneConnected { name: name.clone() });
+                    let over_usb = link.is_usb();
+                    active = Some(Session { link, send, reader });
+                    let _ = events.send(Event::PhoneConnected { name: name.clone(), usb: over_usb });
                     let _ = events.send(Event::CardPresent { present: false, uid: Vec::new() });
                     // Sync: every record this PC has, forgotten ones too.
                     let records: Vec<CardInfo> = known.records().cloned().collect();
@@ -849,10 +1087,8 @@ async fn run_inner(
         }
         Ok(())
     }.await;
-    if let Some((conn, _, reader)) = active {
-        transport::close(&conn);
-        reader.abort();
-        let _ = reader.await;
+    if let Some(session) = active {
+        session.close().await;
     }
     reader_task.abort();
     let _ = reader_task.await;
@@ -860,6 +1096,52 @@ async fn run_inner(
     while handshakes.join_next().await.is_some() {}
     endpoint.close().await;
     result
+}
+
+/// Host side of a cable link: the signed USB handshake (bounded), then the
+/// phone's `Hello` (it may first ask its user to pair, hence the longer
+/// wait). The verified key from the handshake is the peer id, exactly like
+/// iroh's `remote_id()`.
+async fn usb_handshake(
+    link: UsbLink,
+    secret: iroh::SecretKey,
+    host_name: String,
+    capability: Option<[u8; 32]>,
+) -> io::Result<Incoming> {
+    let UsbLink {
+        mut read,
+        mut write,
+        guard,
+    } = link;
+    let peer = tokio::time::timeout(
+        Duration::from_secs(10),
+        tapbridge_core::usb::host_handshake(&mut read, &mut write, &secret, &host_name, capability),
+    )
+    .await
+    .map_err(io::Error::other)??;
+    let hello = tokio::time::timeout(USB_HELLO_WAIT, wire::read_frame(&mut read))
+        .await
+        .map_err(io::Error::other)??;
+    let Frame::Hello {
+        capability,
+        name,
+        push,
+    } = hello
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected Hello as first frame",
+        ));
+    };
+    Ok(Incoming {
+        peer,
+        link: Link::Usb(guard),
+        send: Sink::Usb(write),
+        recv: read,
+        capability,
+        name,
+        push,
+    })
 }
 
 /// The tap outcome when no session is live.
@@ -877,16 +1159,14 @@ fn session_outcome(store: &Store, endpoint: &Endpoint) -> TapOutcome {
 }
 
 async fn disconnect(
-    active: &mut Option<(Connection, SendStream, tokio::task::JoinHandle<()>)>,
+    active: &mut Option<Session>,
     received: &mut tokio_mpsc::Receiver<io::Result<Frame>>,
     to_reader: &tokio_mpsc::Sender<Frame>,
     events: &tokio_mpsc::UnboundedSender<Event>,
     card_present: &mut bool,
 ) -> io::Result<()> {
-    if let Some((conn, _, reader)) = active.take() {
-        transport::close(&conn);
-        reader.abort();
-        let _ = reader.await;
+    if let Some(session) = active.take() {
+        session.close().await;
     }
     while received.try_recv().is_ok() {}
     tokio::time::timeout(
@@ -913,7 +1193,7 @@ async fn disconnect(
 /// Writes one frame to the live session, disconnecting on failure. Returns
 /// whether the frame reached the stream.
 async fn send_frame(
-    active: &mut Option<(Connection, SendStream, tokio::task::JoinHandle<()>)>,
+    active: &mut Option<Session>,
     received: &mut tokio_mpsc::Receiver<io::Result<Frame>>,
     to_reader: &tokio_mpsc::Sender<Frame>,
     events: &tokio_mpsc::UnboundedSender<Event>,
@@ -924,9 +1204,12 @@ async fn send_frame(
     if let Some(line) = tracer.and_then(|t| t.observe(&frame)) {
         let _ = events.send(Event::Trace(line));
     }
-    if let Some((_, send, _)) = active.as_mut() {
-        let sent =
-            tokio::time::timeout(Duration::from_secs(5), wire::write_frame(send, &frame)).await;
+    if let Some(session) = active.as_mut() {
+        let sent = tokio::time::timeout(
+            Duration::from_secs(5),
+            wire::write_frame(&mut session.send, &frame),
+        )
+        .await;
         if !matches!(sent, Ok(Ok(()))) {
             disconnect(active, received, to_reader, events, card_present).await?;
             return Ok(false);
@@ -1044,7 +1327,7 @@ mod tests {
         // see a live session.
         let expected_name = name.to_owned();
         collector
-            .wait(|event| matches!(event, Event::PhoneConnected { name } if *name == expected_name))
+            .wait(|event| matches!(event, Event::PhoneConnected { name, .. } if *name == expected_name))
             .await;
         (
             handle,
@@ -1586,6 +1869,278 @@ mod tests {
         handle.shutdown();
         transport::close(&phone.conn);
         drop(phone.endpoint);
+    }
+
+    /// The phone end of an in-memory "cable": the service gets the other
+    /// end as a [`UsbLink`], exactly what the desktop's USB watcher hands
+    /// it after the accessory switch.
+    struct UsbPhone {
+        info: tapbridge_core::usb::HostInfo,
+        reply: Frame,
+        read: tokio::io::ReadHalf<tokio::io::DuplexStream>,
+        write: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    }
+
+    /// Plugs `key` in over USB, runs the phone handshake and sends `Hello`
+    /// (with the capability the host offered when `pair`).
+    async fn plug_usb(handle: &ServiceHandle, key: &SecretKey, pair: bool) -> UsbPhone {
+        let (host_io, phone_io) = tokio::io::duplex(4 * tapbridge_core::usb::CHUNK);
+        handle.attach_usb(UsbLink::new(host_io, ()));
+        let (mut read, mut write) = tokio::io::split(phone_io);
+        let info = tokio::time::timeout(
+            Duration::from_secs(5),
+            tapbridge_core::usb::phone_handshake(&mut read, &mut write, key),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        wire::write_frame(
+            &mut write,
+            &Frame::Hello {
+                capability: if pair { info.capability } else { None },
+                name: "Pixel USB".into(),
+                push: Some("usb-token".into()),
+            },
+        )
+        .await
+        .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(5), wire::read_frame(&mut read))
+            .await
+            .unwrap()
+            .unwrap();
+        UsbPhone {
+            info,
+            reply,
+            read,
+            write,
+        }
+    }
+
+    fn collector(handle: &std::sync::Arc<ServiceHandle>) -> Collector {
+        Collector {
+            handle: handle.clone(),
+            seen: Vec::new(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_phone_pairs_over_usb_with_the_open_pairing_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let _session = crate::test_session();
+        let handle = std::sync::Arc::new(
+            crate::service::start(settings(dir.path(), false))
+                .await
+                .unwrap(),
+        );
+        let mut events = collector(&handle);
+        let key = SecretKey::generate();
+        // No pairing window: the host offers no capability and an unpaired
+        // phone is refused.
+        let phone = plug_usb(&handle, &key, true).await;
+        assert_eq!(phone.info.host, handle.endpoint_addr().unwrap().id);
+        assert_eq!(phone.info.name, "Test PC");
+        assert_eq!(phone.info.capability, None);
+        assert_eq!(phone.reply, Frame::Rejected);
+        assert!(!handle.status().paired);
+        drop(phone);
+        // Pairing window open: the capability travels in HostProof.
+        let invitation = handle.mint_invitation().unwrap();
+        let phone = plug_usb(&handle, &key, true).await;
+        assert_eq!(phone.info.capability, Some(invitation.capability()));
+        assert!(matches!(phone.reply, Frame::Accepted { ref name, .. } if name == "Test PC"));
+        events
+            .wait(|event| matches!(event, Event::PairingCompleted { name } if name == "Pixel USB"))
+            .await;
+        events
+            .wait(|event| matches!(event, Event::PhoneConnected { usb: true, .. }))
+            .await;
+        let status = handle.status();
+        assert!(status.paired && status.phone_connected && status.usb && status.push_stored);
+        assert_eq!(status.phone_name.as_deref(), Some("Pixel USB"));
+        handle.shutdown();
+        drop(phone);
+        // The phone's USB-verified key is the pinned peer: the same id the
+        // network path pins.
+        assert_eq!(Store::open(dir.path()).unwrap().peer, Some(key.public()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_paired_phone_reconnects_over_usb_and_unplugging_ends_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let _session = crate::test_session();
+        let handle = std::sync::Arc::new(
+            crate::service::start(settings(dir.path(), false))
+                .await
+                .unwrap(),
+        );
+        let mut events = collector(&handle);
+        let key = SecretKey::generate();
+        handle.mint_invitation().unwrap();
+        let phone = plug_usb(&handle, &key, true).await;
+        assert!(matches!(phone.reply, Frame::Accepted { .. }));
+        events
+            .wait(|event| matches!(event, Event::PairingCompleted { .. }))
+            .await;
+        events
+            .wait(|event| matches!(event, Event::PhoneConnected { usb: true, .. }))
+            .await;
+        // Unplug: the stream ends.
+        drop(phone);
+        events
+            .wait(|event| matches!(event, Event::PhoneDisconnected))
+            .await;
+        assert!(!handle.status().phone_connected);
+        events.seen.clear();
+        // Plug in again: a pinned reconnect, no capability on offer (the
+        // invitation was consumed), no new pairing.
+        let mut phone = plug_usb(&handle, &key, false).await;
+        assert_eq!(phone.info.capability, None);
+        assert!(matches!(phone.reply, Frame::Accepted { .. }));
+        events
+            .wait(|event| matches!(event, Event::PhoneConnected { usb: true, .. }))
+            .await;
+        assert!(
+            !events
+                .seen
+                .iter()
+                .any(|event| matches!(event, Event::PairingCompleted { .. }))
+        );
+        // A full session over the cable: card in, tap request, card frames.
+        wire::write_frame(
+            &mut phone.write,
+            &Frame::Card {
+                generation: 4,
+                atr: vec![0x3B, 0x80, 0x80, 0x01, 0x01],
+                max_apdu: 255,
+                uid: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        events
+            .wait(|event| matches!(event, Event::CardPresent { present: true, .. }))
+            .await;
+        assert!(handle.status().card_present);
+        assert_eq!(handle.request_tap(), TapOutcome::ReadCardSent);
+        loop {
+            let frame =
+                tokio::time::timeout(Duration::from_secs(5), wire::read_frame(&mut phone.read))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            if frame == Frame::ReadCard {
+                break;
+            }
+        }
+        // Unplug with the card present: absent, then disconnected.
+        drop(phone);
+        events
+            .wait(|event| matches!(event, Event::CardPresent { present: false, .. }))
+            .await;
+        events
+            .wait(|event| matches!(event, Event::PhoneDisconnected))
+            .await;
+        let status = handle.status();
+        assert!(!status.card_present && !status.phone_connected && !status.usb);
+        handle.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn usb_replaces_a_live_network_session_from_the_pinned_phone() {
+        let dir = tempfile::tempdir().unwrap();
+        let _session = crate::test_session();
+        let (handle, mut events, mut network) = paired_service(dir.path(), "Pixel", None).await;
+        assert!(!handle.status().usb);
+        let key = network.endpoint.secret_key().clone();
+        let mut phone = plug_usb(&handle, &key, false).await;
+        assert!(matches!(phone.reply, Frame::Accepted { .. }));
+        events
+            .wait(|event| matches!(event, Event::PhoneDisconnected))
+            .await;
+        events
+            .wait(|event| matches!(event, Event::PhoneConnected { usb: true, .. }))
+            .await;
+        assert!(handle.status().usb);
+        // The host closed the network session (pending sync records may
+        // still arrive first).
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while wire::read_frame(&mut network.recv).await.is_ok() {}
+        })
+        .await
+        .expect("the network session ends");
+        // Taps go to the cable now.
+        assert_eq!(handle.request_tap(), TapOutcome::ReadCardSent);
+        let frame = tokio::time::timeout(Duration::from_secs(5), wire::read_frame(&mut phone.read))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame, Frame::ReadCard);
+        handle.shutdown();
+        drop(phone);
+        transport::close(&network.conn);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn another_phone_on_the_cable_is_refused_while_paired() {
+        let dir = tempfile::tempdir().unwrap();
+        let _session = crate::test_session();
+        let (handle, _events, network) = paired_service(dir.path(), "Pixel", None).await;
+        handle.mint_invitation().unwrap();
+        // A different phone, even with the open window's capability, does
+        // not replace the pinned phone.
+        let stranger = plug_usb(&handle, &SecretKey::generate(), true).await;
+        assert_eq!(stranger.reply, Frame::Rejected);
+        let status = handle.status();
+        assert!(status.phone_connected && !status.usb);
+        handle.shutdown();
+        drop(stranger);
+        transport::close(&network.conn);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turning_usb_off_ends_the_cable_session_and_is_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let _session = crate::test_session();
+        let handle = std::sync::Arc::new(
+            crate::service::start(settings(dir.path(), false))
+                .await
+                .unwrap(),
+        );
+        let mut events = collector(&handle);
+        assert!(handle.status().use_usb, "on by default");
+        handle.mint_invitation().unwrap();
+        let key = SecretKey::generate();
+        let phone = plug_usb(&handle, &key, true).await;
+        assert!(matches!(phone.reply, Frame::Accepted { .. }));
+        events
+            .wait(|event| matches!(event, Event::PhoneConnected { usb: true, .. }))
+            .await;
+        handle.set_use_usb(false);
+        events
+            .wait(|event| matches!(event, Event::PhoneDisconnected))
+            .await;
+        assert!(!handle.status().use_usb);
+        // Ignored while off: the cable gets no greeting.
+        let (host_io, phone_io) = tokio::io::duplex(4096);
+        handle.attach_usb(UsbLink::new(host_io, ()));
+        let (mut read, _write) = tokio::io::split(phone_io);
+        let mut first = [0u8; 1];
+        let greeted = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read(&mut read, &mut first),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(greeted, Ok(0) | Err(_)), "no handshake while off");
+        handle.shutdown();
+        drop(phone);
+        let handle = crate::service::start(settings(dir.path(), false))
+            .await
+            .unwrap();
+        assert!(!handle.status().use_usb, "persisted");
+        handle.set_use_usb(true);
+        assert!(handle.status().use_usb);
+        handle.shutdown();
     }
 
     /// macOS: the PIV token's own SELECT and certificate read mark the
