@@ -32,6 +32,9 @@ nm -gU "$BUNDLE/Contents/MacOS/ifd_tapbridge.dylib" | grep -q IFDHControl
 nm -gU "$BUNDLE/Contents/MacOS/ifd_tapbridge.dylib" | grep -q IFDHCreateChannelByName
 
 # Sanity: the plist must parse.
-plutil -lint "$BUNDLE/Contents/Info.plist" >/dev/null
+# (plutil is macOS's; skipped where it's missing, e.g. a Nix build.)
+if command -v plutil >/dev/null; then
+    plutil -lint "$BUNDLE/Contents/Info.plist" >/dev/null
+fi
 
 echo "built $BUNDLE"

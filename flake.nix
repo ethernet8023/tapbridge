@@ -20,8 +20,30 @@
           android_sdk.accept_license = true;
         };
       }));
+      darwinSystems = [ "aarch64-darwin" "x86_64-darwin" ];
+      version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+      tapbridgeFor = pkgs: pkgs.callPackage ./nix/package.nix {
+        src = pkgs.lib.cleanSource ./.;
+        inherit version;
+      };
     in
     {
+      packages = nixpkgs.lib.genAttrs darwinSystems (system:
+        let pkgs = nixpkgs.legacyPackages.${system}; in
+        rec {
+          tapbridge = tapbridgeFor pkgs;
+          default = tapbridge;
+        });
+
+      # nix-darwin: `programs.tapbridge`. See docs/nix-darwin.md.
+      darwinModules = rec {
+        tapbridge = { pkgs, ... }: {
+          imports = [ ./nix/darwin-module.nix ];
+          programs.tapbridge.package = nixpkgs.lib.mkDefault (tapbridgeFor pkgs);
+        };
+        default = tapbridge;
+      };
+
       devShells = forAll (pkgs:
         let
           # Versions pinned to android/app/build.gradle.kts (compileSdk 36,

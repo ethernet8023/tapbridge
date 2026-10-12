@@ -13,7 +13,17 @@ license = "MIT"
 iroh = { version = "=1.2.0", default-features = false, features = ["tls-ring"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time", "signal"] }
 
+# No debug info anywhere: nobody attaches a debugger right now, and it was
+# most of target/'s size. Panics still print file:line backtraces
+# (line-tables-only would add symbols back if needed).
+[profile.dev]
+debug = false
+
+[profile.test]
+debug = false
+
 [profile.release]
+debug = false
 strip = "debuginfo"
 # lto = "thin" crashes rustc (0xc0000005 STATUS_ACCESS_VIOLATION) linking
 # tapbridge.exe on rustc 1.98.0 aarch64-pc-windows-msvc; LTO off builds clean.
