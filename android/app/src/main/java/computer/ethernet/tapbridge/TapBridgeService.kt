@@ -178,6 +178,11 @@ class TapBridgeService : Service() {
         private set
     @Volatile var wakeHint: String? = null
         private set
+    /** Host id of the live session; null without one. Unlike [targetHost]
+     *  (what to dial next, cleared when the app opens), this only changes
+     *  when a session starts or ends. */
+    @Volatile var connectedHost: String? = null
+        private set
     /** OS of the PC on the live session (NativeBridge.PLATFORM_*), for wording; -1 without one. */
     @Volatile var hostPlatform: Int = -1
         private set
@@ -392,6 +397,7 @@ class TapBridgeService : Service() {
     }
 
     private fun show(value: Status, error: String? = null) {
+        if (value != Status.CONNECTED) connectedHost = null
         status = value
         lastError = error
         main.post { listener?.onStatusChanged(value, error) }
@@ -449,6 +455,7 @@ class TapBridgeService : Service() {
                     NativeBridge.hostPivLogin(pointer),
                 )
                 targetHost = acceptedHost
+                connectedHost = acceptedHost
                 hostPlatform = NativeBridge.hostPlatform(pointer)
                 hostPivLogin = NativeBridge.hostPivLogin(pointer)
                 NativeBridge.usedHint(pointer)?.let {
@@ -769,6 +776,7 @@ class TapBridgeService : Service() {
                 IdentityStore.saveHint(this, hostId, it)
             }
             targetHost = hostId
+            connectedHost = hostId
             hostPlatform = platform
             hostPivLogin = pivLogin
             viaUsb = true

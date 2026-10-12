@@ -155,7 +155,7 @@ class MainActivity : ComponentActivity() {
                     it.status = status
                     it.error = error
                     val connected = status == TapBridgeService.Status.CONNECTED
-                    it.connectedHost = if (connected) service?.targetHost else null
+                    it.connectedHost = if (connected) service?.connectedHost else null
                     it.hostPlatform = if (connected) service?.hostPlatform ?: -1 else -1
                     it.hostPivLogin = connected && service?.hostPivLogin == true
                     it.viaUsb = connected && service?.viaUsb == true
@@ -206,7 +206,7 @@ class MainActivity : ComponentActivity() {
             state?.error = service?.lastError
             state?.tapRequested = service?.tapRequested == true
             state?.authState = service?.authState ?: AuthState.IDLE
-            state?.connectedHost = service?.takeIf { it.status == TapBridgeService.Status.CONNECTED }?.targetHost
+            state?.connectedHost = service?.takeIf { it.status == TapBridgeService.Status.CONNECTED }?.connectedHost
             state?.hostPlatform = service?.takeIf { it.status == TapBridgeService.Status.CONNECTED }?.hostPlatform ?: -1
             state?.hostPivLogin = service?.takeIf { it.status == TapBridgeService.Status.CONNECTED }?.hostPivLogin == true
             state?.viaUsb = service?.takeIf { it.status == TapBridgeService.Status.CONNECTED }?.viaUsb == true
