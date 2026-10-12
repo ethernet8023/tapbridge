@@ -1727,10 +1727,10 @@ impl Render for SettingsView {
             );
 
         let (phone_title, phone_detail) = match &snapshot.phone {
-            Some(name) if snapshot.phone_connected => (name.clone(), Some("Paired, connected now")),
+            Some(name) if snapshot.phone_connected => (name.clone(), Some("Paired & online")),
             Some(name) => (
                 name.clone(),
-                Some("Paired. Connects when you need your key."),
+                Some("Paired"),
             ),
             None => ("No phone paired".to_owned(), None),
         };

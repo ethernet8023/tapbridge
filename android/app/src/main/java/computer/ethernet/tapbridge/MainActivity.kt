@@ -445,7 +445,9 @@ class MainActivity : ComponentActivity() {
             }
         }
         handleForwardedTag(intent)
-        handlePairingLink(intent)
+        // A recreated activity (rotation, process death) gets the same
+        // intent back: the link was already handled then.
+        if (savedInstanceState == null) handlePairingLink(intent)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -457,11 +459,14 @@ class MainActivity : ComponentActivity() {
     /**
      * A tapbridge:1:... link (the PC's pairing QR, scanned with the camera).
      * Never pairs on its own: the user confirms in a dialog first, since any
-     * page or QR could carry such a link. Consumed once, so a recreated
-     * activity doesn't ask again.
+     * page or QR could carry such a link. Handled once: clearing
+     * `intent.data` only changes this copy, and Android keeps the task's
+     * original intent, so a launch from Recents (or after the app was
+     * killed) delivers the old link again. Those launches are ignored.
      */
     private fun handlePairingLink(intent: Intent?) {
         if (intent?.action != Intent.ACTION_VIEW || intent.data?.scheme != "tapbridge") return
+        if (intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0) return
         val text = intent.dataString
         intent.data = null
         if (text != null && Invitation.parse(text) != null) state?.linkInvitation = text
