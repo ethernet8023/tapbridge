@@ -1,0 +1,8 @@
+# tapbridge: virtual FIDO security key, device access for the logged-in user
+# (systemd "uaccess"). Installed by the Nix modules (`virtualSecurityKey`).
+
+# The virtual FIDO security key: creating it needs /dev/uhid, and browsers
+# need the hidraw node it becomes (vendor 1209, product 7a73; a uhid device
+# has no USB parent, so match the HID device name 0003:VVVV:PPPP.N).
+KERNEL=="uhid", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uhid"
+SUBSYSTEM=="hidraw", KERNELS=="0003:1209:7A73.*", TAG+="uaccess", ENV{ID_SECURITY_TOKEN}="1"

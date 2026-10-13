@@ -26,11 +26,18 @@
 #include <unistd.h>
 
 /* ---- PC/SC IFDHandler types (Apple wintypes.h / ifdhandler.h) ---- */
+#ifdef __APPLE__
 typedef uint32_t DWORD;
+typedef int32_t RESPONSECODE;
+#else
+/* pcsc-lite's wintypes.h: DWORD and RESPONSECODE are `long`, 8 bytes on LP64.
+ * Getting this wrong shifts every argument after an SCARD_IO_HEADER. */
+typedef unsigned long DWORD;
+typedef long RESPONSECODE;
+#endif
 typedef uint8_t UCHAR;
 typedef unsigned char *PUCHAR;
 typedef DWORD *PDWORD;
-typedef int32_t RESPONSECODE;
 typedef char *LPSTR;
 
 typedef struct _SCARD_IO_HEADER {
@@ -113,8 +120,8 @@ static int read_all(int fd, unsigned char *buf, size_t len)
 /*
  * Per-reader socket path. pcscd's IFDHandler ABI carries no context pointer,
  * so the only way to give each reader its own daemon is a table keyed by Lun.
- * Linux: reader.conf's DEVICENAME is the socket path (IFDHCreateChannelByName).
- * macOS never passes a path-shaped name, so it keeps TB_SOCKET_PATH.
+ * Linux: reader.conf's DEVICENAME is "unix:<socket path>" (IFDHCreateChannelByName).
+ * Any other name (macOS: nix-darwin passes /dev/null) keeps TB_SOCKET_PATH.
  */
 #define TB_MAX_LUN 32
 static char tb_paths[TB_MAX_LUN][sizeof(((struct sockaddr_un *)0)->sun_path)];
@@ -223,8 +230,11 @@ RESPONSECODE IFDHCreateChannel(DWORD Lun, DWORD Channel)
 RESPONSECODE IFDHCreateChannelByName(DWORD Lun, LPSTR DeviceName)
 {
     DWORD slot = Lun >> 16;
-    if (slot < TB_MAX_LUN && DeviceName && DeviceName[0] == '/') {
-        strncpy(tb_paths[slot], DeviceName, sizeof(tb_paths[slot]) - 1);
+    /* "unix:<path>" only: pcscd stat()s a DEVICENAME without a ':' at config
+     * time and refuses to start if it is missing, and the app is not running
+     * at boot. (macOS's nix-darwin passes /dev/null, which is ignored.) */
+    if (slot < TB_MAX_LUN && DeviceName && strncmp(DeviceName, "unix:/", 6) == 0) {
+        strncpy(tb_paths[slot], DeviceName + 5, sizeof(tb_paths[slot]) - 1);
         tb_paths[slot][sizeof(tb_paths[slot]) - 1] = 0;
     }
     return IFD_SUCCESS;
@@ -399,9 +409,11 @@ RESPONSECODE IFDHICCPresence(DWORD Lun)
 {
     unsigned char status, data[1];
     uint32_t data_len = 0;
-    (void)Lun;
+    /* The app may not be running yet (pcscd starts at boot): an unreachable
+     * daemon is "no card", not an error. pcscd removes a reader whose first
+     * presence check fails and never retries it. */
     if (tb_roundtrip(Lun, TB_CMD_PRESENCE, NULL, 0, data, sizeof(data), &data_len, &status) < 0)
-        return IFD_COMMUNICATION_ERROR;
+        return IFD_ICC_NOT_PRESENT;
     if (status == TB_OK)
         return IFD_ICC_PRESENT;
     return IFD_ICC_NOT_PRESENT;

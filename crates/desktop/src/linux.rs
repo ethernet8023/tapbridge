@@ -62,8 +62,14 @@ fn desktop_entry(exe: &str) -> String {
     )
 }
 
+/// The Nix modules say whether the unit starts at login.
+pub const MANAGED_START_ENV: &str = "TAPBRIDGE_START_AT_LOGIN";
+
 pub fn autostart_is_enabled() -> bool {
-    managed() || autostart_path().is_some_and(|path| path.is_file())
+    if managed() {
+        return std::env::var_os(MANAGED_START_ENV).is_none_or(|value| value != "0");
+    }
+    autostart_path().is_some_and(|path| path.is_file())
 }
 
 pub fn autostart_set_enabled(enabled: bool) -> Result<(), String> {

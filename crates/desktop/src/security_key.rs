@@ -1112,3 +1112,61 @@ mod uhid_driver_tests {
         assert_eq!(reply, vec![CTAP2_ERR_KEEPALIVE_CANCEL]);
     }
 }
+
+/// Against the real kernel and a real FIDO client. Both need root (for
+/// `/dev/uhid`) and libfido2's `fido2-token`, so they only run on purpose:
+/// the NixOS VM test (`nix flake check`) runs them as root.
+#[cfg(all(test, target_os = "linux"))]
+mod uhid_live_tests {
+    use super::*;
+    use tapbridge_host::ctap_pin::fake::Authenticator;
+
+    /// The `/dev/hidrawN` of the virtual key, once the kernel has made it.
+    fn wait_for_hidraw() -> String {
+        for _ in 0..100 {
+            for entry in std::fs::read_dir("/sys/class/hidraw").into_iter().flatten().flatten() {
+                let uevent = std::fs::read_to_string(entry.path().join("device/uevent"))
+                    .unwrap_or_default();
+                if uevent.contains("HID_NAME=tapbridge security key") {
+                    return format!("/dev/{}", entry.file_name().to_string_lossy());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("no hidraw node named \"tapbridge security key\" appeared");
+    }
+
+    #[test]
+    #[ignore = "needs root (/dev/uhid) and fido2-token (libfido2) on PATH"]
+    fn libfido2_reads_get_info_through_the_real_kernel() {
+        let card = Arc::new(super::tests::SimCard::new(Authenticator::new(None, &[2])));
+        let log: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|line| eprintln!("{line}"));
+        start(hid::Device::create, card, log).expect("create the virtual key (root?)");
+        let path = wait_for_hidraw();
+        let output = std::process::Command::new("fido2-token")
+            .args(["-I", &path])
+            .output()
+            .expect("run fido2-token");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}{}", String::from_utf8_lossy(&output.stderr));
+        assert!(stdout.contains("FIDO_2_0"), "versions in the GetInfo reply: {stdout}");
+    }
+
+    #[test]
+    #[ignore = "needs root (/dev/uhid) and fido2-token (libfido2) on PATH"]
+    fn libfido2_lists_the_virtual_key() {
+        let card = Arc::new(super::tests::SimCard::new(Authenticator::new(None, &[2])));
+        let log: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|line| eprintln!("{line}"));
+        start(hid::Device::create, card, log).expect("create the virtual key (root?)");
+        let path = wait_for_hidraw();
+        let listing = std::process::Command::new("fido2-token")
+            .arg("-L")
+            .output()
+            .expect("run fido2-token");
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        assert!(
+            listing.contains(&path) && listing.contains("vendor=0x1209, product=0x7a73"),
+            "fido2-token -L: {listing}"
+        );
+    }
+}

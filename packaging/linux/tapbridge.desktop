@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=tapbridge
+Comment=Use your phone as the NFC reader for your security key
+Exec=tapbridge
+Icon=tapbridge
+Terminal=false
+Categories=Utility;Security;

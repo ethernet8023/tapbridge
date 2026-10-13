@@ -8,7 +8,7 @@
 //!
 //! macOS: com.apple.ifdreader loads the shim at startup and the socket is
 //! the fixed [`MAC_SOCKET_PATH`]. Linux: pcscd loads the shim from a
-//! `reader.conf.d` entry whose `DEVICENAME` is the per-user socket path
+//! `reader.conf.d` entry whose `DEVICENAME` is `unix:` plus the per-user socket path
 //! (see [`socket_path`]).
 
 // The always-present login card (ApduCache, AlwaysPresent) serves macOS smart
@@ -32,9 +32,17 @@ use tapbridge_host::{
 #[cfg(target_os = "macos")]
 pub const MAC_SOCKET_PATH: &str = "/var/tmp/tapbridge-ifd.sock";
 
-/// Where this user's IFD socket lives. Linux: `$XDG_RUNTIME_DIR/tapbridge/ifd.sock`,
-/// the same path the NixOS module writes into reader.conf's `DEVICENAME`.
+/// Overrides the socket path: the Nix modules set it to the path they wrote
+/// into reader.conf's `DEVICENAME`.
+pub const SOCKET_ENV: &str = "TAPBRIDGE_IFD_SOCKET";
+
+/// Where this user's IFD socket lives. Linux default:
+/// `$XDG_RUNTIME_DIR/tapbridge/ifd.sock`; a hand-written reader.conf must
+/// name the same path as `DEVICENAME unix:<path>` (or set [`SOCKET_ENV`]).
 pub fn socket_path() -> PathBuf {
+    if let Some(path) = std::env::var_os(SOCKET_ENV).filter(|path| !path.is_empty()) {
+        return PathBuf::from(path);
+    }
     #[cfg(target_os = "macos")]
     {
         PathBuf::from(MAC_SOCKET_PATH)
@@ -85,9 +93,18 @@ pub fn listen(path: &Path) -> io::Result<UnixListener> {
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_MODE))?;
     Ok(listener)
 }
+
+/// macOS: pcscd runs as root, so only the owner needs the socket. Linux:
+/// pcscd runs as its own unprivileged user (NixOS: `pcscd`), which reaches
+/// the socket through the group of the directory the NixOS module makes
+/// (setgid `pcscd`, no access for anyone else).
+#[cfg(target_os = "macos")]
+const SOCKET_MODE: u32 = 0o600;
+#[cfg(not(target_os = "macos"))]
+const SOCKET_MODE: u32 = 0o660;
 
 /// How long a transmit to the always-present card waits for a tap.
 const VIRTUAL_WAIT: Duration = Duration::from_secs(25);

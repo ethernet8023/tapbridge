@@ -454,7 +454,12 @@ fn managed_apply() -> bool {
         crate::pcsc_reader::ALWAYS_PRESENT.set_enabled(app.always_present);
         true
     }
-    #[cfg(not(target_os = "macos"))]
+    // The Nix units start the app themselves and set the settings.
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::managed()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     false
 }
 

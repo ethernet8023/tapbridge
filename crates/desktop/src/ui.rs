@@ -1864,11 +1864,26 @@ fn card_button(
         .child(label.into())
 }
 
-/// The nix-darwin guide in the tapbridge repo.
+/// The guide for the Nix setup that manages the settings, in the tapbridge repo.
+#[cfg(not(target_os = "linux"))]
 pub const MANAGED_GUIDE: &str =
     "https://github.com/ethernet8023/tapbridge/blob/main/docs/nix-darwin.md";
+#[cfg(target_os = "linux")]
+pub const MANAGED_GUIDE: &str =
+    "https://github.com/ethernet8023/tapbridge/blob/main/docs/nixos.md";
 
-/// Shown above the (grayed out) settings when nix-darwin manages them.
+/// What manages the settings, as the notice names it.
+#[cfg(not(target_os = "linux"))]
+const MANAGED_BY: &str = "nix-darwin";
+#[cfg(target_os = "linux")]
+const MANAGED_BY: &str = "Nix";
+
+#[cfg(not(target_os = "linux"))]
+const MANAGED_WHERE: &str = "programs.tapbridge in your nix-darwin config";
+#[cfg(target_os = "linux")]
+const MANAGED_WHERE: &str = "services.tapbridge (NixOS) or programs.tapbridge (Home Manager)";
+
+/// Shown above the (grayed out) settings when Nix manages them.
 fn managed_notice(cx: &mut App) -> impl IntoElement {
     glass::panel("managed", 14.0, cx)
         .id("managed")
@@ -1882,13 +1897,13 @@ fn managed_notice(cx: &mut App) -> impl IntoElement {
             div()
                 .text_size(px(15.0))
                 .font_weight(gpui::FontWeight::MEDIUM)
-                .child("Managed by nix-darwin"),
+                .child(format!("Managed by {MANAGED_BY}")),
         )
         .child(
             div()
                 .text_size(px(12.5))
                 .text_color(rgb(ACCENT_SOFT))
-                .child("Change these settings in programs.tapbridge in your nix-darwin config. Open the guide →"),
+                .child(format!("Change these settings in {MANAGED_WHERE}. Open the guide →")),
         )
         .on_click(|_, _, cx| cx.open_url(MANAGED_GUIDE))
 }
