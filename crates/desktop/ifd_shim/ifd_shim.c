@@ -110,8 +110,25 @@ static int read_all(int fd, unsigned char *buf, size_t len)
     return 0;
 }
 
+/*
+ * Per-reader socket path. pcscd's IFDHandler ABI carries no context pointer,
+ * so the only way to give each reader its own daemon is a table keyed by Lun.
+ * Linux: reader.conf's DEVICENAME is the socket path (IFDHCreateChannelByName).
+ * macOS never passes a path-shaped name, so it keeps TB_SOCKET_PATH.
+ */
+#define TB_MAX_LUN 32
+static char tb_paths[TB_MAX_LUN][sizeof(((struct sockaddr_un *)0)->sun_path)];
+
+static const char *tb_path_for(DWORD Lun)
+{
+    DWORD slot = Lun >> 16; /* pcscd Lun = reader index << 16 | slot */
+    if (slot < TB_MAX_LUN && tb_paths[slot][0])
+        return tb_paths[slot];
+    return TB_SOCKET_PATH;
+}
+
 /* Connects to the daemon socket; -1 on failure. */
-static int tb_connect(void)
+static int tb_connect(const char *path)
 {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un addr;
@@ -119,7 +136,7 @@ static int tb_connect(void)
         return -1;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, TB_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(fd);
         return -1;
@@ -133,7 +150,7 @@ static int tb_connect(void)
  * `out_cap`), sets *out_len. Returns 0 on success; the protocol status
  * byte is returned through *status.
  */
-static int tb_roundtrip(unsigned char cmd, const unsigned char *payload,
+static int tb_roundtrip(DWORD Lun, unsigned char cmd, const unsigned char *payload,
                         uint32_t payload_len, unsigned char *out,
                         uint32_t out_cap, uint32_t *out_len, unsigned char *status)
 {
@@ -144,7 +161,7 @@ static int tb_roundtrip(unsigned char cmd, const unsigned char *payload,
 
     if (payload_len + 1 > TB_MAX_BODY)
         return -1;
-    fd = tb_connect();
+    fd = tb_connect(tb_path_for(Lun));
     if (fd < 0)
         return -1;
 
@@ -205,8 +222,11 @@ RESPONSECODE IFDHCreateChannel(DWORD Lun, DWORD Channel)
 
 RESPONSECODE IFDHCreateChannelByName(DWORD Lun, LPSTR DeviceName)
 {
-    (void)Lun;
-    (void)DeviceName;
+    DWORD slot = Lun >> 16;
+    if (slot < TB_MAX_LUN && DeviceName && DeviceName[0] == '/') {
+        strncpy(tb_paths[slot], DeviceName, sizeof(tb_paths[slot]) - 1);
+        tb_paths[slot][sizeof(tb_paths[slot]) - 1] = 0;
+    }
     return IFD_SUCCESS;
 }
 
@@ -226,7 +246,7 @@ RESPONSECODE IFDHGetCapabilities(DWORD Lun, DWORD Tag, PDWORD Length, PUCHAR Val
         unsigned char atr[MAX_ATR_SIZE];
         uint32_t atr_len = 0;
         unsigned char status;
-        if (tb_roundtrip(TB_CMD_ATR, NULL, 0, atr, sizeof(atr), &atr_len, &status) < 0)
+        if (tb_roundtrip(Lun, TB_CMD_ATR, NULL, 0, atr, sizeof(atr), &atr_len, &status) < 0)
             return IFD_COMMUNICATION_ERROR;
         if (status != TB_OK || atr_len == 0)
             return IFD_ICC_NOT_PRESENT;
@@ -302,14 +322,14 @@ RESPONSECODE IFDHPowerICC(DWORD Lun, DWORD Action, PUCHAR Atr, PDWORD AtrLength)
         return IFD_COMMUNICATION_ERROR;
     switch (Action) {
     case IFD_POWER_UP:
-        rc = tb_roundtrip(TB_CMD_POWER_ON, NULL, 0, atr, sizeof(atr), &atr_len, &status);
+        rc = tb_roundtrip(Lun, TB_CMD_POWER_ON, NULL, 0, atr, sizeof(atr), &atr_len, &status);
         break;
     case IFD_RESET:
         /* A cold reset on the phone path is a fresh power on. */
-        rc = tb_roundtrip(TB_CMD_POWER_ON, NULL, 0, atr, sizeof(atr), &atr_len, &status);
+        rc = tb_roundtrip(Lun, TB_CMD_POWER_ON, NULL, 0, atr, sizeof(atr), &atr_len, &status);
         break;
     case IFD_POWER_DOWN:
-        rc = tb_roundtrip(TB_CMD_POWER_OFF, NULL, 0, NULL, 0, &out_len, &status);
+        rc = tb_roundtrip(Lun, TB_CMD_POWER_OFF, NULL, 0, NULL, 0, &out_len, &status);
         *AtrLength = 0;
         if (rc < 0)
             return IFD_COMMUNICATION_ERROR;
@@ -357,7 +377,7 @@ RESPONSECODE IFDHTransmitToICC(DWORD Lun, SCARD_IO_HEADER SendPci, PUCHAR TxBuff
     (void)SendPci;
     if (TxLength > TB_MAX_BODY)
         return IFD_COMMUNICATION_ERROR;
-    rc = tb_roundtrip(TB_CMD_TRANSMIT, TxBuffer, TxLength, RxBuffer, *RxLength, &rx_len, &status);
+    rc = tb_roundtrip(Lun, TB_CMD_TRANSMIT, TxBuffer, TxLength, RxBuffer, *RxLength, &rx_len, &status);
     if (rc < 0) {
         *RxLength = 0;
         return IFD_COMMUNICATION_ERROR;
@@ -380,7 +400,7 @@ RESPONSECODE IFDHICCPresence(DWORD Lun)
     unsigned char status, data[1];
     uint32_t data_len = 0;
     (void)Lun;
-    if (tb_roundtrip(TB_CMD_PRESENCE, NULL, 0, data, sizeof(data), &data_len, &status) < 0)
+    if (tb_roundtrip(Lun, TB_CMD_PRESENCE, NULL, 0, data, sizeof(data), &data_len, &status) < 0)
         return IFD_COMMUNICATION_ERROR;
     if (status == TB_OK)
         return IFD_ICC_PRESENT;

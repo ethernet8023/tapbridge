@@ -105,6 +105,14 @@
           ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
             (repoScript "build-and-run-macos-pkg" "run-macos.sh")
           ];
+          # Linux desktop build inputs (gpui + tray-icon); the dlopen'd ones also
+          # go on LD_LIBRARY_PATH so `cargo run` finds them.
+          linuxLibs = with pkgs; [
+            gtk3 libayatana-appindicator glib cairo pango gdk-pixbuf atk xdotool
+            wayland libxkbcommon vulkan-loader fontconfig freetype openssl
+            libxcb libx11 libxcursor libxi libxrandr udev pcsclite
+          ];
+          isLinux = pkgs.stdenv.hostPlatform.isLinux;
         in
         {
           default = pkgs.mkShell {
@@ -114,7 +122,8 @@
               jdk
               android.androidsdk
               android.platform-tools
-            ] ++ commands;
+            ] ++ commands ++ pkgs.lib.optionals isLinux ([ pkgs.pkg-config ] ++ linuxLibs);
+            LD_LIBRARY_PATH = pkgs.lib.optionalString isLinux (pkgs.lib.makeLibraryPath linuxLibs);
             JAVA_HOME = jdk.home;
             ANDROID_HOME = sdk;
             ANDROID_SDK_ROOT = sdk;
