@@ -29,34 +29,34 @@ Verified so far: `nix develop -c cargo check -p tapbridge-host` is clean on x86_
 - reader.conf-only loading WORKS. A `reader.conf.d/` entry (`FRIENDLYNAME`/`DEVICENAME`/`LIBPATH`/`CHANNELID`) makes pcscd 2.4.1 load `ifd_shim.c` built as a plain `.so` with no USB device. `pcsc_scan` showed `tapbridge`, "Card inserted", and the ATR from a stub unix-socket server speaking the real ifd framing. This ran in a throwaway user+mount namespace, not as real root pcscd, so polkit and the real service user are still untested (step 5's VM test covers them).
 - Shim change: the socket path now comes from `DEVICENAME` (`IFDHCreateChannelByName`), stored in a table keyed by `Lun >> 16` (pcscd's Lun is `reader_index << 16 | slot`). It falls back to the old `/var/tmp` path when the name is not a path, so macOS is unchanged.
 
-### 2. Shared PC/SC reader (half a day)
+### 2. Shared PC/SC reader: DONE (half a day)
 - Remove `cfg(macos)` from `host/src/ifd.rs` (pure codec).
 - Move the socket server and wake-on-PowerOn out of `desktop/src/macos.rs` into `desktop/src/pcsc_reader.rs`, used by mac and Linux. The socket path is a parameter, not a const (no global).
 - `ifd_shim/build.sh`: `--linux` target producing `libtapbridge_ifd.so`. Verify the exported IFDHandler symbols as the mac script does.
 - Test: codec unit tests stay. Add a socket-server test with a fake `ServiceHandle`.
 
-### 3. Linux desktop shell (1 day)
+### 3. Linux desktop shell: DONE (1 day)
 - `state_dir()` -> `$XDG_STATE_HOME/tapbridge`.
 - `autostart.rs`: XDG autostart `.desktop` (non-Nix users); the nix modules use a systemd user unit instead, so it reports "managed by Nix" in Settings (mirrors darwin module's behavior).
 - `hostname.rs`, `login.rs` (smart-card login = PAM `pam_pkcs11`/`pam_p11`, out of scope; show nothing), `assets.rs`, tray.
 - `host/state.rs`: Secret Service backend (decision 4).
 - `usb_link.rs`: nusb AOA on Linux. Needs udev (step 5); handle permission-denied with an actionable log line ("install the udev rules").
 
-### 4. Virtual security key via uhid (1 day)
+### 4. Virtual security key via uhid: DONE (1 day)
 - New `desktop/src/uhid_key.rs`: create the device through `/dev/uhid` (try the `uhid-virt` crate; if it drags in too much, ~150 lines of raw `libc` over the `uhid_event` struct). New VID/PID distinct from the reader's `0x1209/0x7A71`.
 - Output reports -> `Engine`; Engine reports -> `UHID_INPUT2`. Keepalives while waiting for a tap.
-- Apply 3b lifecycle rules (open count, idle eviction, channel cap).
+- Apply 3b lifecycle rules. Correction found while building: `ctaphid::Engine` serves one transaction at a time and has no channel table, so there is nothing to evict or cap; open/close counting is kept and cancels a request still waiting for a tap.
 - Missing `/dev/uhid` access: skip the device (log once), like mac does without its entitlement.
 - Test: a unit test that drives the uhid backend over a mock `/dev/uhid` fd (socketpair) for INIT + CBOR GetInfo through the real `Engine`.
 
-### 5. Packaging (1 day)
+### 5. Packaging: DONE (1 day)
 - `nix/package.nix`: Linux build (desktop binary, the `.so`, udev rules file, `.desktop`, icons). Add Linux to `packages`/`apps`/`checks` in `flake.nix`.
 - `udev/70-tapbridge.rules`: `uhid` access via `TAG+="uaccess"`; the hidraw node for our VID/PID `TAG+="uaccess"` (browsers need it); the AOA phone PIDs for nusb.
 - `nix/nixos-module.nix` (`services.tapbridge`): `enable`, `package`, `users` (list: gets reader.conf entries + group), `settings` (same options as the darwin module where they apply). Sets `services.pcscd.enable = true`, `services.pcscd.readerConfig` (one entry per user, `DEVICENAME` = that user's socket), `services.udev.packages`, a polkit rule allowing those users `org.debian.pcsc-lite.access_pcsc` (pcscd's polkit gate), and `systemd.user.services.tapbridge`.
 - `nix/home-module.nix` (`programs.tapbridge`): `enable`, `package`, `settings`, `systemd.user.services.tapbridge` bound to `graphical-session.target`. Assertion/warning when the NixOS module isn't present on the host, since the reader needs system setup.
 - Extend `options-doc.nix` / `splice-doc.py` so `docs/nixos.md` and `docs/home-manager.md` get generated tables, and the CI `docs` check covers them.
 
-### 6. Verification + CI (half a day)
+### 6. Verification + CI: DONE (half a day)
 - NixOS VM test (`checks.x86_64-linux.vm`): pcscd + module enabled + a scripted fake phone -> `opensc-tool -r tapbridge --send-apdu ...` returns the scripted R-APDU; `fido2-token -L` lists the uhid key and `fido2-token -I` reaches GetInfo through to the fake card. This is the real end-to-end, not a mock layer.
 - `build.yml`: add a Linux job: tests, clippy, `nix build .#tapbridge`, `nix flake check`.
 - Gates run on real hardware (reported separately, not claimed): real phone over iroh, real phone over USB AOA, Firefox WebAuthn against a real site, pcscd with a real PIV card.
@@ -66,3 +66,16 @@ About 4 to 5 days total. Biggest uncertainty: step 1 (gpui/tray on Linux, reader
 
 ## Not in scope
 Smart-card login on Linux (PAM), Wayland screenshot tooling, non-Nix distro packages (deb/rpm/AppImage). XDG autostart + udev rules file are provided so those are easy later.
+
+## Findings while building (they changed the design above)
+
+Found by the NixOS VM test and a rootless pcscd run, none visible from reading code:
+- `DEVICENAME` is `unix:<socket path>`, not a bare path: pcscd `stat()`s a name without a `:` when it starts, and refuses to start if the app is not running yet. The shim strips `unix:` and ignores any other name (nix-darwin passes `/dev/null`).
+- An unreachable daemon answers "no card" to the first presence check; otherwise pcscd removes the reader for good.
+- NixOS runs pcscd as the unprivileged user `pcscd`: the socket directory is `2750 <user>:pcscd` and the socket is 0660 (macOS keeps 0600, its pcscd is root).
+- On Linux pcsc-lite's `DWORD` is 8 bytes (`unsigned long`); the shim's 32-bit typedefs shifted every `IFDHTransmitToICC` argument. Now `#ifdef __APPLE__`.
+- `/dev/uhid` needs the `uhid` kernel module loaded; the NixOS module loads it.
+- `ctaphid::Engine` has no channel table, so there was nothing to evict or cap (step 4).
+- The Linux package is a dream2nix `rust-crane` build (dependencies once, our crates separately), so edits to our code do not recompile the dependency tree.
+
+`nix build .#checks.x86_64-linux.vm -L` runs all five VM subtests green: socket directory, pcscd reader, APDU as a user without a session, udev tag on `/dev/uhid`, and `fido2-token` (libfido2) listing the virtual key and reading its GetInfo through the real kernel.

@@ -1,5 +1,7 @@
 # Builds every app on every push to main and every pull request:
 #   nix-docs the nix-darwin options table matches the module
+#   Linux    tests + clippy, nix build of the app, options tables, and the
+#            NixOS VM test (pcscd reader, virtual security key, udev)
 #   macOS    tests + clippy, tapbridge.app + IFD bundle -> unsigned .pkg
 #   Windows  tests (x64), tapbridge.exe + Inno Setup installer (x64, arm64)
 #   Android  unit tests, debug APK with the Rust JNI library (16 KB checked),
@@ -40,6 +42,26 @@ jobs:
             echo "::error file=docs/nix-darwin.md::out of date with nix/darwin-module.nix; run: nix run .#docs"
             exit 1
           }
+
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: DeterminateSystems/determinate-nix-action@v3
+      # The VM test needs KVM, which the runner has but does not let us open.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Test
+        run: nix develop -c cargo test --workspace --locked
+      - name: Clippy
+        run: nix develop -c cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Build the app
+        run: nix build .#tapbridge -L
+      - name: Docs tables are up to date, and the NixOS VM test passes
+        run: nix flake check -L
 
   macos:
     runs-on: macos-26
