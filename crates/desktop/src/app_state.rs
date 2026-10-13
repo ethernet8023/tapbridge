@@ -519,7 +519,7 @@ fn spawn_service(state_dir: PathBuf, trace: bool, events: mpsc::Sender<UiEvent>)
                 crate::usb_link::spawn(handle.clone(), runtime.handle().clone());
                 #[cfg(unix)]
                 spawn_ifd_server(&handle, &events);
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 spawn_security_key(&handle, &events);
                 let _ = events.send(UiEvent::ServiceStarted(handle));
                 // The service tasks live on this runtime until the process exits.
@@ -558,9 +558,9 @@ fn spawn_ifd_server(handle: &ServiceHandle, events: &mpsc::Sender<UiEvent>) {
     }
 }
 
-/// macOS: the virtual FIDO security key browsers talk to. A request with
-/// no card on the phone asks for a tap the same way PC/SC does.
-#[cfg(target_os = "macos")]
+/// macOS and Linux: the virtual FIDO security key browsers talk to. A
+/// request with no card on the phone asks for a tap the same way PC/SC does.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn spawn_security_key(handle: &ServiceHandle, events: &mpsc::Sender<UiEvent>) {
     let events = events.clone();
     let started = crate::security_key::spawn(
