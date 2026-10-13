@@ -13,6 +13,10 @@ mod mac_security;
 mod macos;
 #[cfg(target_os = "macos")]
 mod security_key;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(unix)]
+mod pcsc_reader;
 
 mod about;
 mod app_state;
@@ -52,9 +56,9 @@ fn state_dir() -> PathBuf {
     {
         macos::state_dir()
     }
-    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[cfg(target_os = "linux")]
     {
-        PathBuf::from("tapbridge-state")
+        linux::state_dir()
     }
 }
 

@@ -98,7 +98,7 @@ struct Shell {
     /// Start-at-login state, cached: Settings re-renders from it every tick.
     autostart: bool,
     /// macOS: the login card always shows as present (see
-    /// [`crate::macos::AlwaysPresent`]).
+    /// [`crate::pcsc_reader::AlwaysPresent`]).
     always_present: bool,
     /// macOS: the smart card settings, once read.
     security: Option<ui::Security>,
@@ -451,7 +451,7 @@ fn managed_apply() -> bool {
             let result = autostart::set_enabled(false);
             logging::log(&format!("nix-darwin: removing our LaunchAgent: {result:?}"));
         }
-        crate::macos::ALWAYS_PRESENT.set_enabled(app.always_present);
+        crate::pcsc_reader::ALWAYS_PRESENT.set_enabled(app.always_present);
         true
     }
     #[cfg(not(target_os = "macos"))]
@@ -481,12 +481,12 @@ fn always_present_load(state_dir: &std::path::Path) -> bool {
     #[cfg(target_os = "macos")]
     {
         if let Some((_, app)) = crate::mac_security::managed() {
-            crate::macos::ALWAYS_PRESENT.load_cache(state_dir);
+            crate::pcsc_reader::ALWAYS_PRESENT.load_cache(state_dir);
             return app.always_present;
         }
-        let enabled = crate::macos::always_present_saved(state_dir);
-        crate::macos::ALWAYS_PRESENT.load_cache(state_dir);
-        crate::macos::ALWAYS_PRESENT.set_enabled(enabled);
+        let enabled = crate::pcsc_reader::always_present_saved(state_dir);
+        crate::pcsc_reader::ALWAYS_PRESENT.load_cache(state_dir);
+        crate::pcsc_reader::ALWAYS_PRESENT.set_enabled(enabled);
         enabled
     }
     #[cfg(not(target_os = "macos"))]
@@ -517,7 +517,7 @@ fn spawn_service(state_dir: PathBuf, trace: bool, events: mpsc::Sender<UiEvent>)
         match started {
             Ok(handle) => {
                 crate::usb_link::spawn(handle.clone(), runtime.handle().clone());
-                #[cfg(target_os = "macos")]
+                #[cfg(unix)]
                 spawn_ifd_server(&handle, &events);
                 #[cfg(target_os = "macos")]
                 spawn_security_key(&handle, &events);
@@ -532,23 +532,24 @@ fn spawn_service(state_dir: PathBuf, trace: bool, events: mpsc::Sender<UiEvent>)
     });
 }
 
-/// macOS: serve the PC/SC IFD shim socket on a dedicated thread. The wake
-/// callback routes into the UI tick loop, reusing the exact tray
+/// macOS and Linux: serve the PC/SC IFD shim socket on a dedicated thread.
+/// The wake callback routes into the UI tick loop, reusing the exact tray
 /// "Request tap" path (ReadCard on a live session, else relay POST).
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn spawn_ifd_server(handle: &ServiceHandle, events: &mpsc::Sender<UiEvent>) {
-    match macos::listen() {
+    let path = crate::pcsc_reader::socket_path();
+    match crate::pcsc_reader::listen(&path) {
         Ok(listener) => {
             let service = handle.clone();
             let events = events.clone();
             std::thread::spawn(move || {
-                macos::serve(
+                crate::pcsc_reader::serve(
                     listener,
                     service,
                     move || {
                         let _ = events.send(UiEvent::WakeRequested);
                     },
-                    &macos::ALWAYS_PRESENT,
+                    &crate::pcsc_reader::ALWAYS_PRESENT,
                 );
             });
             logging::log("ifd: PC/SC reader socket listening");
@@ -1094,10 +1095,10 @@ fn settings_action(action: ui::SettingsAction, cx: &mut App) {
                 if shell.managed {
                     return;
                 }
-                let result = crate::macos::always_present_save(&shell.state_dir, enabled);
+                let result = crate::pcsc_reader::always_present_save(&shell.state_dir, enabled);
                 logging::log(&format!("always-present card -> {enabled}: {result:?}"));
                 if result.is_ok() {
-                    crate::macos::ALWAYS_PRESENT.set_enabled(enabled);
+                    crate::pcsc_reader::ALWAYS_PRESENT.set_enabled(enabled);
                     shell.always_present = enabled;
                 }
             });
@@ -1408,7 +1409,7 @@ impl Shell {
         }
         // The always-present card is the one paired with this Mac's login.
         #[cfg(target_os = "macos")]
-        crate::macos::ALWAYS_PRESENT.set_atr(
+        crate::pcsc_reader::ALWAYS_PRESENT.set_atr(
             self.cards
                 .iter()
                 .rev()
@@ -1568,7 +1569,7 @@ impl Shell {
         #[cfg(not(windows))]
         lines.push(format!(
             "PC/SC reader: {} (virtual PIV reader)",
-            crate::macos::IFD_SOCKET_PATH
+            crate::pcsc_reader::socket_path().display()
         ));
         match self.service.as_ref().map(ServiceHandle::status) {
             Some(status) => {

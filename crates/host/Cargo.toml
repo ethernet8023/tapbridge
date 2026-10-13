@@ -34,6 +34,12 @@ security-framework = { version = "3", features = ["OSX_10_15"] }
 security-framework-sys = "2.17"
 core-foundation = "0.10"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+aes-gcm = "0.10"
+# Sync Secret Service client (gnome-keyring, KWallet, KeePassXC). Pure-Rust
+# crypto so the build needs no libdbus/openssl.
+keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+
 [features]
 # Exposes the software FIDO2 authenticator (ctap_pin::fake) to other crates' tests.
 test-support = []

@@ -110,7 +110,7 @@
           linuxLibs = with pkgs; [
             gtk3 libayatana-appindicator glib cairo pango gdk-pixbuf atk xdotool
             wayland libxkbcommon vulkan-loader fontconfig freetype openssl
-            libxcb libx11 libxcursor libxi libxrandr udev pcsclite
+            libxcb libx11 libxcursor libxi libxrandr udev pcsclite dbus
           ];
           isLinux = pkgs.stdenv.hostPlatform.isLinux;
         in

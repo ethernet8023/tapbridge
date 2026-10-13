@@ -6,8 +6,23 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-CC="${CC:-clang}"
 DIST="dist"
+
+# Linux: a plain shared object; pcscd loads it from a reader.conf.d entry
+# (see docs/nixos.md), so there is no bundle or Info.plist.
+if [ "$(uname -s)" = Linux ]; then
+    CC="${CC:-cc}"
+    mkdir -p "$DIST"
+    $CC -shared -O2 -fPIC -Wall -Wextra -o "$DIST/libtapbridge_ifd.so" ifd_shim.c
+    for symbol in IFDHCreateChannelByName IFDHICCPresence IFDHTransmitToICC \
+        IFDHPowerICC IFDHGetCapabilities IFDHControl; do
+        nm -gD "$DIST/libtapbridge_ifd.so" | grep -q "$symbol"
+    done
+    echo "built $DIST/libtapbridge_ifd.so"
+    exit 0
+fi
+
+CC="${CC:-clang}"
 BUNDLE="$DIST/tapbridge.bundle"
 
 rm -rf "$BUNDLE"
