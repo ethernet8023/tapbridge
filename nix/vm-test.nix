@@ -26,7 +26,7 @@ pkgs.testers.runNixOSTest {
       isNormalUser = true;
       uid = 1000;
     };
-    environment.systemPackages = [ pkgs.opensc pkgs.pcsc-tools pkgs.libfido2 pkgs.python3 tests ];
+    environment.systemPackages = [ pkgs.opensc pkgs.pcsc-tools pkgs.libfido2 pkgs.python3 pkgs.binutils tests ];
   };
 
   testScript = ''
@@ -49,6 +49,11 @@ pkgs.testers.runNixOSTest {
         print(machine.succeed("tail -n 20 /tmp/stub.log"))
         assert code == 0, out
         assert "SW1=0x90, SW2=0x00" in out, out
+
+    with subtest("the app can find the libraries it loads at run time (tray, wayland, vulkan)"):
+        runpath = machine.succeed("readelf -d $(readlink -f $(which tapbridge)) | grep -E 'RUNPATH|RPATH'")
+        for lib in ["libayatana-appindicator", "wayland", "libxkbcommon", "vulkan-loader"]:
+            assert lib in runpath, f"{lib} missing from {runpath}"
 
     with subtest("udev gives the logged-in user the key's device nodes"):
         print(machine.succeed("ls -l /dev/uhid; udevadm info /dev/uhid"))

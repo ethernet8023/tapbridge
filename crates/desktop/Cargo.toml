@@ -45,6 +45,10 @@ windows-sys = { version = "0.61", features = [
 [target.'cfg(unix)'.dependencies]
 iroh.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# tray-icon's menu is GTK: it must be initialized and its events pumped (tray.rs).
+gtk = "0.18"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = [

@@ -53,6 +53,16 @@ const COMMAND: Modifiers = if cfg!(target_os = "macos") {
     Modifiers::CONTROL
 };
 
+/// Linux: the tray and its menu are GTK objects, and gpui does not run a GTK
+/// main loop, so the UI tick runs the pending GTK events (the menu's D-Bus
+/// traffic, clicks) itself. A no-op elsewhere.
+pub fn pump_gtk() {
+    #[cfg(target_os = "linux")]
+    while gtk::events_pending() {
+        gtk::main_iteration_do(false);
+    }
+}
+
 pub struct Tray {
     tray: TrayIcon,
     status_item: MenuItem,
@@ -68,6 +78,9 @@ pub struct Tray {
 
 impl Tray {
     pub fn new(icons: assets::Icons) -> Result<Self, String> {
+        // tray-icon's menu is made of GTK widgets, which need GTK initialized.
+        #[cfg(target_os = "linux")]
+        gtk::init().map_err(|error| format!("gtk init: {error}"))?;
         let status_item = MenuItem::with_id("status", "tapbridge starting", false, None);
         // macOS gets an SF Symbol gear below; the native icon is the Windows
         // Settings stock icon (and the AppKit fallback).

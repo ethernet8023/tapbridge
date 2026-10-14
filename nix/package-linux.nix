@@ -67,6 +67,11 @@ in
         install -Dm644 crates/desktop/assets/icons/app-$size.png \
           $out/share/icons/hicolor/''${size}x''${size}/apps/tapbridge.png
       done
+    '';
+
+    # After the fixup phase's RPATH shrink, which drops every entry the binary
+    # does not link against at build time (all of these are dlopen'd).
+    postFixup = ''
       patchelf --add-rpath ${lib.makeLibraryPath runtimeLibs} $out/bin/tapbridge
     '';
 

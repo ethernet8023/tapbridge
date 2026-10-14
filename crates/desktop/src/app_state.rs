@@ -582,6 +582,7 @@ fn spawn_security_key(handle: &ServiceHandle, events: &mpsc::Sender<UiEvent>) {
 }
 
 fn tick(inbox: &mpsc::Receiver<UiEvent>, cx: &mut App) {
+    crate::tray::pump_gtk();
     while let Ok(event) = inbox.try_recv() {
         handle_event(event, cx);
     }
