@@ -8,27 +8,27 @@ use crate::tray::TrayState;
 
 pub struct Icons {
     #[cfg(target_os = "macos")]
-    disconnected: tray_icon::Icon,
+    disconnected: gpui_tray::Icon,
     #[cfg(target_os = "macos")]
-    connected: tray_icon::Icon,
+    connected: gpui_tray::Icon,
     /// Waiting for a tap: one wave filled at a time, inner to outer.
     #[cfg(target_os = "macos")]
-    tap: [tray_icon::Icon; 3],
+    tap: [gpui_tray::Icon; 3],
     #[cfg(not(target_os = "macos"))]
-    idle: tray_icon::Icon,
+    idle: gpui_tray::Icon,
     #[cfg(not(target_os = "macos"))]
-    phone: tray_icon::Icon,
-    card: tray_icon::Icon,
-    error: tray_icon::Icon,
+    phone: gpui_tray::Icon,
+    card: gpui_tray::Icon,
+    error: gpui_tray::Icon,
 }
 
-fn load(embedded: &[u8]) -> tray_icon::Icon {
+fn load(embedded: &[u8]) -> gpui_tray::Icon {
     let decoder = png::Decoder::new(std::io::Cursor::new(embedded));
     let mut reader = decoder.read_info().expect("valid embedded icon png");
     let mut data = vec![0u8; reader.output_buffer_size().unwrap_or(0).max(1)];
     let info = reader.next_frame(&mut data).expect("png frame");
     data.truncate(info.buffer_size());
-    tray_icon::Icon::from_rgba(data, info.width, info.height).expect("valid icon")
+    gpui_tray::Icon::from_rgba(data, info.width, info.height).expect("valid icon")
 }
 
 impl Icons {
@@ -59,7 +59,7 @@ impl Icons {
 
     /// The icon for `state`; `frame` picks the waiting-for-tap animation
     /// frame (macOS only; Windows has no animation).
-    pub fn for_state(&self, state: TrayState, frame: usize) -> tray_icon::Icon {
+    pub fn for_state(&self, state: TrayState, frame: usize) -> gpui_tray::Icon {
         match state {
             TrayState::Error | TrayState::MissingUsbip => self.error.clone(),
             TrayState::Card => self.card.clone(),

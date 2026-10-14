@@ -15,18 +15,24 @@ let
     wayland
     libxkbcommon
     vulkan-loader
-    libayatana-appindicator
     libx11
     libxcb
     libxcursor
     libxi
     libxrandr
-    gtk3
   ];
+  # crane builds the dependencies from a dummy copy of the workspace (every
+  # crate of ours an empty stub), but gpui-tray, a registry crate, needs the
+  # real patched gpui-ce. Its content-addressed copy only changes when the
+  # vendored gpui does, so the dependency derivation stays cached.
+  gpuiVendor = builtins.path {
+    path = src + "/third_party/gpui-glass/vendor/gpui-ce";
+    name = "gpui-ce-vendor";
+  };
   # Both the dependencies derivation and ours compile against these.
   toolchain = {
     nativeBuildInputs = with config.deps; [ pkg-config rustPlatform.bindgenHook ];
-    buildInputs = with config.deps; [ gtk3 libayatana-appindicator dbus udev openssl fontconfig freetype ] ++ runtimeLibs;
+    buildInputs = with config.deps; [ dbus udev openssl fontconfig freetype ] ++ runtimeLibs;
   };
 in
 {
@@ -43,13 +49,18 @@ in
   deps = { nixpkgs, ... }: lib.mapAttrs (_: lib.mkDefault) {
     inherit (nixpkgs)
       stdenv pkg-config rustPlatform patchelf jq
-      gtk3 libayatana-appindicator dbus udev openssl fontconfig freetype
+      dbus udev openssl fontconfig freetype
       wayland libxkbcommon vulkan-loader libxcb libx11 libxcursor libxi libxrandr;
   };
 
   # The workspace tests need a network and pcscd: CI and the NixOS VM test run them.
   rust-crane.runTests = false;
   rust-crane.depsDrv.mkDerivation = toolchain;
+  rust-crane.depsDrv.package-func.args.extraDummyScript = ''
+    rm -rf $out/third_party/gpui-glass/vendor/gpui-ce
+    cp -r ${gpuiVendor} $out/third_party/gpui-glass/vendor/gpui-ce
+    chmod -R u+w $out/third_party/gpui-glass/vendor/gpui-ce
+  '';
 
   mkDerivation = toolchain // {
     inherit src;
@@ -96,5 +107,6 @@ in
       install -Dm755 "$exe" $out/bin/tapbridge-tests
     '';
     postInstall = "";
+    postFixup = "";
   };
 }

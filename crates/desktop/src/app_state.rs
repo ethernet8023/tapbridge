@@ -9,7 +9,7 @@ use crate::{
     autostart,
     card_tasks::{CardTask, Effect},
     hostname, logging, login,
-    tray::{MenuAction, Tray, TrayState},
+    tray::{Tray, TrayState},
     ui, wake,
 };
 #[cfg(windows)]
@@ -31,7 +31,7 @@ const USBIP_ADDR: &str = "127.0.0.1:3240";
 
 // App-wide commands: bound to ⌘, / ⌘Q (Ctrl on Windows) and, on macOS, the
 // app menu that owns those shortcuts while a tapbridge window is focused.
-gpui::actions!(tapbridge, [OpenSettings, OpenAbout, Quit]);
+gpui::actions!(tapbridge, [OpenSettings, OpenAbout, Quit, PairPhone]);
 const TICK: Duration = Duration::from_millis(100);
 /// How long the tray shows "waiting for a tap" after a wake: the phone keeps
 /// its tap gate open this long (DESIGN.md, wake step 4).
@@ -358,7 +358,7 @@ fn shell_setup(
     #[cfg(not(windows))]
     let _ = &instance;
     // Created on the gpui main thread, whose message loop pumps it.
-    let tray = Tray::new(crate::assets::Icons::load())
+    let tray = Tray::new(crate::assets::Icons::load(), cx)
         .inspect_err(|error| logging::log(&format!("tray unavailable: {error}")))
         .ok();
     let anchor = ui::open_anchor_window(cx);
@@ -398,7 +398,7 @@ fn shell_setup(
         watcher,
         _instance: Shell::instance_guard(instance),
     });
-    cx.update_global::<Shell, _>(|shell, _| shell.refresh_tray());
+    cx.update_global::<Shell, _>(|shell, cx| shell.refresh_tray(cx));
     install_commands(cx);
     cx.spawn(async move |cx: &mut AsyncApp| {
         loop {
@@ -582,7 +582,6 @@ fn spawn_security_key(handle: &ServiceHandle, events: &mpsc::Sender<UiEvent>) {
 }
 
 fn tick(inbox: &mpsc::Receiver<UiEvent>, cx: &mut App) {
-    crate::tray::pump_gtk();
     while let Ok(event) = inbox.try_recv() {
         handle_event(event, cx);
     }
@@ -685,9 +684,9 @@ fn tick(inbox: &mpsc::Receiver<UiEvent>, cx: &mut App) {
             }
             _ => {}
         }
-        cx.update_global::<Shell, _>(|shell, _| {
+        cx.update_global::<Shell, _>(|shell, cx| {
             shell.notice = None;
-            shell.refresh_tray();
+            shell.refresh_tray(cx);
         });
     }
     card_tick(cx);
@@ -701,7 +700,7 @@ fn tick(inbox: &mpsc::Receiver<UiEvent>, cx: &mut App) {
     }
     // Animate (and expire) the waiting-for-tap icon.
     if cx.global::<Shell>().waiting_since.is_some() {
-        cx.update_global::<Shell, _>(|shell, _| shell.refresh_tray());
+        cx.update_global::<Shell, _>(|shell, cx| shell.refresh_tray(cx));
     }
     // Keep an open Settings window live; prune it once closed (a failed
     // update means the window is gone).
@@ -737,21 +736,12 @@ fn tick(inbox: &mpsc::Receiver<UiEvent>, cx: &mut App) {
             + shell.about.is_some() as usize;
         macos::dock::sync(visible);
     }
-    let actions = cx
-        .global::<Shell>()
-        .tray
-        .as_ref()
-        .map(Tray::actions)
-        .unwrap_or_default();
-    for action in actions {
-        handle_action(action, cx);
-    }
 }
 
 fn handle_event(event: UiEvent, cx: &mut App) {
     match event {
         UiEvent::ServiceStarted(handle) => {
-            cx.update_global::<Shell, _>(|shell, _| {
+            cx.update_global::<Shell, _>(|shell, cx| {
                 #[cfg(target_os = "macos")]
                 if let Some((security, app)) = crate::mac_security::managed() {
                     // nix-darwin's module asserts this pairing; a hand-edited
@@ -773,15 +763,15 @@ fn handle_event(event: UiEvent, cx: &mut App) {
                         let _ = events.send(UiEvent::UsbipAttached(result));
                     });
                 }
-                shell.refresh_tray();
+                shell.refresh_tray(cx);
             });
         }
         UiEvent::ServiceFailed(error) => {
             logging::log(&format!("service failed: {error}"));
-            cx.update_global::<Shell, _>(|shell, _| {
+            cx.update_global::<Shell, _>(|shell, cx| {
                 shell.service_error = Some(error);
                 shell.notice = Some("tapbridge failed to start".into());
-                shell.refresh_tray();
+                shell.refresh_tray(cx);
             });
         }
         #[cfg(windows)]
@@ -796,7 +786,7 @@ fn handle_event(event: UiEvent, cx: &mut App) {
                 } else {
                     Usbip::Failed
                 };
-                shell.refresh_tray();
+                shell.refresh_tray(cx);
             });
         }
         #[cfg(windows)]
@@ -828,7 +818,7 @@ fn handle_event(event: UiEvent, cx: &mut App) {
                     Some(format!("Wake failed: {reason}"))
                 }
             };
-            cx.update_global::<Shell, _>(|shell, _| {
+            cx.update_global::<Shell, _>(|shell, cx| {
                 if notice.is_some() {
                     shell.waiting_since = None;
                     if let Some(task) = shell.card_task.as_mut() {
@@ -836,7 +826,7 @@ fn handle_event(event: UiEvent, cx: &mut App) {
                     }
                 }
                 shell.notice = notice;
-                shell.refresh_tray();
+                shell.refresh_tray(cx);
             });
         }
         UiEvent::LoginDone(ok, text) => {
@@ -986,18 +976,10 @@ fn run_card_effect(effect: Effect, cx: &mut App) {
     }
 }
 
-fn handle_action(action: MenuAction, cx: &mut App) {
-    match action {
-        MenuAction::Pair => open_pairing(cx),
-        MenuAction::OpenSettings => open_settings(cx),
-        MenuAction::About => open_about(cx),
-        MenuAction::Quit => quit(cx),
-    }
-}
-
 /// Registers the app-wide commands, their shortcuts and (macOS) the app menu.
 fn install_commands(cx: &mut App) {
     cx.on_action(|_: &OpenSettings, cx| open_settings(cx));
+    cx.on_action(|_: &PairPhone, cx| open_pairing(cx));
     cx.on_action(|_: &Quit, cx| quit(cx));
     cx.on_action(|_: &OpenAbout, cx| open_about(cx));
     crate::text_input::bind_keys(cx);
@@ -1064,11 +1046,11 @@ fn settings_action(action: ui::SettingsAction, cx: &mut App) {
         ui::SettingsAction::Pair => open_pairing(cx),
         ui::SettingsAction::Forget => {
             logging::log("forget: revoking paired phone");
-            cx.update_global::<Shell, _>(|shell, _| {
+            cx.update_global::<Shell, _>(|shell, cx| {
                 if let Some(service) = shell.service.as_ref() {
                     service.forget_phone();
                 }
-                shell.refresh_tray();
+                shell.refresh_tray(cx);
             });
         }
         ui::SettingsAction::SetUseUsb(enabled) => {
@@ -1080,11 +1062,11 @@ fn settings_action(action: ui::SettingsAction, cx: &mut App) {
                 return;
             }
             logging::log(&format!("use usb cable -> {enabled}"));
-            cx.update_global::<Shell, _>(|shell, _| {
+            cx.update_global::<Shell, _>(|shell, cx| {
                 if let Some(service) = shell.service.as_ref() {
                     service.set_use_usb(enabled);
                 }
-                shell.refresh_tray();
+                shell.refresh_tray(cx);
             });
         }
         ui::SettingsAction::SetAutostart(enabled) => {
@@ -1319,7 +1301,7 @@ fn check_login(uid: Vec<u8>, cx: &mut App) {
 fn request_tap(cx: &mut App) -> bool {
     // A phone on the cable is switched over only now (it opens the app).
     crate::usb_link::want_phone();
-    cx.update_global::<Shell, _>(|shell, _| {
+    cx.update_global::<Shell, _>(|shell, cx| {
         let Some(service) = shell.service.as_ref() else {
             logging::log("wake: service not running");
             return false;
@@ -1357,7 +1339,7 @@ fn request_tap(cx: &mut App) -> bool {
         };
         let sent = notice.is_none();
         shell.notice = notice;
-        shell.refresh_tray();
+        shell.refresh_tray(cx);
         sent
     })
 }
@@ -1462,7 +1444,7 @@ impl Shell {
             .collect()
     }
 
-    fn refresh_tray(&mut self) {
+    fn refresh_tray(&mut self, cx: &mut App) {
         let status = self.service.as_ref().map(ServiceHandle::status);
         if let Some(since) = self.waiting_since
             && (since.elapsed() >= TAP_WAIT || status.as_ref().is_some_and(|s| s.card_present))
@@ -1479,7 +1461,7 @@ impl Shell {
             && state == TrayState::Disconnected
             && status.as_ref().is_some_and(|status| !status.paired);
         if let Some(tray) = self.tray.as_mut() {
-            tray.set_status(&text, state, frame, pair_action);
+            tray.set_status(&text, state, frame, pair_action, cx);
         }
     }
 

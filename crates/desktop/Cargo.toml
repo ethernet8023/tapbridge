@@ -23,7 +23,8 @@ gpui = { package = "gpui-ce", version = "=0.2.2", default-features = false }
 gpui_platform = { package = "gpui_ce_platform", version = "=0.1.0", features = ["font-kit", "macos-wgpu"] }
 gpui-glass = { path = "../../third_party/gpui-glass/crates/gpui-glass" }
 gpui-smooth = { path = "../../third_party/gpui-glass/crates/gpui-smooth", features = ["gpui"] }
-tray-icon = "0.26"
+# One tray for macOS, Windows and Linux (StatusNotifierItem, no GTK); built on our patched gpui-ce.
+gpui-tray = { version = "0.1", default-features = false, features = ["gpui-ce", "menu-state"] }
 qrcode = { version = "0.14.1", default-features = false, features = ["image"] }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 png = "0.18"
@@ -44,10 +45,6 @@ windows-sys = { version = "0.61", features = [
 
 [target.'cfg(unix)'.dependencies]
 iroh.workspace = true
-
-[target.'cfg(target_os = "linux")'.dependencies]
-# tray-icon's menu is GTK: it must be initialized and its events pumped (tray.rs).
-gtk = "0.18"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

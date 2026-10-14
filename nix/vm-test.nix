@@ -50,9 +50,9 @@ pkgs.testers.runNixOSTest {
         assert code == 0, out
         assert "SW1=0x90, SW2=0x00" in out, out
 
-    with subtest("the app can find the libraries it loads at run time (tray, wayland, vulkan)"):
+    with subtest("the app can find the libraries it loads at run time (wayland, xkbcommon, vulkan)"):
         runpath = machine.succeed("readelf -d $(readlink -f $(which tapbridge)) | grep -E 'RUNPATH|RPATH'")
-        for lib in ["libayatana-appindicator", "wayland", "libxkbcommon", "vulkan-loader"]:
+        for lib in ["wayland", "libxkbcommon", "vulkan-loader"]:
             assert lib in runpath, f"{lib} missing from {runpath}"
 
     with subtest("udev gives the logged-in user the key's device nodes"):

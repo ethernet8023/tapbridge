@@ -200,7 +200,6 @@
           # Linux desktop build inputs (gpui + tray-icon); the dlopen'd ones also
           # go on LD_LIBRARY_PATH so `cargo run` finds them.
           linuxLibs = with pkgs; [
-            gtk3 libayatana-appindicator glib cairo pango gdk-pixbuf atk xdotool
             wayland libxkbcommon vulkan-loader fontconfig freetype openssl
             libxcb libx11 libxcursor libxi libxrandr udev pcsclite dbus
           ];
