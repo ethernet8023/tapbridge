@@ -58,6 +58,8 @@ Everything is under `services.tapbridge`. The table below is generated from the 
 | `startAtLogin` | `true` | Start at login. tapbridge starts with your graphical session, as a systemd user service. |
 | `useUsb` | `true` | Connect to phone via USB. The phone can also reach the PC over a USB cable, which works without a network. |
 | `virtualSecurityKey` | `true` | Show browsers a virtual FIDO security key (for WebAuthn and passkeys), backed by the card on your phone. This lets the logged-in user open `/dev/uhid`, which any program of theirs can also use to create virtual input devices. |
+| `pam.su` | `false` | Let a tap on your phone authenticate `su`, the same way as `pam.sudo`. |
+| `pam.sudo` | `false` | Let a tap on your phone authenticate `sudo` (through pam_u2f and the virtual security key). Needs `virtualSecurityKey`. Each user first registers the key once with `pamu2fcfg > ~/.config/Yubico/u2f_keys`; the password still works when the key is absent. |
 <!-- END generated options -->
 
 ## Home Manager

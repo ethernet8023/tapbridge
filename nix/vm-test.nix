@@ -21,6 +21,8 @@ pkgs.testers.runNixOSTest {
       enable = true;
       inherit package;
       users = [ "alice" ];
+      pam.sudo = true;
+      pam.su = true;
     };
     users.users.alice = {
       isNormalUser = true;
@@ -58,6 +60,13 @@ pkgs.testers.runNixOSTest {
     with subtest("udev gives the logged-in user the key's device nodes"):
         print(machine.succeed("ls -l /dev/uhid; udevadm info /dev/uhid"))
         machine.succeed("udevadm info /dev/uhid | grep -E 'TAGS=.*uaccess'")
+
+    with subtest("sudo and su ask pam_u2f first, and the password stays a fallback"):
+        for service in ["sudo", "su"]:
+            line = machine.succeed(f"grep pam_u2f /etc/pam.d/{service}")
+            assert "sufficient" in line, line
+            assert "cue" in line, line
+        machine.succeed("! grep -q pam_u2f /etc/pam.d/login")
 
     with subtest("libfido2 sees and talks to the virtual key through the real kernel"):
         machine.succeed("tapbridge-tests --ignored --exact security_key::uhid_live_tests::libfido2_reads_get_info_through_the_real_kernel --nocapture")

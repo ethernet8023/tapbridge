@@ -52,6 +52,27 @@ in
         virtual input devices.
       '';
     };
+
+    pam = {
+      sudo = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Let a tap on your phone authenticate `sudo` (through pam_u2f and the
+          virtual security key). Needs `virtualSecurityKey`. Each user first
+          registers the key once with `pamu2fcfg > ~/.config/Yubico/u2f_keys`;
+          the password still works when the key is absent.
+        '';
+      };
+
+      su = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Let a tap on your phone authenticate `su`, the same way as `pam.sudo`.
+        '';
+      };
+    };
   };
 
   config = mkIf cfg.enable {
@@ -60,7 +81,23 @@ in
         assertion = cfg.users != [ ];
         message = "services.tapbridge.users is empty: list the users who get a tapbridge reader.";
       }
+      {
+        assertion = !(cfg.pam.sudo || cfg.pam.su) || cfg.virtualSecurityKey;
+        message = "services.tapbridge.pam.sudo/su sign in with the virtual security key: set services.tapbridge.virtualSecurityKey = true.";
+      }
     ];
+
+    # pam_u2f talks to the virtual key like any other FIDO key. It stays
+    # `sufficient` (the nixpkgs default), so the password still works whenever
+    # the key is absent, such as when tapbridge isn't running.
+    # Not `security.pam.u2f.enable`: that makes every PAM service (login, sshd,
+    # the display manager) default to u2fAuth. Only the listed services get it.
+    security.pam.u2f = mkIf (cfg.pam.sudo || cfg.pam.su) {
+      # "Please touch the device": a tap on the phone is easy to miss without it.
+      settings.cue = lib.mkDefault true;
+    };
+    security.pam.services.sudo.u2fAuth = mkIf cfg.pam.sudo true;
+    security.pam.services.su.u2fAuth = mkIf cfg.pam.su true;
 
     environment.systemPackages = [ cfg.package ];
     services.udev.packages = [ udevRules ];
