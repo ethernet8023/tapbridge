@@ -45,10 +45,6 @@ menu-state = []
 name = "gpui_tray"
 path = "src/lib.rs"
 
-[[example]]
-name = "tray"
-path = "examples/tray.rs"
-
 [dependencies.async-channel]
 version = "2.5"
 
@@ -114,6 +110,7 @@ features = [
     "NSButton",
     "NSCell",
     "NSControl",
+    "NSEvent",
     "NSImage",
     "NSMenu",
     "NSMenuItem",

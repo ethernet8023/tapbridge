@@ -7,7 +7,7 @@ use std::{
 use crate::{
     Error, Icon, Result,
     backend::{BackendEvent, PlatformTray},
-    menu::{ActionTable, MenuSnapshot, compile_menu},
+    menu::{ActionTable, MenuSnapshot, compile_menu, shortcut_for},
 };
 
 type ActivateCallback = dyn Fn(Option<String>, &mut gpui::App);
@@ -34,6 +34,7 @@ pub struct TrayBuilder {
     visible: bool,
     activate_handler: Option<Box<ActivateCallback>>,
     menu_builder: Option<Box<MenuBuilder>>,
+    item_images: Vec<(String, std::sync::Arc<[u8]>)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -46,6 +47,9 @@ pub(crate) struct TraySnapshot {
     pub(crate) visible: bool,
     pub(crate) activatable: bool,
     pub(crate) menu: Option<MenuSnapshot>,
+    /// SVG images for menu items, by label (macOS; ignored elsewhere).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) item_images: Vec<(String, std::sync::Arc<[u8]>)>,
 }
 
 struct TrayInner {
@@ -136,6 +140,7 @@ impl Default for TrayBuilder {
             visible: true,
             activate_handler: None,
             menu_builder: None,
+            item_images: Vec::new(),
         }
     }
 }
@@ -200,6 +205,18 @@ impl TrayBuilder {
         self
     }
 
+    /// Shows an SVG image beside the menu item labelled `label` (macOS; ignored
+    /// elsewhere). The image is drawn as a template at menu-font size, like an
+    /// SF Symbol. Local patch: not in upstream gpui-tray 0.1.4.
+    pub fn menu_item_image(
+        mut self,
+        label: impl Into<String>,
+        svg: impl Into<std::sync::Arc<[u8]>>,
+    ) -> Self {
+        self.item_images.push((label.into(), svg.into()));
+        self
+    }
+
     /// Sets the GPUI-aware menu builder.
     pub fn menu(mut self, build: impl Fn(&mut gpui::App) -> Vec<gpui::MenuItem> + 'static) -> Self {
         self.menu_builder = Some(Box::new(build));
@@ -210,7 +227,7 @@ impl TrayBuilder {
     pub fn build(self, cx: &mut gpui::App) -> Result<Tray> {
         let generation = u64::from(self.menu_builder.is_some());
         let (menu, actions) = if let Some(build) = self.menu_builder.as_ref() {
-            let (menu, actions) = compile_menu(generation, build(cx))?;
+            let (menu, actions) = compile_menu(generation, build(cx), &|action| shortcut_for(action, cx))?;
             (Some(menu), actions)
         } else {
             (None, ActionTable::empty(generation))
@@ -225,6 +242,7 @@ impl TrayBuilder {
             visible: self.visible,
             activatable: self.activate_handler.is_some(),
             menu,
+            item_images: self.item_images,
         };
         let (events_tx, events_rx) = async_channel::unbounded();
         let backend = PlatformTray::new(&snapshot, events_tx)?;
@@ -296,7 +314,7 @@ impl TrayInner {
         };
 
         let generation = self.generation.get().wrapping_add(1).max(1);
-        let (menu, actions) = compile_menu(generation, build(cx))?;
+        let (menu, actions) = compile_menu(generation, build(cx), &|action| shortcut_for(action, cx))?;
         let old = self.snapshot.borrow().clone();
         let mut new = old.clone();
         new.menu = Some(menu);

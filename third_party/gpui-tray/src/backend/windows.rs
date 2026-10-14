@@ -303,6 +303,7 @@ fn append_items(
                 label,
                 checked,
                 enabled,
+                ..
             } => {
                 let command = *next_command;
                 *next_command = next_command

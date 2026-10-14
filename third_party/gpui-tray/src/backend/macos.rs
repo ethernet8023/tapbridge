@@ -1,11 +1,12 @@
 use std::cell::{Cell, RefCell};
 
+use crate::menu::Shortcut;
 use image::ImageEncoder as _;
 use objc2::{
     AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained,
 };
 use objc2_app_kit::{
-    NSControlStateValueOff, NSControlStateValueOn, NSImage, NSMenu, NSMenuItem, NSStatusBar,
+    NSEventModifierFlags, NSControlStateValueOff, NSControlStateValueOn, NSImage, NSMenu, NSMenuItem, NSStatusBar,
     NSStatusBarButton, NSStatusItem, NSVariableStatusItemLength,
 };
 use objc2_foundation::{NSData, NSObject, NSObjectProtocol, NSSize, NSString};
@@ -199,16 +200,17 @@ impl MacTray {
         Ok(())
     }
 
-    fn set_menu(&mut self, snapshot: &TraySnapshot) -> Result<()> {
+    fn set_menu(&mut self, tray: &TraySnapshot) -> Result<()> {
         self.target.reset_mappings();
-        self.menu = snapshot
+        self.menu = tray
             .menu
             .as_ref()
-            .map(|snapshot| {
+            .map(|menu| {
                 build_menu(
                     "gpui-tray",
-                    &snapshot.items,
-                    snapshot.generation,
+                    &menu.items,
+                    &tray.item_images,
+                    menu.generation,
                     &self.target,
                     self.mtm,
                 )
@@ -250,17 +252,60 @@ fn native_image(icon: &Icon) -> Result<Retained<NSImage>> {
     Ok(image)
 }
 
+/// Shows `shortcut` as the item's key equivalent. Only a single character is a
+/// key equivalent (Return, F-keys and friends would need their AppKit codes).
+/// Local patch: not in upstream gpui-tray 0.1.4.
+fn set_key_equivalent(item: &NSMenuItem, shortcut: &Shortcut) {
+    let mut chars = shortcut.key.chars();
+    let (Some(key), None) = (chars.next(), chars.next()) else {
+        return;
+    };
+    let mut flags = NSEventModifierFlags::empty();
+    if shortcut.command {
+        flags |= NSEventModifierFlags::Command;
+    }
+    if shortcut.control {
+        flags |= NSEventModifierFlags::Control;
+    }
+    if shortcut.option {
+        flags |= NSEventModifierFlags::Option;
+    }
+    if shortcut.shift {
+        flags |= NSEventModifierFlags::Shift;
+    }
+    item.setKeyEquivalent(&NSString::from_str(&key.to_lowercase().to_string()));
+    item.setKeyEquivalentModifierMask(flags);
+}
+
+/// An SVG as a template image about the size of an SF Symbol at the menu font
+/// size (these exports are tight to the glyph), keeping its aspect ratio.
+/// NSImage reads SVG itself (macOS 13+). Local patch.
+fn svg_menu_image(svg: &[u8]) -> Option<Retained<NSImage>> {
+    // SAFETY: NSData copies `svg`, which remains valid for the duration of the call.
+    let data = unsafe { NSData::dataWithBytes_length(svg.as_ptr().cast(), svg.len()) };
+    let image = NSImage::initWithData(NSImage::alloc(), &data)?;
+    let natural = image.size();
+    let scale = 13.0 / natural.width.max(natural.height).max(1.0);
+    image.setSize(NSSize::new(natural.width * scale, natural.height * scale));
+    image.setTemplate(true);
+    Some(image)
+}
+
 /// Menu-bar icon height in points (what tray-icon used).
 const MENU_BAR_ICON_HEIGHT: f64 = 22.0;
 
 fn build_menu(
     title: &str,
     items: &[NativeMenuItem],
+    images: &[(String, std::sync::Arc<[u8]>)],
     generation: u64,
     target: &TrayTarget,
     mtm: MainThreadMarker,
 ) -> Result<Retained<NSMenu>> {
     let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str(title));
+    // Without this AppKit re-enables every item whose target answers its
+    // selector, so a disabled status line would be clickable. Local patch.
+    menu.setAutoenablesItems(false);
     for item in items {
         match item {
             NativeMenuItem::Separator => menu.addItem(&NSMenuItem::separatorItem(mtm)),
@@ -269,6 +314,7 @@ fn build_menu(
                 label,
                 checked,
                 enabled,
+                shortcut,
             } => {
                 // SAFETY: The selector is implemented by TrayTarget and target is retained by MacTray.
                 let item = unsafe {
@@ -281,6 +327,14 @@ fn build_menu(
                 };
                 item.setTag(target.allocate_tag(generation, *id));
                 item.setEnabled(*enabled);
+                if let Some(shortcut) = shortcut {
+                    set_key_equivalent(&item, shortcut);
+                }
+                if let Some((_, svg)) = images.iter().find(|(name, _)| name == label) {
+                    if let Some(image) = svg_menu_image(svg) {
+                        item.setImage(Some(&image));
+                    }
+                }
                 item.setState(if *checked {
                     NSControlStateValueOn
                 } else {
@@ -305,7 +359,7 @@ fn build_menu(
                     )
                 };
                 item.setEnabled(*enabled);
-                let submenu = build_menu(label, items, generation, target, mtm)?;
+                let submenu = build_menu(label, items, images, generation, target, mtm)?;
                 item.setSubmenu(Some(&submenu));
                 menu.addItem(&item);
             }

@@ -340,6 +340,7 @@ fn compile_dbus_menu(
                     label,
                     checked,
                     enabled,
+                    ..
                 } => DbusMenuItem::Item {
                     external_id: allocate(next_id),
                     generation,
@@ -756,6 +757,7 @@ mod tests {
                     visible: true,
                     activatable: true,
                     menu: None,
+                    item_images: Vec::new(),
                 },
                 revision: 1,
                 menu: Vec::new(),
@@ -798,6 +800,7 @@ mod tests {
             visible: true,
             activatable: false,
             menu: None,
+            item_images: Vec::new(),
         };
         assert_eq!(icon_pixmap(&snapshot)[0].2, vec![4, 1, 2, 3]);
     }

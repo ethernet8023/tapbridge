@@ -81,7 +81,13 @@ impl Tray {
             pair_action: false,
         }));
         let builder_state = menu.clone();
-        let native = gpui_tray::Tray::builder()
+        let builder = gpui_tray::Tray::builder();
+        // macOS menus carry a glyph beside Settings and About, as SF Symbols do.
+        #[cfg(target_os = "macos")]
+        let builder = builder
+            .menu_item_image(SETTINGS_TITLE, &include_bytes!("../assets/ui/gear.svg")[..])
+            .menu_item_image(ABOUT_TITLE, &include_bytes!("../assets/ui/info.svg")[..]);
+        let native = builder
             .icon(icons.for_state(TrayState::Disconnected, 0))
             .title("tapbridge")
             .tooltip("tapbridge")

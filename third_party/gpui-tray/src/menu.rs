@@ -16,12 +16,46 @@ pub(crate) enum NativeMenuItem {
         label: String,
         checked: bool,
         enabled: bool,
+        /// The action's single-keystroke binding, for the key equivalent a
+        /// macOS menu shows. Local patch: not in upstream gpui-tray 0.1.4.
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        shortcut: Option<Shortcut>,
     },
     Submenu {
         label: String,
         enabled: bool,
         items: Vec<Self>,
     },
+}
+
+/// A keystroke as a menu's key equivalent: one key plus modifiers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Shortcut {
+    pub(crate) key: String,
+    /// Command on macOS, the Windows key elsewhere (gpui's `platform`).
+    pub(crate) command: bool,
+    pub(crate) control: bool,
+    pub(crate) option: bool,
+    pub(crate) shift: bool,
+}
+
+/// What the key map binds `action` to (the last binding wins, as in gpui's own
+/// menus), unless it is a multi-keystroke chord, which has no key equivalent.
+pub(crate) fn shortcut_for(action: &dyn gpui::Action, cx: &gpui::App) -> Option<Shortcut> {
+    let keymap = cx.key_bindings();
+    let keymap = keymap.borrow();
+    let binding = keymap.bindings_for_action(action).next_back()?;
+    let [keystroke] = binding.keystrokes() else {
+        return None;
+    };
+    let keystroke = keystroke.inner();
+    Some(Shortcut {
+        key: keystroke.key.clone(),
+        command: keystroke.modifiers.platform,
+        control: keystroke.modifiers.control,
+        option: keystroke.modifiers.alt,
+        shift: keystroke.modifiers.shift,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
@@ -48,10 +82,11 @@ impl ActionTable {
 pub(crate) fn compile_menu(
     generation: u64,
     items: Vec<gpui::MenuItem>,
+    shortcut: &dyn Fn(&dyn gpui::Action) -> Option<Shortcut>,
 ) -> Result<(MenuSnapshot, ActionTable)> {
     let mut next_id = 1_u32;
     let mut actions = HashMap::new();
-    let items = compile_items(items, &mut next_id, &mut actions)?;
+    let items = compile_items(items, &mut next_id, &mut actions, shortcut)?;
 
     Ok((
         MenuSnapshot { generation, items },
@@ -66,6 +101,7 @@ fn compile_items(
     items: Vec<gpui::MenuItem>,
     next_id: &mut u32,
     actions: &mut HashMap<MenuItemId, Box<dyn gpui::Action>>,
+    shortcut: &dyn Fn(&dyn gpui::Action) -> Option<Shortcut>,
 ) -> Result<Vec<NativeMenuItem>> {
     items
         .into_iter()
@@ -77,19 +113,21 @@ fn compile_items(
                 gpui::MenuItem::Submenu(menu) => Ok(NativeMenuItem::Submenu {
                     label: menu.name.to_string(),
                     enabled,
-                    items: compile_items(menu.items, next_id, actions)?,
+                    items: compile_items(menu.items, next_id, actions, shortcut)?,
                 }),
                 gpui::MenuItem::Action { name, action, .. } => {
                     let id = MenuItemId(*next_id);
                     *next_id = next_id.checked_add(1).ok_or_else(|| {
                         Error::native_message("tray menu contains more than u32::MAX actions")
                     })?;
+                    let shortcut = shortcut(action.as_ref());
                     actions.insert(id, action);
                     Ok(NativeMenuItem::Item {
                         id,
                         label: name.to_string(),
                         checked,
                         enabled,
+                        shortcut,
                     })
                 }
                 gpui::MenuItem::SystemMenu(_) => Err(Error::UnsupportedMenuItem("SystemMenu")),
@@ -147,7 +185,7 @@ mod tests {
             }),
         ];
 
-        let (snapshot, table) = compile_menu(7, items).unwrap();
+        let (snapshot, table) = compile_menu(7, items, &|_| None).unwrap();
         assert_eq!(snapshot.generation, 7);
         assert_eq!(table.generation, 7);
         assert!(table.action(MenuItemId(1)).is_some());
