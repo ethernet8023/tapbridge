@@ -35,3 +35,5 @@ lto = "off"
 gpui-ce = { path = "third_party/gpui-glass/vendor/gpui-ce/crates/gpui" }
 gpui_ce_wgpu = { path = "third_party/gpui-glass/vendor/gpui-ce/crates/gpui_wgpu" }
 gpui_ce_platform = { path = "third_party/gpui-glass/vendor/gpui-ce/crates/gpui_platform" }
+# gpui-tray 0.1.4 plus a macOS template-icon patch (third_party/gpui-tray).
+gpui-tray = { path = "third_party/gpui-tray" }

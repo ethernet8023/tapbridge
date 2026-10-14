@@ -22,6 +22,13 @@ pub struct Icons {
     error: gpui_tray::Icon,
 }
 
+/// macOS menu-bar icons are template images: the system recolours them for
+/// the light or dark menu bar.
+#[cfg(target_os = "macos")]
+fn load_template(embedded: &[u8]) -> gpui_tray::Icon {
+    load(embedded).menu_bar_template()
+}
+
 fn load(embedded: &[u8]) -> gpui_tray::Icon {
     let decoder = png::Decoder::new(std::io::Cursor::new(embedded));
     let mut reader = decoder.read_info().expect("valid embedded icon png");
@@ -35,15 +42,15 @@ impl Icons {
     #[cfg(target_os = "macos")]
     pub fn load() -> Self {
         Self {
-            disconnected: load(include_bytes!("../assets/icons/menubar-disconnected.png")),
-            connected: load(include_bytes!("../assets/icons/menubar-connected.png")),
+            disconnected: load_template(include_bytes!("../assets/icons/menubar-disconnected.png")),
+            connected: load_template(include_bytes!("../assets/icons/menubar-connected.png")),
             tap: [
-                load(include_bytes!("../assets/icons/menubar-tap1.png")),
-                load(include_bytes!("../assets/icons/menubar-tap2.png")),
-                load(include_bytes!("../assets/icons/menubar-tap3.png")),
+                load_template(include_bytes!("../assets/icons/menubar-tap1.png")),
+                load_template(include_bytes!("../assets/icons/menubar-tap2.png")),
+                load_template(include_bytes!("../assets/icons/menubar-tap3.png")),
             ],
-            card: load(include_bytes!("../assets/icons/menubar-card.png")),
-            error: load(include_bytes!("../assets/icons/menubar-error.png")),
+            card: load_template(include_bytes!("../assets/icons/menubar-card.png")),
+            error: load_template(include_bytes!("../assets/icons/menubar-error.png")),
         }
     }
 
