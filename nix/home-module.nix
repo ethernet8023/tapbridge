@@ -28,8 +28,9 @@ in
   };
 
   config = mkIf cfg.enable {
-    home.packages = [ cfg.package ];
-
+    # Deliberately NOT home.packages: a bare `tapbridge` runs without the
+    # unit's environment (no TAPBRIDGE_MANAGED, reader socket or pamu2fcfg).
+    # To bring the app back after Quit: systemctl --user start tapbridge.
     systemd.user.services.tapbridge = {
       Unit = {
         Description = "tapbridge: your phone as the NFC reader for your security key";

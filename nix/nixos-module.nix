@@ -100,7 +100,10 @@ in
     security.pam.services.sudo.u2fAuth = mkIf cfg.pam.sudo true;
     security.pam.services.su.u2fAuth = mkIf cfg.pam.su true;
 
-    environment.systemPackages = [ cfg.package ];
+    # Deliberately NOT environment.systemPackages: a bare `tapbridge` runs
+    # without the unit's environment (no TAPBRIDGE_MANAGED, reader socket or
+    # pamu2fcfg) and half works. pcscd and udev get the package by store path;
+    # to bring the app back after Quit: systemctl --user start tapbridge.
     services.udev.packages = [ udevRules ];
     # /dev/uhid only exists once the module is loaded (nothing else asks for it).
     boot.kernelModules = lib.optional cfg.virtualSecurityKey "uhid";

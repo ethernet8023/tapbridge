@@ -53,7 +53,8 @@ pkgs.testers.runNixOSTest {
         assert "SW1=0x90, SW2=0x00" in out, out
 
     with subtest("the app can find the libraries it loads at run time (wayland, xkbcommon, vulkan)"):
-        runpath = machine.succeed("readelf -d $(readlink -f $(which tapbridge)) | grep -E 'RUNPATH|RPATH'")
+        exe = machine.succeed("sed -n 's/^ExecStart=//p' /etc/systemd/user/tapbridge.service").strip()
+        runpath = machine.succeed(f"readelf -d {exe} | grep -E 'RUNPATH|RPATH'")
         for lib in ["wayland", "libxkbcommon", "vulkan-loader"]:
             assert lib in runpath, f"{lib} missing from {runpath}"
 
@@ -67,6 +68,9 @@ pkgs.testers.runNixOSTest {
             assert "sufficient" in line, line
             assert "cue" in line, line
         machine.succeed("! grep -q pam_u2f /etc/pam.d/login")
+
+    with subtest("a bare tapbridge is not on PATH (it would run without the unit's environment)"):
+        machine.fail("command -v tapbridge")
 
     with subtest("the app's Register button can find pamu2fcfg"):
         # alice has no running user session here, so read the unit file itself.
