@@ -67,6 +67,9 @@ pub enum UiEvent {
     /// Whether this card's identity is paired with the login, read after a
     /// tap (`login::present_card_paired`).
     LoginChecked(Vec<u8>, bool),
+    /// Linux: registering the card's sudo/su key finished: (ok, message).
+    #[cfg(target_os = "linux")]
+    KeyDone(bool, String),
     /// macOS: the smart card settings as read from the system.
     #[cfg(target_os = "macos")]
     SecurityRead(ui::SecurityOptions),
@@ -123,6 +126,9 @@ struct Shell {
     /// The phone asked to set up the login of this card; answer it when the
     /// pairing ends.
     phone_asked_login: Option<Vec<u8>>,
+    /// Linux: cards whose FIDO key is registered with pam_u2f (re-read when
+    /// the card list changes and after a register or remove).
+    sudo_keys: HashSet<Vec<u8>>,
     // Held for their Drop / process-lifetime handles.
     _anchor: WindowHandle<ui::Anchor>,
     #[cfg(windows)]
@@ -394,6 +400,7 @@ fn shell_setup(
         setup_ok: HashSet::new(),
         new_card: None,
         phone_asked_login: None,
+        sudo_keys: HashSet::new(),
         #[cfg(windows)]
         watcher,
         _instance: Shell::instance_guard(instance),
@@ -870,6 +877,16 @@ fn handle_event(event: UiEvent, cx: &mut App) {
             });
             read_security(cx);
         }
+        #[cfg(target_os = "linux")]
+        UiEvent::KeyDone(ok, text) => {
+            logging::log(&format!("sudo key: registration finished, ok={ok}"));
+            cx.update_global::<Shell, _>(|shell, _| {
+                if let Some(task) = shell.card_task.as_mut() {
+                    task.paired(ok, text);
+                }
+                shell.reload_sudo_keys();
+            });
+        }
         UiEvent::LoginChecked(uid, paired) => {
             cx.update_global::<Shell, _>(|shell, _| {
                 if let Some(service) = shell.service.as_ref() {
@@ -964,6 +981,30 @@ fn run_card_effect(effect: Effect, cx: &mut App) {
                 let (ok, message) = login::pair_present_card();
                 let _ = events.send(UiEvent::LoginDone(ok, message));
             });
+        }
+        Effect::RunRegistration => {
+            #[cfg(target_os = "linux")]
+            {
+                let events = cx.global::<Shell>().events.clone();
+                let uid = cx
+                    .global::<Shell>()
+                    .card_task
+                    .as_ref()
+                    .map(|task| task.uid.clone())
+                    .unwrap_or_default();
+                logging::log("sudo key: registering the card on the phone");
+                std::thread::spawn(move || {
+                    let (ok, message) = match crate::fido_login::Paths::current() {
+                        Some(paths) => crate::fido_login::register(
+                            &paths,
+                            &uid,
+                            crate::fido_login::run_pamu2fcfg,
+                        ),
+                        None => (false, "No home directory to save the key in.".to_owned()),
+                    };
+                    let _ = events.send(UiEvent::KeyDone(ok, message));
+                });
+            }
         }
         Effect::RunUnpairing => {
             let events = cx.global::<Shell>().events.clone();
@@ -1189,6 +1230,18 @@ fn settings_action(action: ui::SettingsAction, cx: &mut App) {
             request_tap(cx);
         }
         ui::SettingsAction::OpenUrl(url) => cx.open_url(&url),
+        ui::SettingsAction::RegisterKey(uid) => {
+            #[cfg(target_os = "linux")]
+            start_key_registration(uid, cx);
+            #[cfg(not(target_os = "linux"))]
+            let _ = uid;
+        }
+        ui::SettingsAction::RemoveKey(uid) => {
+            #[cfg(target_os = "linux")]
+            remove_key(uid, cx);
+            #[cfg(not(target_os = "linux"))]
+            let _ = uid;
+        }
         ui::SettingsAction::DismissCardTask => {
             cx.update_global::<Shell, _>(|shell, _| {
                 if shell.card_task.as_ref().is_some_and(CardTask::dismissable) {
@@ -1221,6 +1274,57 @@ fn start_login(uid: Vec<u8>, cx: &mut App) -> bool {
     cx.update_global::<Shell, _>(|shell, _| shell.card_task = Some(task));
     run_card_effect(effect, cx);
     true
+}
+
+/// Linux: starts registering the card's FIDO key for sudo and su unless
+/// another card task is running. Like the login: runs at once when the card
+/// is on the phone, otherwise asks for a tap first.
+#[cfg(target_os = "linux")]
+fn start_key_registration(uid: Vec<u8>, cx: &mut App) {
+    if cx
+        .global::<Shell>()
+        .card_task
+        .as_ref()
+        .is_some_and(CardTask::busy)
+    {
+        return;
+    }
+    let status = cx
+        .global::<Shell>()
+        .service
+        .as_ref()
+        .map(ServiceHandle::status)
+        .unwrap_or_default();
+    let present = status.card_present && status.card_uid == uid;
+    let (task, effect) = CardTask::register(uid, present, Instant::now());
+    cx.update_global::<Shell, _>(|shell, _| shell.card_task = Some(task));
+    run_card_effect(effect, cx);
+}
+
+/// Linux: takes the card's key out of pam_u2f's file. It only edits files,
+/// so it needs no tap.
+#[cfg(target_os = "linux")]
+fn remove_key(uid: Vec<u8>, cx: &mut App) {
+    if cx
+        .global::<Shell>()
+        .card_task
+        .as_ref()
+        .is_some_and(CardTask::busy)
+    {
+        return;
+    }
+    let (ok, text) = match (
+        crate::fido_login::Paths::current(),
+        crate::fido_login::current_user(),
+    ) {
+        (Some(paths), Some(user)) => crate::fido_login::unregister(&paths, &user, &uid),
+        _ => (false, "Couldn't tell which user's key to remove.".to_owned()),
+    };
+    logging::log(&format!("sudo key: removal finished, ok={ok}"));
+    cx.update_global::<Shell, _>(|shell, _| {
+        shell.card_task = Some(CardTask::done(uid, ok, text));
+        shell.reload_sudo_keys();
+    });
 }
 
 /// Starts removing the card from this PC's login unless another card
@@ -1391,10 +1495,31 @@ fn quit(cx: &mut App) {
 }
 
 impl Shell {
+    /// Linux: which cards have a key in pam_u2f's file. Read here, not per
+    /// frame: Settings rebuilds its snapshot every tick.
+    #[cfg(target_os = "linux")]
+    fn reload_sudo_keys(&mut self) {
+        use crate::fido_login;
+        self.sudo_keys.clear();
+        if let (Some(paths), Some(user)) = (fido_login::Paths::current(), fido_login::current_user())
+        {
+            self.sudo_keys.extend(
+                self.cards
+                    .iter()
+                    .filter(|known| fido_login::registered(&paths, &user, &known.info.uid))
+                    .map(|known| known.info.uid.clone()),
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn reload_sudo_keys(&mut self) {}
+
     fn reload_cards(&mut self) {
         if let Some(service) = self.service.as_ref() {
             self.cards = service.known_cards();
         }
+        self.reload_sudo_keys();
         // The always-present card is the one paired with this Mac's login.
         #[cfg(target_os = "macos")]
         crate::pcsc_reader::ALWAYS_PRESENT.set_atr(
@@ -1439,6 +1564,15 @@ impl Shell {
                         card.has(caps::BLOCKED),
                     ),
                     flexsecure: crate::card_tasks::is_flexsecure(&known.atr),
+                    sudo_key: cfg!(target_os = "linux").then(|| {
+                        if self.sudo_keys.contains(&card.uid) {
+                            crate::card_tasks::StepState::Done
+                        } else if card.has(caps::FIDO) {
+                            crate::card_tasks::StepState::Todo
+                        } else {
+                            crate::card_tasks::StepState::Locked
+                        }
+                    }),
                 }
             })
             .collect()

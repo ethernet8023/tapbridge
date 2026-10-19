@@ -31,6 +31,8 @@ in
     TAPBRIDGE_MANAGED = "1";
     TAPBRIDGE_START_AT_LOGIN = lib.boolToString cfg.startAtLogin;
     TAPBRIDGE_IFD_SOCKET = socket;
+    # The Settings window's "Register" for sudo and su runs this.
+    TAPBRIDGE_PAMU2FCFG = "${pkgs.pam_u2f}/bin/pamu2fcfg";
   };
 
   # Run before the app: the USB setting is the absence of `usb-off` in its state dir.

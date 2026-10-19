@@ -68,6 +68,14 @@ pkgs.testers.runNixOSTest {
             assert "cue" in line, line
         machine.succeed("! grep -q pam_u2f /etc/pam.d/login")
 
+    with subtest("the app's Register button can find pamu2fcfg"):
+        # alice has no running user session here, so read the unit file itself.
+        unit = machine.succeed("cat /etc/systemd/user/tapbridge.service")
+        line = [l for l in unit.splitlines() if "TAPBRIDGE_PAMU2FCFG" in l][0]
+        path = line.split("TAPBRIDGE_PAMU2FCFG=", 1)[1].strip().strip('"')
+        assert path.endswith("/bin/pamu2fcfg"), line
+        machine.succeed(f"test -x {path}")
+
     with subtest("libfido2 sees and talks to the virtual key through the real kernel"):
         machine.succeed("tapbridge-tests --ignored --exact security_key::uhid_live_tests::libfido2_reads_get_info_through_the_real_kernel --nocapture")
         machine.succeed("tapbridge-tests --ignored --exact security_key::uhid_live_tests::libfido2_lists_the_virtual_key --nocapture")

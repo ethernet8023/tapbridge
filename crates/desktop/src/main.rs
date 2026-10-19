@@ -14,6 +14,8 @@ mod macos;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod security_key;
 #[cfg(target_os = "linux")]
+mod fido_login;
+#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(unix)]
 mod pcsc_reader;

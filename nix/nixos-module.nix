@@ -60,8 +60,9 @@ in
         description = ''
           Let a tap on your phone authenticate `sudo` (through pam_u2f and the
           virtual security key). Needs `virtualSecurityKey`. Each user first
-          registers the key once with `pamu2fcfg > ~/.config/Yubico/u2f_keys`;
-          the password still works when the key is absent.
+          registers a card once: Settings, the card's gear, "Register" (or
+          `pamu2fcfg > ~/.config/Yubico/u2f_keys`). The password still works
+          when the key is absent.
         '';
       };
 
