@@ -1958,6 +1958,14 @@ const MANAGED_WHERE: &str = "programs.tapbridge in your nix-darwin config";
 #[cfg(target_os = "linux")]
 const MANAGED_WHERE: &str = "services.tapbridge (NixOS) or programs.tapbridge (Home Manager)";
 
+/// Under the grayed-out "Start at login" when Nix manages it: the option that
+/// decides it. Whether the app starts is the Nix unit's business, so the
+/// toggle only reports it.
+#[cfg(not(target_os = "linux"))]
+const MANAGED_START_AT_LOGIN: &str = "Set by programs.tapbridge.startAtLogin in your nix-darwin config.";
+#[cfg(target_os = "linux")]
+const MANAGED_START_AT_LOGIN: &str = "Set by startAtLogin in services.tapbridge (NixOS) or programs.tapbridge (Home Manager).";
+
 /// Shown above the (grayed out) settings when Nix manages them.
 fn managed_notice(cx: &mut App) -> impl IntoElement {
     glass::panel("managed", 14.0, cx)
@@ -2127,7 +2135,11 @@ impl Render for SettingsView {
                     autostart,
                     !managed,
                     "Start at login",
-                    String::new(),
+                    if managed {
+                        MANAGED_START_AT_LOGIN.to_owned()
+                    } else {
+                        String::new()
+                    },
                     cx,
                 )
                 .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {

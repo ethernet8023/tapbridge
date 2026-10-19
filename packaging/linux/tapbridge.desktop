@@ -2,7 +2,10 @@
 Type=Application
 Name=tapbridge
 Comment=Use your phone as the NFC reader for your security key
-Exec=tapbridge
+# Start the systemd user unit the NixOS / Home Manager modules define: it
+# carries the environment the app needs (the pcscd socket path, pamu2fcfg).
+# A bare `tapbridge` has none of it. Without the unit, run the app directly.
+Exec=sh -c "systemctl --user start tapbridge.service 2>/dev/null || exec tapbridge"
 Icon=tapbridge
 Terminal=false
 Categories=Utility;Security;
