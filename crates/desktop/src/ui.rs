@@ -1944,8 +1944,7 @@ fn card_button(
 pub const MANAGED_GUIDE: &str =
     "https://github.com/ethernet8023/tapbridge/blob/main/docs/nix-darwin.md";
 #[cfg(target_os = "linux")]
-pub const MANAGED_GUIDE: &str =
-    "https://github.com/ethernet8023/tapbridge/blob/main/docs/nixos.md";
+pub const MANAGED_GUIDE: &str = "https://github.com/ethernet8023/tapbridge/blob/main/docs/nixos.md";
 
 /// What manages the settings, as the notice names it.
 #[cfg(not(target_os = "linux"))]
@@ -1962,9 +1961,11 @@ const MANAGED_WHERE: &str = "services.tapbridge (NixOS) or programs.tapbridge (H
 /// decides it. Whether the app starts is the Nix unit's business, so the
 /// toggle only reports it.
 #[cfg(not(target_os = "linux"))]
-const MANAGED_START_AT_LOGIN: &str = "Set by programs.tapbridge.startAtLogin in your nix-darwin config.";
+const MANAGED_START_AT_LOGIN: &str =
+    "Set by programs.tapbridge.startAtLogin in your nix-darwin config.";
 #[cfg(target_os = "linux")]
-const MANAGED_START_AT_LOGIN: &str = "Set by startAtLogin in services.tapbridge (NixOS) or programs.tapbridge (Home Manager).";
+const MANAGED_START_AT_LOGIN: &str =
+    "Set by startAtLogin in services.tapbridge (NixOS) or programs.tapbridge (Home Manager).";
 
 /// Shown above the (grayed out) settings when Nix manages them.
 fn managed_notice(cx: &mut App) -> impl IntoElement {
@@ -1986,7 +1987,9 @@ fn managed_notice(cx: &mut App) -> impl IntoElement {
             div()
                 .text_size(px(12.5))
                 .text_color(rgb(ACCENT_SOFT))
-                .child(format!("Change these settings in {MANAGED_WHERE}. Open the guide →")),
+                .child(format!(
+                    "Change these settings in {MANAGED_WHERE}. Open the guide →"
+                )),
         )
         .on_click(|_, _, cx| cx.open_url(MANAGED_GUIDE))
 }

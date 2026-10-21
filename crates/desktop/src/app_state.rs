@@ -787,7 +787,7 @@ fn handle_event(event: UiEvent, cx: &mut App) {
                 Ok(()) => logging::log("usbip: reader attached (busid 1-1)"),
                 Err(error) => logging::log(&format!("usbip: attach failed: {error}")),
             }
-            cx.update_global::<Shell, _>(|shell, _| {
+            cx.update_global::<Shell, _>(|shell, cx| {
                 shell.usbip = if result.is_ok() {
                     Usbip::Attached
                 } else {
@@ -1318,7 +1318,10 @@ fn remove_key(uid: Vec<u8>, cx: &mut App) {
         crate::fido_login::current_user(),
     ) {
         (Some(paths), Some(user)) => crate::fido_login::unregister(&paths, &user, &uid),
-        _ => (false, "Couldn't tell which user's key to remove.".to_owned()),
+        _ => (
+            false,
+            "Couldn't tell which user's key to remove.".to_owned(),
+        ),
     };
     logging::log(&format!("sudo key: removal finished, ok={ok}"));
     cx.update_global::<Shell, _>(|shell, _| {
@@ -1501,7 +1504,8 @@ impl Shell {
     fn reload_sudo_keys(&mut self) {
         use crate::fido_login;
         self.sudo_keys.clear();
-        if let (Some(paths), Some(user)) = (fido_login::Paths::current(), fido_login::current_user())
+        if let (Some(paths), Some(user)) =
+            (fido_login::Paths::current(), fido_login::current_user())
         {
             self.sudo_keys.extend(
                 self.cards

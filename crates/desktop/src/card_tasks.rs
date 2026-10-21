@@ -153,6 +153,7 @@ impl CardTask {
 
     /// "Register" for sudo and su (Linux): like the login, it runs at once
     /// when the card is on the phone and otherwise asks for a tap first.
+    #[cfg(any(target_os = "linux", test))]
     pub fn register(uid: Vec<u8>, present: bool, now: Instant) -> (Self, Effect) {
         let (step, effect) = if present {
             (Step::Registering, Effect::RunRegistration)
@@ -242,6 +243,7 @@ impl CardTask {
 
     /// A result with nothing running behind it (for a task finished without
     /// a tap, like removing a key).
+    #[cfg(any(target_os = "linux", test))]
     pub fn done(uid: Vec<u8>, ok: bool, text: String) -> Self {
         Self {
             uid,

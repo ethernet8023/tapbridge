@@ -16,10 +16,7 @@ pub fn managed() -> bool {
 
 /// `$XDG_STATE_HOME/tapbridge`, else `~/.local/state/tapbridge`.
 pub fn state_dir() -> PathBuf {
-    state_dir_from(
-        std::env::var_os("XDG_STATE_HOME"),
-        std::env::var_os("HOME"),
-    )
+    state_dir_from(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
 }
 
 fn state_dir_from(

@@ -245,8 +245,14 @@ enum Input {
     /// The last program closed the device: whatever it was waiting for is
     /// moot, so a pending tap request must not keep the phone waiting.
     Released,
-    Done { cid: u32, reply: Vec<u8> },
-    Status { cid: u32, status: u8 },
+    Done {
+        cid: u32,
+        reply: Vec<u8>,
+    },
+    Status {
+        cid: u32,
+        status: u8,
+    },
 }
 
 /// Creates the virtual security key and serves it on background threads.
@@ -274,10 +280,7 @@ fn spawn_with_card(
 /// [`spawn_with_card`] with the device factory as a parameter, so tests can
 /// back the key with a fake kernel side instead of the real OS device.
 fn start<D>(
-    create: impl FnOnce(
-        Box<dyn Fn(&[u8]) + Send>,
-        Box<dyn Fn() + Send>,
-    ) -> Result<D, String>,
+    create: impl FnOnce(Box<dyn Fn(&[u8]) + Send>, Box<dyn Fn() + Send>) -> Result<D, String>,
     card: Arc<dyn Card + Send + Sync>,
     log: Arc<dyn Fn(&str) + Send + Sync>,
 ) -> Result<(), String>
@@ -435,7 +438,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[ignore = "needs the HID virtual device entitlement"]
     fn virtual_device_registers_with_iokit() {
-        let device = hid::Device::create(|_| {}, || {}).expect("device created (entitlement present?)");
+        let device =
+            hid::Device::create(|_| {}, || {}).expect("device created (entitlement present?)");
         let listing = std::process::Command::new("ioreg")
             .args(["-r", "-c", "IOHIDUserDevice", "-l"])
             .output()
@@ -1067,7 +1071,11 @@ mod uhid_driver_tests {
         .unwrap();
         let mut kernel = Kernel(kernel);
         kernel.send_event(4, &[]); // UHID_OPEN
-        kernel.write_report(&init_report(ctaphid::BROADCAST_CID, ctaphid::CMD_INIT, &[9; 8]));
+        kernel.write_report(&init_report(
+            ctaphid::BROADCAST_CID,
+            ctaphid::CMD_INIT,
+            &[9; 8],
+        ));
         let (cmd, payload) = kernel.read_message();
         assert_eq!(cmd, ctaphid::CMD_INIT);
         assert_eq!(&payload[..8], &[9; 8], "nonce echoed");
@@ -1087,7 +1095,11 @@ mod uhid_driver_tests {
         assert_eq!(cmd, ctaphid::CMD_CBOR);
         assert_eq!(reply[0], 0x00, "CTAP2_OK from the card");
         assert!(reply.len() > 8, "a CBOR GetInfo map follows the status");
-        assert_eq!(wired.card.sim().taps, 0, "the card was already on the phone");
+        assert_eq!(
+            wired.card.sim().taps,
+            0,
+            "the card was already on the phone"
+        );
     }
 
     #[test]
@@ -1124,9 +1136,13 @@ mod uhid_live_tests {
     /// The `/dev/hidrawN` of the virtual key, once the kernel has made it.
     fn wait_for_hidraw() -> String {
         for _ in 0..100 {
-            for entry in std::fs::read_dir("/sys/class/hidraw").into_iter().flatten().flatten() {
-                let uevent = std::fs::read_to_string(entry.path().join("device/uevent"))
-                    .unwrap_or_default();
+            for entry in std::fs::read_dir("/sys/class/hidraw")
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let uevent =
+                    std::fs::read_to_string(entry.path().join("device/uevent")).unwrap_or_default();
                 if uevent.contains("HID_NAME=tapbridge security key") {
                     return format!("/dev/{}", entry.file_name().to_string_lossy());
                 }
@@ -1148,8 +1164,15 @@ mod uhid_live_tests {
             .output()
             .expect("run fido2-token");
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(output.status.success(), "{stdout}{}", String::from_utf8_lossy(&output.stderr));
-        assert!(stdout.contains("FIDO_2_0"), "versions in the GetInfo reply: {stdout}");
+        assert!(
+            output.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("FIDO_2_0"),
+            "versions in the GetInfo reply: {stdout}"
+        );
     }
 
     #[test]

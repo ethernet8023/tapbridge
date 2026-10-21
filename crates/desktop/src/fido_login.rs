@@ -191,7 +191,9 @@ pub fn other_fido_keys(sysfs_hidraw: &Path) -> Vec<String> {
                 return None;
             }
             let uevent = fs::read_to_string(device.join("uevent")).ok()?;
-            let id = uevent.lines().find_map(|line| line.strip_prefix("HID_ID="))?;
+            let id = uevent
+                .lines()
+                .find_map(|line| line.strip_prefix("HID_ID="))?;
             let name = uevent
                 .lines()
                 .find_map(|line| line.strip_prefix("HID_NAME="))
@@ -267,7 +269,10 @@ pub fn unregister(paths: &Paths, user: &str, uid: &[u8]) -> (bool, String) {
         Ok::<_, io::Error>(None)
     })();
     match result {
-        Ok(None) => (true, "Removed: sudo and su no longer accept this card.".to_owned()),
+        Ok(None) => (
+            true,
+            "Removed: sudo and su no longer accept this card.".to_owned(),
+        ),
         Ok(Some(why)) => (false, why),
         Err(error) => (false, format!("Couldn't change the key file: {error}")),
     }
@@ -344,7 +349,12 @@ mod tests {
         // pam_u2f reads the last line of a user, and so do we.
         let split = format!("ethie:{A}\nroot:x,y,es256,\nethie:{B}\n");
         let more = add_credential(&split, "ethie", "kh3==,pk3==,es256,+presence");
-        assert!(more.lines().last().unwrap().starts_with(&format!("ethie:{B}:kh3==")));
+        assert!(
+            more.lines()
+                .last()
+                .unwrap()
+                .starts_with(&format!("ethie:{B}:kh3=="))
+        );
     }
 
     #[test]
@@ -457,10 +467,28 @@ mod tests {
     fn another_fido_key_is_found_but_our_own_and_other_hid_devices_are_not() {
         let dir = tempfile::tempdir().unwrap();
         let fido = [0x06, 0xD0, 0xF1, 0x09, 0x01];
-        fake_hidraw(dir.path(), "hidraw0", "0003:00001209:00007A73", "tapbridge", &fido);
-        fake_hidraw(dir.path(), "hidraw1", "0003:00001050:00000407", "Yubico YubiKey", &fido);
+        fake_hidraw(
+            dir.path(),
+            "hidraw0",
+            "0003:00001209:00007A73",
+            "tapbridge",
+            &fido,
+        );
+        fake_hidraw(
+            dir.path(),
+            "hidraw1",
+            "0003:00001050:00000407",
+            "Yubico YubiKey",
+            &fido,
+        );
         // A keyboard: generic desktop usage page (05 01), not FIDO.
-        fake_hidraw(dir.path(), "hidraw2", "0003:000026CE:000001A2", "Keyboard", &[0x05, 0x01]);
+        fake_hidraw(
+            dir.path(),
+            "hidraw2",
+            "0003:000026CE:000001A2",
+            "Keyboard",
+            &[0x05, 0x01],
+        );
         assert_eq!(other_fido_keys(dir.path()), ["Yubico YubiKey"]);
         let warning = other_keys_warning(dir.path()).unwrap();
         assert!(warning.contains("Yubico YubiKey") && warning.starts_with("Unplug"));
