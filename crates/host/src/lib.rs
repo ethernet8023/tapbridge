@@ -5,11 +5,12 @@ pub mod ccid;
 pub mod ctap_nfc;
 pub mod ctap_pin;
 pub mod ctaphid;
-#[cfg(target_os = "macos")]
 pub mod ifd;
 #[cfg(target_os = "macos")]
 pub mod keychain;
 pub mod reader;
+#[cfg(target_os = "linux")]
+pub mod secret_service;
 pub mod service;
 pub mod state;
 pub mod trace;

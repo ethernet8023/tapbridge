@@ -37,9 +37,9 @@ const USB_HELLO_WAIT: Duration = Duration::from_secs(120);
 
 /// PIV APDU deadline on the macOS IFD path, matching the usbip reader's
 /// `APDU_DEADLINE` (2 s) plus its allowed extensions bound.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 const PIV_DEADLINE: Duration = Duration::from_secs(2);
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 const CTAP_DEADLINE: Duration = Duration::from_secs(15);
 use tapbridge_core::{
     pairing::{Invitation, PairingGate},
@@ -328,14 +328,14 @@ enum Command {
     SetUseUsb(bool, std::sync::mpsc::SyncSender<()>),
     /// macOS PIV path: relay one APDU to the phone card and reply with the
     /// R-APDU. Mirrors the usbip reader's single-in-flight model.
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     PivTransmit {
         apdu: Vec<u8>,
         deadline: Duration,
         reply: std::sync::mpsc::SyncSender<PivResult>,
     },
     /// macOS PIV path: deadline watchdog fired for `apdu_id`.
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     PivTimeout {
         apdu_id: u64,
     },
@@ -343,13 +343,13 @@ enum Command {
 
 /// macOS PIV transmit outcome; `TransmitError` maps onto the IFD socket
 /// protocol statuses used by the shim.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 pub type PivResult = Result<Vec<u8>, crate::ifd::TransmitError>;
 
 /// Watchdog notifications for stalled PIV transits travel as
 /// [`Command::PivTimeout`] from the per-transmit timer task.
 /// One PIV APDU in flight (size-1 like the reader's `InFlight`).
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 struct PivInFlight {
     apdu_id: u64,
     generation: u64,
@@ -467,7 +467,7 @@ impl ServiceHandle {
 
     /// macOS PIV path: relays one APDU to the phone card, blocking until the
     /// R-APDU (or error) arrives; the deadline matches the usbip reader.
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     pub fn piv_transmit(&self, apdu: Vec<u8>) -> PivResult {
         self.transmit(apdu, PIV_DEADLINE)
     }
@@ -476,12 +476,12 @@ impl ServiceHandle {
     /// longer deadline, since CTAP operations (key generation, PIN
     /// protocol) can take seconds on a card. Matches the phone's 15 s
     /// IsoDep timeout.
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     pub fn ctap_transmit(&self, apdu: Vec<u8>) -> PivResult {
         self.transmit(apdu, CTAP_DEADLINE)
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     fn transmit(&self, apdu: Vec<u8>, deadline: Duration) -> PivResult {
         self.reply_option(|reply| Command::PivTransmit {
             apdu,
@@ -620,7 +620,7 @@ async fn run_inner(
     mut commands: tokio_mpsc::Receiver<Command>,
     events: tokio_mpsc::UnboundedSender<Event>,
 ) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     let (piv_timeout_tx, mut piv_timeout_rx) = tokio_mpsc::channel::<Command>(8);
     let mut tracer = settings.trace.then(Tracer::default);
     let mut gate = PairingGate::new();
@@ -655,18 +655,18 @@ async fn run_inner(
     let mut card_generation: u64 = 0;
     let mut latest_atr: Vec<u8> = Vec::new();
     // One PIV APDU in flight (size-1, like the reader's `InFlight`).
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     let mut piv_in_flight: Option<PivInFlight> = None;
     // PIV timeouts re-enter the loop as commands (tokio::select! cannot hold
     // cfg'd arms). `Option` so shutdown is not blocked by an idle sender.
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     let piv_timeout_tx: tokio_mpsc::Sender<Command> = piv_timeout_tx;
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     let mut piv_ids: u64 = 0;
     // The watchdog timer's senders live in the spawned tasks; the receiver
     // is drained after each loop iteration (deadline logic tolerates the
     // small delay, and no cfg'd select arm is needed).
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     let drain_piv_timeouts =
         |piv_in_flight: &mut Option<PivInFlight>,
          piv_timeout_rx: &mut tokio_mpsc::Receiver<Command>| {
@@ -808,7 +808,7 @@ async fn run_inner(
                                 ).await?;
                             let _ = reply.send(sent);
                         },
-                        #[cfg(target_os = "macos")]
+                        #[cfg(unix)]
                         Command::PivTransmit { apdu, deadline, reply } => {
                             // Mirrors the usbip reader's XfrBlock guards: one
                             // in flight, card present + valid ATR, session
@@ -858,7 +858,7 @@ async fn run_inner(
                                 },
                             }
                         },
-                        #[cfg(target_os = "macos")]
+                        #[cfg(unix)]
                         Command::PivTimeout { apdu_id: _ } => {
                             // Handled by `drain_piv_timeouts` after each loop
                             // iteration; reaching the commands channel is a
@@ -1012,7 +1012,7 @@ async fn run_inner(
                                 // Card absence/replacement retires a pending
                                 // PIV APDU (never carried to the next tag),
                                 // mirroring the reader.
-                                #[cfg(target_os = "macos")]
+                                #[cfg(unix)]
                                 if let Some(inf) = piv_in_flight.take() {
                                     if inf.generation != *generation || atr.is_empty() {
                                         let _ = inf.reply.send(Err(crate::ifd::TransmitError::NoCard));
@@ -1036,14 +1036,14 @@ async fn run_inner(
                                 Frame::Failed { id, .. } => probe.failed(*id),
                                 _ => {}
                             }
-                            #[cfg(target_os = "macos")]
+                            #[cfg(unix)]
                             if let Frame::Response { id, generation, data } = &frame
                                 && piv_in_flight.as_ref().is_some_and(|inf| inf.apdu_id == *id && inf.generation == *generation)
                                     && let Some(inf) = piv_in_flight.take()
                                 {
                                     let _ = inf.reply.send(Ok(data.clone()));
                                 }
-                            #[cfg(target_os = "macos")]
+                            #[cfg(unix)]
                             if let Frame::Failed { id, generation } = &frame
                                 && piv_in_flight.as_ref().is_some_and(|inf| inf.apdu_id == *id && inf.generation == *generation)
                                     && let Some(inf) = piv_in_flight.take()
@@ -1088,7 +1088,7 @@ async fn run_inner(
                 }
             }
             // PIV deadline watchdog: drain fired timers after each event.
-            #[cfg(target_os = "macos")]
+            #[cfg(unix)]
             drain_piv_timeouts(&mut piv_in_flight, &mut piv_timeout_rx);
         }
         Ok(())
@@ -2153,7 +2153,7 @@ mod tests {
 
     /// macOS: the PIV token's own SELECT and certificate read mark the
     /// card, without the service sending anything of its own.
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn piv_traffic_from_the_mac_marks_the_card_capabilities() {
         let dir = tempfile::tempdir().unwrap();

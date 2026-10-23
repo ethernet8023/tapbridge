@@ -22,3 +22,4 @@ dist/
 .DS_Store
 tapbridge-components.pkg/
 dist/
+result

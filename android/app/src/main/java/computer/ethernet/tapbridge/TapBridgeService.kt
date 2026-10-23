@@ -114,6 +114,8 @@ class TapBridgeService : Service() {
         fun onUsbPairRequest(prompt: UsbPrompt?) {}
         /** The USB link was refused or failed; tell the user why. */
         fun onUsbNotice(text: String) {}
+        /** The QR pairing in progress changed (null: none). */
+        fun onPairing(pairing: PairingFlow.View?) {}
     }
 
     /** A verified, unpaired PC on the cable whose pairing window is open. */
@@ -189,6 +191,16 @@ class TapBridgeService : Service() {
     /** The PC on the live session can pair a card with its OS login. */
     @Volatile var hostPivLogin: Boolean = false
         private set
+    /** Host the latest network attempt dials (or dialed); null before any. */
+    @Volatile var dialingHost: String? = null
+        private set
+    /** The QR pairing being shown on the pairing screen; holds the
+     *  invitation while it retries. Written via [updatePairing]. */
+    @Volatile private var pairing: PairingFlow.Pairing? = null
+    private val pairingLock = Any()
+    /** The pairing screen's view of [pairing] (never the invitation). */
+    val pairingView get() = pairing?.view
+    private val pairingTimeout = Runnable { onPairingTimeout() }
 
     // ------------------------------------------------------------ USB link
     /** The attached tapbridge accessory being served; null when none. While
@@ -283,11 +295,15 @@ class TapBridgeService : Service() {
             else -> { // ACTION_START / rebind while the UI is visible
                 startedFromUi = true
                 wakeHint = null
-                targetHost = null // app-open: connect to the last-used host
+                // App-open: the last-used host. EXTRA_HOST: the user picked
+                // a PC on the home screen, which replaces the live session.
+                val picked = intent?.getStringExtra(EXTRA_HOST)
+                targetHost = picked
                 // The app is on screen: no need to keep shouting.
                 foreground(TapNotice.QUIET)
                 registerNetworkRetry()
-                connectAsync()
+                if (picked != null) retryAttempt = 0
+                connectAsync(force = picked != null && picked != connectedHost)
             }
         }
     }
@@ -407,10 +423,13 @@ class TapBridgeService : Service() {
     private val usbBusy get() = usbAccessory != null
 
     @Synchronized
-    fun connectAsync() {
+    fun connectAsync(force: Boolean = false) {
         // The cable is the session while it is attached; no network dialing.
         if (usbBusy) return
-        if (wantsConnection && status == Status.CONNECTED) return
+        // Already connected: stay, unless a fresh scan (or a pairing still
+        // retrying) is for another PC; that replaces the session.
+        val pairingDial = PairingState.hasPending() || PairingFlow.needsDial(pairing, connectedHost)
+        if (!force && !pairingDial && wantsConnection && status == Status.CONNECTED) return
         wantsConnection = true
         val attempt = requested.incrementAndGet()
         show(Status.CONNECTING)
@@ -421,15 +440,25 @@ class TapBridgeService : Service() {
             try {
                 NativeBridge.initialize(applicationContext)
                 val key = IdentityStore.getOrCreateKey(this@TapBridgeService)
-                val invite = PairingState.consumePendingInvitation()
+                // A fresh scan starts a pairing; the pairing keeps the
+                // invitation so retries in its window redial the same PC.
+                PairingState.consumePendingInvitation().takeIf { it.isNotEmpty() }?.let { fresh ->
+                    val host = Invitation.parse(fresh)?.host ?: throw IOException("invalid invitation")
+                    beginPairing(PairingFlow.start(host, fresh, System.currentTimeMillis()))
+                }
+                val invite = pairing?.inviteToUse ?: ""
                 val hosts = IdentityStore.pairedHosts(this@TapBridgeService)
                 val invitedHost = invite.takeIf { it.isNotEmpty() }?.let {
                     Invitation.parse(it)?.host ?: throw IOException("invalid invitation")
                 }
-                // Connect-by-host-id: a wake names its host; the app (or a
-                // fresh pairing) uses the last-used/invited host. The hint is
-                // always scoped to THAT host's record.
-                val hostId = targetHost ?: invitedHost ?: IdentityStore.lastUsedHost(this@TapBridgeService)
+                // Connect-by-host-id: a pairing dials the scanned PC; a wake
+                // (or a PC picked on the home screen) names its host; else
+                // the last-used one. The hint is always scoped to THAT host.
+                val hostId = invitedHost ?: targetHost ?: IdentityStore.lastUsedHost(this@TapBridgeService)
+                if (hostId != dialingHost) {
+                    dialingHost = hostId
+                    main.post { listener?.onStatusChanged(status, lastError) }
+                }
                 val record = hostId?.let { id -> hosts.firstOrNull { it.hostId == id } }
                 val hint = when {
                     invitedHost != null -> invitedHost
@@ -447,13 +476,17 @@ class TapBridgeService : Service() {
                 // Persist the pairing before any session use; cache the dial
                 // hint on THIS host's record.
                 val acceptedHost = hint.substringBefore(";")
+                val acceptedName = NativeBridge.hostName(pointer) ?: "PC"
                 IdentityStore.saveAcceptedHost(
                     this@TapBridgeService,
                     acceptedHost,
-                    NativeBridge.hostName(pointer) ?: "PC",
+                    acceptedName,
                     NativeBridge.hostPlatform(pointer).coerceAtLeast(0),
                     NativeBridge.hostPivLogin(pointer),
                 )
+                // The stored record (a rename wins) names the PC on screen.
+                val shownName = IdentityStore.hostById(this@TapBridgeService, acceptedHost)?.name ?: acceptedName
+                updatePairing { PairingFlow.accepted(it, acceptedHost, shownName) }
                 targetHost = acceptedHost
                 connectedHost = acceptedHost
                 hostPlatform = NativeBridge.hostPlatform(pointer)
@@ -476,6 +509,7 @@ class TapBridgeService : Service() {
                 if (requested.get() == attempt) {
                     gate.closeIfActive()
                     session.close()
+                    updatePairing { PairingFlow.failedAttempt(it, error.message ?: "connection failed") }
                     show(Status.ERROR, error.message ?: "connection failed")
                     scheduleRetry(attempt)
                 }
@@ -989,6 +1023,58 @@ class TapBridgeService : Service() {
     fun retireTag() = pauseTagDiscovery()
 
     @Synchronized
+    // ------------------------------------------------------------ pairing
+
+    /** Any thread: applies [change] to the pairing atomically and tells the UI. */
+    private fun updatePairing(change: (PairingFlow.Pairing?) -> PairingFlow.Pairing?) {
+        val value = synchronized(pairingLock) {
+            val next = change(pairing)
+            if (next == pairing) return
+            pairing = next
+            next
+        }
+        if (value?.phase != PairingFlow.Phase.PAIRING) main.removeCallbacks(pairingTimeout)
+        val view = value?.view
+        main.post { listener?.onPairing(view) }
+    }
+
+    /** Any thread: a new pairing with a fresh quiet-retry window. */
+    private fun beginPairing(value: PairingFlow.Pairing) {
+        updatePairing { value }
+        retryAttempt = 0
+        main.removeCallbacks(pairingTimeout)
+        main.postDelayed(pairingTimeout, PairingFlow.WINDOW_MS)
+    }
+
+    /** Main thread: the window ran out. Show the error, then go back to
+     *  normal: the last-used PC, or nothing when none is paired yet. */
+    private fun onPairingTimeout() {
+        if (pairing?.phase != PairingFlow.Phase.PAIRING) return
+        updatePairing(PairingFlow::timedOut)
+        settleAfterPairing()
+    }
+
+    private fun settleAfterPairing() {
+        if (!wantsConnection || usbBusy) return
+        if (IdentityStore.pairedHosts(this).isEmpty()) stopSession()
+        else if (status != Status.CONNECTED) { targetHost = null; retryAttempt = 0; connectAsync(force = true) }
+    }
+
+    /** "Try again" on the pairing screen: same code, a fresh window. The
+     *  activity then starts the service, which dials it. Main thread. */
+    fun retryPairing() {
+        val next = PairingFlow.retry(pairing, System.currentTimeMillis()) ?: return
+        if (next.phase == PairingFlow.Phase.PAIRING) beginPairing(next)
+    }
+
+    /** The pairing screen closed: Cancel while pairing, or Done. Main thread. */
+    fun endPairing() {
+        PairingState.clear()
+        val was = pairing ?: return
+        updatePairing { null }
+        if (was.phase == PairingFlow.Phase.PAIRING) settleAfterPairing()
+    }
+
     fun stopSession() {
         // First: the state resets below must not re-post a notification
         // that stopForeground is about to remove.
@@ -1006,6 +1092,9 @@ class TapBridgeService : Service() {
         setAuthState(AuthState.IDLE)
         unregisterNetworkRetry()
         main.removeCallbacks(idleRunnable)
+        main.removeCallbacks(pairingTimeout)
+        updatePairing(PairingFlow::timedOut)
+        dialingHost = null
         show(Status.IDLE)
         lifecycle.execute { cleanup(); releaseUsbHandles() }
         stopForeground(STOP_FOREGROUND_REMOVE)

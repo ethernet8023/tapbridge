@@ -84,6 +84,10 @@ nix develop
 
 You can install tapbridge and set all its options from your nix-darwin config instead of using the installer: see [docs/nix-darwin.md](docs/nix-darwin.md). `nix build .#tapbridge` builds the app on its own.
 
+### Linux
+
+tapbridge gives a Linux PC a PC/SC reader (PIV, OpenSC) and a virtual FIDO security key (WebAuthn, passkeys), both backed by the card on your phone. NixOS and Home Manager modules set it all up: see [docs/nixos.md](docs/nixos.md) and [docs/home-manager.md](docs/home-manager.md). `nix build .#tapbridge` builds the app on its own.
+
 ### Windows
 
 You need Rust 1.91+, LLVM clang, the MSVC build tools (x64 and arm64 libraries) and Inno Setup 6.

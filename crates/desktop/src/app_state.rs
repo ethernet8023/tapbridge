@@ -9,7 +9,7 @@ use crate::{
     autostart,
     card_tasks::{CardTask, Effect},
     hostname, logging, login,
-    tray::{MenuAction, Tray, TrayState},
+    tray::{Tray, TrayState},
     ui, wake,
 };
 #[cfg(windows)]
@@ -31,7 +31,7 @@ const USBIP_ADDR: &str = "127.0.0.1:3240";
 
 // App-wide commands: bound to ⌘, / ⌘Q (Ctrl on Windows) and, on macOS, the
 // app menu that owns those shortcuts while a tapbridge window is focused.
-gpui::actions!(tapbridge, [OpenSettings, OpenAbout, Quit]);
+gpui::actions!(tapbridge, [OpenSettings, OpenAbout, Quit, PairPhone]);
 const TICK: Duration = Duration::from_millis(100);
 /// How long the tray shows "waiting for a tap" after a wake: the phone keeps
 /// its tap gate open this long (DESIGN.md, wake step 4).
@@ -67,6 +67,9 @@ pub enum UiEvent {
     /// Whether this card's identity is paired with the login, read after a
     /// tap (`login::present_card_paired`).
     LoginChecked(Vec<u8>, bool),
+    /// Linux: registering the card's sudo/su key finished: (ok, message).
+    #[cfg(target_os = "linux")]
+    KeyDone(bool, String),
     /// macOS: the smart card settings as read from the system.
     #[cfg(target_os = "macos")]
     SecurityRead(ui::SecurityOptions),
@@ -98,7 +101,7 @@ struct Shell {
     /// Start-at-login state, cached: Settings re-renders from it every tick.
     autostart: bool,
     /// macOS: the login card always shows as present (see
-    /// [`crate::macos::AlwaysPresent`]).
+    /// [`crate::pcsc_reader::AlwaysPresent`]).
     always_present: bool,
     /// macOS: the smart card settings, once read.
     security: Option<ui::Security>,
@@ -123,6 +126,9 @@ struct Shell {
     /// The phone asked to set up the login of this card; answer it when the
     /// pairing ends.
     phone_asked_login: Option<Vec<u8>>,
+    /// Linux: cards whose FIDO key is registered with pam_u2f (re-read when
+    /// the card list changes and after a register or remove).
+    sudo_keys: HashSet<Vec<u8>>,
     // Held for their Drop / process-lifetime handles.
     _anchor: WindowHandle<ui::Anchor>,
     #[cfg(windows)]
@@ -358,7 +364,7 @@ fn shell_setup(
     #[cfg(not(windows))]
     let _ = &instance;
     // Created on the gpui main thread, whose message loop pumps it.
-    let tray = Tray::new(crate::assets::Icons::load())
+    let tray = Tray::new(crate::assets::Icons::load(), cx)
         .inspect_err(|error| logging::log(&format!("tray unavailable: {error}")))
         .ok();
     let anchor = ui::open_anchor_window(cx);
@@ -394,11 +400,12 @@ fn shell_setup(
         setup_ok: HashSet::new(),
         new_card: None,
         phone_asked_login: None,
+        sudo_keys: HashSet::new(),
         #[cfg(windows)]
         watcher,
         _instance: Shell::instance_guard(instance),
     });
-    cx.update_global::<Shell, _>(|shell, _| shell.refresh_tray());
+    cx.update_global::<Shell, _>(|shell, cx| shell.refresh_tray(cx));
     install_commands(cx);
     cx.spawn(async move |cx: &mut AsyncApp| {
         loop {
@@ -451,10 +458,15 @@ fn managed_apply() -> bool {
             let result = autostart::set_enabled(false);
             logging::log(&format!("nix-darwin: removing our LaunchAgent: {result:?}"));
         }
-        crate::macos::ALWAYS_PRESENT.set_enabled(app.always_present);
+        crate::pcsc_reader::ALWAYS_PRESENT.set_enabled(app.always_present);
         true
     }
-    #[cfg(not(target_os = "macos"))]
+    // The Nix units start the app themselves and set the settings.
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::managed()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     false
 }
 
@@ -481,12 +493,12 @@ fn always_present_load(state_dir: &std::path::Path) -> bool {
     #[cfg(target_os = "macos")]
     {
         if let Some((_, app)) = crate::mac_security::managed() {
-            crate::macos::ALWAYS_PRESENT.load_cache(state_dir);
+            crate::pcsc_reader::ALWAYS_PRESENT.load_cache(state_dir);
             return app.always_present;
         }
-        let enabled = crate::macos::always_present_saved(state_dir);
-        crate::macos::ALWAYS_PRESENT.load_cache(state_dir);
-        crate::macos::ALWAYS_PRESENT.set_enabled(enabled);
+        let enabled = crate::pcsc_reader::always_present_saved(state_dir);
+        crate::pcsc_reader::ALWAYS_PRESENT.load_cache(state_dir);
+        crate::pcsc_reader::ALWAYS_PRESENT.set_enabled(enabled);
         enabled
     }
     #[cfg(not(target_os = "macos"))]
@@ -517,9 +529,9 @@ fn spawn_service(state_dir: PathBuf, trace: bool, events: mpsc::Sender<UiEvent>)
         match started {
             Ok(handle) => {
                 crate::usb_link::spawn(handle.clone(), runtime.handle().clone());
-                #[cfg(target_os = "macos")]
+                #[cfg(unix)]
                 spawn_ifd_server(&handle, &events);
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 spawn_security_key(&handle, &events);
                 let _ = events.send(UiEvent::ServiceStarted(handle));
                 // The service tasks live on this runtime until the process exits.
@@ -532,23 +544,24 @@ fn spawn_service(state_dir: PathBuf, trace: bool, events: mpsc::Sender<UiEvent>)
     });
 }
 
-/// macOS: serve the PC/SC IFD shim socket on a dedicated thread. The wake
-/// callback routes into the UI tick loop, reusing the exact tray
+/// macOS and Linux: serve the PC/SC IFD shim socket on a dedicated thread.
+/// The wake callback routes into the UI tick loop, reusing the exact tray
 /// "Request tap" path (ReadCard on a live session, else relay POST).
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn spawn_ifd_server(handle: &ServiceHandle, events: &mpsc::Sender<UiEvent>) {
-    match macos::listen() {
+    let path = crate::pcsc_reader::socket_path();
+    match crate::pcsc_reader::listen(&path) {
         Ok(listener) => {
             let service = handle.clone();
             let events = events.clone();
             std::thread::spawn(move || {
-                macos::serve(
+                crate::pcsc_reader::serve(
                     listener,
                     service,
                     move || {
                         let _ = events.send(UiEvent::WakeRequested);
                     },
-                    &macos::ALWAYS_PRESENT,
+                    &crate::pcsc_reader::ALWAYS_PRESENT,
                 );
             });
             logging::log("ifd: PC/SC reader socket listening");
@@ -557,9 +570,9 @@ fn spawn_ifd_server(handle: &ServiceHandle, events: &mpsc::Sender<UiEvent>) {
     }
 }
 
-/// macOS: the virtual FIDO security key browsers talk to. A request with
-/// no card on the phone asks for a tap the same way PC/SC does.
-#[cfg(target_os = "macos")]
+/// macOS and Linux: the virtual FIDO security key browsers talk to. A
+/// request with no card on the phone asks for a tap the same way PC/SC does.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn spawn_security_key(handle: &ServiceHandle, events: &mpsc::Sender<UiEvent>) {
     let events = events.clone();
     let started = crate::security_key::spawn(
@@ -678,9 +691,9 @@ fn tick(inbox: &mpsc::Receiver<UiEvent>, cx: &mut App) {
             }
             _ => {}
         }
-        cx.update_global::<Shell, _>(|shell, _| {
+        cx.update_global::<Shell, _>(|shell, cx| {
             shell.notice = None;
-            shell.refresh_tray();
+            shell.refresh_tray(cx);
         });
     }
     card_tick(cx);
@@ -694,7 +707,7 @@ fn tick(inbox: &mpsc::Receiver<UiEvent>, cx: &mut App) {
     }
     // Animate (and expire) the waiting-for-tap icon.
     if cx.global::<Shell>().waiting_since.is_some() {
-        cx.update_global::<Shell, _>(|shell, _| shell.refresh_tray());
+        cx.update_global::<Shell, _>(|shell, cx| shell.refresh_tray(cx));
     }
     // Keep an open Settings window live; prune it once closed (a failed
     // update means the window is gone).
@@ -730,21 +743,12 @@ fn tick(inbox: &mpsc::Receiver<UiEvent>, cx: &mut App) {
             + shell.about.is_some() as usize;
         macos::dock::sync(visible);
     }
-    let actions = cx
-        .global::<Shell>()
-        .tray
-        .as_ref()
-        .map(Tray::actions)
-        .unwrap_or_default();
-    for action in actions {
-        handle_action(action, cx);
-    }
 }
 
 fn handle_event(event: UiEvent, cx: &mut App) {
     match event {
         UiEvent::ServiceStarted(handle) => {
-            cx.update_global::<Shell, _>(|shell, _| {
+            cx.update_global::<Shell, _>(|shell, cx| {
                 #[cfg(target_os = "macos")]
                 if let Some((security, app)) = crate::mac_security::managed() {
                     // nix-darwin's module asserts this pairing; a hand-edited
@@ -766,15 +770,15 @@ fn handle_event(event: UiEvent, cx: &mut App) {
                         let _ = events.send(UiEvent::UsbipAttached(result));
                     });
                 }
-                shell.refresh_tray();
+                shell.refresh_tray(cx);
             });
         }
         UiEvent::ServiceFailed(error) => {
             logging::log(&format!("service failed: {error}"));
-            cx.update_global::<Shell, _>(|shell, _| {
+            cx.update_global::<Shell, _>(|shell, cx| {
                 shell.service_error = Some(error);
                 shell.notice = Some("tapbridge failed to start".into());
-                shell.refresh_tray();
+                shell.refresh_tray(cx);
             });
         }
         #[cfg(windows)]
@@ -783,13 +787,13 @@ fn handle_event(event: UiEvent, cx: &mut App) {
                 Ok(()) => logging::log("usbip: reader attached (busid 1-1)"),
                 Err(error) => logging::log(&format!("usbip: attach failed: {error}")),
             }
-            cx.update_global::<Shell, _>(|shell, _| {
+            cx.update_global::<Shell, _>(|shell, cx| {
                 shell.usbip = if result.is_ok() {
                     Usbip::Attached
                 } else {
                     Usbip::Failed
                 };
-                shell.refresh_tray();
+                shell.refresh_tray(cx);
             });
         }
         #[cfg(windows)]
@@ -821,7 +825,7 @@ fn handle_event(event: UiEvent, cx: &mut App) {
                     Some(format!("Wake failed: {reason}"))
                 }
             };
-            cx.update_global::<Shell, _>(|shell, _| {
+            cx.update_global::<Shell, _>(|shell, cx| {
                 if notice.is_some() {
                     shell.waiting_since = None;
                     if let Some(task) = shell.card_task.as_mut() {
@@ -829,7 +833,7 @@ fn handle_event(event: UiEvent, cx: &mut App) {
                     }
                 }
                 shell.notice = notice;
-                shell.refresh_tray();
+                shell.refresh_tray(cx);
             });
         }
         UiEvent::LoginDone(ok, text) => {
@@ -872,6 +876,16 @@ fn handle_event(event: UiEvent, cx: &mut App) {
                 security.status = Some(text);
             });
             read_security(cx);
+        }
+        #[cfg(target_os = "linux")]
+        UiEvent::KeyDone(ok, text) => {
+            logging::log(&format!("sudo key: registration finished, ok={ok}"));
+            cx.update_global::<Shell, _>(|shell, _| {
+                if let Some(task) = shell.card_task.as_mut() {
+                    task.paired(ok, text);
+                }
+                shell.reload_sudo_keys();
+            });
         }
         UiEvent::LoginChecked(uid, paired) => {
             cx.update_global::<Shell, _>(|shell, _| {
@@ -968,6 +982,30 @@ fn run_card_effect(effect: Effect, cx: &mut App) {
                 let _ = events.send(UiEvent::LoginDone(ok, message));
             });
         }
+        Effect::RunRegistration => {
+            #[cfg(target_os = "linux")]
+            {
+                let events = cx.global::<Shell>().events.clone();
+                let uid = cx
+                    .global::<Shell>()
+                    .card_task
+                    .as_ref()
+                    .map(|task| task.uid.clone())
+                    .unwrap_or_default();
+                logging::log("sudo key: registering the card on the phone");
+                std::thread::spawn(move || {
+                    let (ok, message) = match crate::fido_login::Paths::current() {
+                        Some(paths) => crate::fido_login::register(
+                            &paths,
+                            &uid,
+                            crate::fido_login::run_pamu2fcfg,
+                        ),
+                        None => (false, "No home directory to save the key in.".to_owned()),
+                    };
+                    let _ = events.send(UiEvent::KeyDone(ok, message));
+                });
+            }
+        }
         Effect::RunUnpairing => {
             let events = cx.global::<Shell>().events.clone();
             logging::log("login: unpairing the card on the phone");
@@ -979,18 +1017,10 @@ fn run_card_effect(effect: Effect, cx: &mut App) {
     }
 }
 
-fn handle_action(action: MenuAction, cx: &mut App) {
-    match action {
-        MenuAction::Pair => open_pairing(cx),
-        MenuAction::OpenSettings => open_settings(cx),
-        MenuAction::About => open_about(cx),
-        MenuAction::Quit => quit(cx),
-    }
-}
-
 /// Registers the app-wide commands, their shortcuts and (macOS) the app menu.
 fn install_commands(cx: &mut App) {
     cx.on_action(|_: &OpenSettings, cx| open_settings(cx));
+    cx.on_action(|_: &PairPhone, cx| open_pairing(cx));
     cx.on_action(|_: &Quit, cx| quit(cx));
     cx.on_action(|_: &OpenAbout, cx| open_about(cx));
     crate::text_input::bind_keys(cx);
@@ -1057,11 +1087,11 @@ fn settings_action(action: ui::SettingsAction, cx: &mut App) {
         ui::SettingsAction::Pair => open_pairing(cx),
         ui::SettingsAction::Forget => {
             logging::log("forget: revoking paired phone");
-            cx.update_global::<Shell, _>(|shell, _| {
+            cx.update_global::<Shell, _>(|shell, cx| {
                 if let Some(service) = shell.service.as_ref() {
                     service.forget_phone();
                 }
-                shell.refresh_tray();
+                shell.refresh_tray(cx);
             });
         }
         ui::SettingsAction::SetUseUsb(enabled) => {
@@ -1073,11 +1103,11 @@ fn settings_action(action: ui::SettingsAction, cx: &mut App) {
                 return;
             }
             logging::log(&format!("use usb cable -> {enabled}"));
-            cx.update_global::<Shell, _>(|shell, _| {
+            cx.update_global::<Shell, _>(|shell, cx| {
                 if let Some(service) = shell.service.as_ref() {
                     service.set_use_usb(enabled);
                 }
-                shell.refresh_tray();
+                shell.refresh_tray(cx);
             });
         }
         ui::SettingsAction::SetAutostart(enabled) => {
@@ -1094,10 +1124,10 @@ fn settings_action(action: ui::SettingsAction, cx: &mut App) {
                 if shell.managed {
                     return;
                 }
-                let result = crate::macos::always_present_save(&shell.state_dir, enabled);
+                let result = crate::pcsc_reader::always_present_save(&shell.state_dir, enabled);
                 logging::log(&format!("always-present card -> {enabled}: {result:?}"));
                 if result.is_ok() {
-                    crate::macos::ALWAYS_PRESENT.set_enabled(enabled);
+                    crate::pcsc_reader::ALWAYS_PRESENT.set_enabled(enabled);
                     shell.always_present = enabled;
                 }
             });
@@ -1200,6 +1230,18 @@ fn settings_action(action: ui::SettingsAction, cx: &mut App) {
             request_tap(cx);
         }
         ui::SettingsAction::OpenUrl(url) => cx.open_url(&url),
+        ui::SettingsAction::RegisterKey(uid) => {
+            #[cfg(target_os = "linux")]
+            start_key_registration(uid, cx);
+            #[cfg(not(target_os = "linux"))]
+            let _ = uid;
+        }
+        ui::SettingsAction::RemoveKey(uid) => {
+            #[cfg(target_os = "linux")]
+            remove_key(uid, cx);
+            #[cfg(not(target_os = "linux"))]
+            let _ = uid;
+        }
         ui::SettingsAction::DismissCardTask => {
             cx.update_global::<Shell, _>(|shell, _| {
                 if shell.card_task.as_ref().is_some_and(CardTask::dismissable) {
@@ -1232,6 +1274,60 @@ fn start_login(uid: Vec<u8>, cx: &mut App) -> bool {
     cx.update_global::<Shell, _>(|shell, _| shell.card_task = Some(task));
     run_card_effect(effect, cx);
     true
+}
+
+/// Linux: starts registering the card's FIDO key for sudo and su unless
+/// another card task is running. Like the login: runs at once when the card
+/// is on the phone, otherwise asks for a tap first.
+#[cfg(target_os = "linux")]
+fn start_key_registration(uid: Vec<u8>, cx: &mut App) {
+    if cx
+        .global::<Shell>()
+        .card_task
+        .as_ref()
+        .is_some_and(CardTask::busy)
+    {
+        return;
+    }
+    let status = cx
+        .global::<Shell>()
+        .service
+        .as_ref()
+        .map(ServiceHandle::status)
+        .unwrap_or_default();
+    let present = status.card_present && status.card_uid == uid;
+    let (task, effect) = CardTask::register(uid, present, Instant::now());
+    cx.update_global::<Shell, _>(|shell, _| shell.card_task = Some(task));
+    run_card_effect(effect, cx);
+}
+
+/// Linux: takes the card's key out of pam_u2f's file. It only edits files,
+/// so it needs no tap.
+#[cfg(target_os = "linux")]
+fn remove_key(uid: Vec<u8>, cx: &mut App) {
+    if cx
+        .global::<Shell>()
+        .card_task
+        .as_ref()
+        .is_some_and(CardTask::busy)
+    {
+        return;
+    }
+    let (ok, text) = match (
+        crate::fido_login::Paths::current(),
+        crate::fido_login::current_user(),
+    ) {
+        (Some(paths), Some(user)) => crate::fido_login::unregister(&paths, &user, &uid),
+        _ => (
+            false,
+            "Couldn't tell which user's key to remove.".to_owned(),
+        ),
+    };
+    logging::log(&format!("sudo key: removal finished, ok={ok}"));
+    cx.update_global::<Shell, _>(|shell, _| {
+        shell.card_task = Some(CardTask::done(uid, ok, text));
+        shell.reload_sudo_keys();
+    });
 }
 
 /// Starts removing the card from this PC's login unless another card
@@ -1312,7 +1408,7 @@ fn check_login(uid: Vec<u8>, cx: &mut App) {
 fn request_tap(cx: &mut App) -> bool {
     // A phone on the cable is switched over only now (it opens the app).
     crate::usb_link::want_phone();
-    cx.update_global::<Shell, _>(|shell, _| {
+    cx.update_global::<Shell, _>(|shell, cx| {
         let Some(service) = shell.service.as_ref() else {
             logging::log("wake: service not running");
             return false;
@@ -1350,7 +1446,7 @@ fn request_tap(cx: &mut App) -> bool {
         };
         let sent = notice.is_none();
         shell.notice = notice;
-        shell.refresh_tray();
+        shell.refresh_tray(cx);
         sent
     })
 }
@@ -1402,13 +1498,35 @@ fn quit(cx: &mut App) {
 }
 
 impl Shell {
+    /// Linux: which cards have a key in pam_u2f's file. Read here, not per
+    /// frame: Settings rebuilds its snapshot every tick.
+    #[cfg(target_os = "linux")]
+    fn reload_sudo_keys(&mut self) {
+        use crate::fido_login;
+        self.sudo_keys.clear();
+        if let (Some(paths), Some(user)) =
+            (fido_login::Paths::current(), fido_login::current_user())
+        {
+            self.sudo_keys.extend(
+                self.cards
+                    .iter()
+                    .filter(|known| fido_login::registered(&paths, &user, &known.info.uid))
+                    .map(|known| known.info.uid.clone()),
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn reload_sudo_keys(&mut self) {}
+
     fn reload_cards(&mut self) {
         if let Some(service) = self.service.as_ref() {
             self.cards = service.known_cards();
         }
+        self.reload_sudo_keys();
         // The always-present card is the one paired with this Mac's login.
         #[cfg(target_os = "macos")]
-        crate::macos::ALWAYS_PRESENT.set_atr(
+        crate::pcsc_reader::ALWAYS_PRESENT.set_atr(
             self.cards
                 .iter()
                 .rev()
@@ -1450,12 +1568,21 @@ impl Shell {
                         card.has(caps::BLOCKED),
                     ),
                     flexsecure: crate::card_tasks::is_flexsecure(&known.atr),
+                    sudo_key: cfg!(target_os = "linux").then(|| {
+                        if self.sudo_keys.contains(&card.uid) {
+                            crate::card_tasks::StepState::Done
+                        } else if card.has(caps::FIDO) {
+                            crate::card_tasks::StepState::Todo
+                        } else {
+                            crate::card_tasks::StepState::Locked
+                        }
+                    }),
                 }
             })
             .collect()
     }
 
-    fn refresh_tray(&mut self) {
+    fn refresh_tray(&mut self, cx: &mut App) {
         let status = self.service.as_ref().map(ServiceHandle::status);
         if let Some(since) = self.waiting_since
             && (since.elapsed() >= TAP_WAIT || status.as_ref().is_some_and(|s| s.card_present))
@@ -1472,7 +1599,7 @@ impl Shell {
             && state == TrayState::Disconnected
             && status.as_ref().is_some_and(|status| !status.paired);
         if let Some(tray) = self.tray.as_mut() {
-            tray.set_status(&text, state, frame, pair_action);
+            tray.set_status(&text, state, frame, pair_action, cx);
         }
     }
 
@@ -1568,7 +1695,7 @@ impl Shell {
         #[cfg(not(windows))]
         lines.push(format!(
             "PC/SC reader: {} (virtual PIV reader)",
-            crate::macos::IFD_SOCKET_PATH
+            crate::pcsc_reader::socket_path().display()
         ));
         match self.service.as_ref().map(ServiceHandle::status) {
             Some(status) => {
