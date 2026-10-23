@@ -17,17 +17,25 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.unit.dp
 import computer.ethernet.tapbridge.IdentityStore
 import computer.ethernet.tapbridge.MainActivity
+import computer.ethernet.tapbridge.PairingFlow
 import computer.ethernet.tapbridge.R
 import computer.ethernet.tapbridge.TapBridgeService
 
-/** Home: status card, the hero art for the current state, one clear action. */
+/** Home: every paired PC and its state, the hero art, one clear action. */
 @Composable
 fun HomeScreen(
     ui: MainActivity.UiState,
     onStartPair: () -> Unit,
+    onConnect: (hostId: String) -> Unit,
     onKeys: () -> Unit,
     onSettings: () -> Unit,
     modifier: Modifier = Modifier,
@@ -74,7 +82,22 @@ fun HomeScreen(
             }
         }
         Spacer(Modifier.height(12.dp))
-        StatusCard(status, if (ui.viaUsb) pcName else hostName, ui.error, viaUsb = ui.viaUsb)
+        if (paired) {
+            PcListCard(
+                hosts.sortedBy { it.pairedAt }.map { host ->
+                    PcRow(
+                        host.hostId,
+                        host.name,
+                        PairingFlow.pcState(host.hostId, ui.status, ui.connectedHost, ui.dialingHost),
+                    )
+                },
+                error = ui.error,
+                viaUsb = ui.viaUsb,
+                onConnect = onConnect,
+            )
+        } else {
+            StatusCard(status, hostName, ui.error)
+        }
         Box(
             Modifier
                 .weight(1f)
@@ -140,4 +163,90 @@ internal fun tapHint(phase: TapPhase, cardPresent: Boolean, pcName: String): Str
     TapPhase.PIN -> "Enter your key's PIN on $pcName" + if (cardPresent) ". Keep holding your key." else ""
     TapPhase.FAILED -> "Sign-in didn't finish. Try again on $pcName."
     TapPhase.ERROR -> "Something went wrong. Lift the key and try again."
+}
+
+internal data class PcRow(val hostId: String, val name: String, val state: PairingFlow.PcState)
+
+/**
+ * Every paired PC. The phone holds one session at a time: that PC shows
+ * connected / connecting / the error; the others are on standby (they wake
+ * the phone when they need a key). Tapping one connects to it instead.
+ */
+@Composable
+internal fun PcListCard(
+    rows: List<PcRow>,
+    error: String?,
+    viaUsb: Boolean,
+    onConnect: (hostId: String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    ElevatedCard(modifier.fillMaxWidth(), shape = RoundedCornerShape(28.dp)) {
+        Column(
+            Modifier
+                .heightIn(max = 260.dp)
+                .verticalScroll(rememberScrollState())
+                .padding(vertical = 6.dp),
+        ) {
+            rows.forEachIndexed { index, row ->
+                if (index > 0) HorizontalDivider(Modifier.padding(horizontal = 20.dp))
+                PcListRow(row, error, viaUsb, onConnect)
+            }
+        }
+    }
+}
+
+@Composable
+private fun PcListRow(row: PcRow, error: String?, viaUsb: Boolean, onConnect: (String) -> Unit) {
+    val canConnect = row.state == PairingFlow.PcState.STANDBY || row.state == PairingFlow.PcState.ERROR
+    val detail = when (row.state) {
+        PairingFlow.PcState.CONNECTED -> if (viaUsb) "Connected via USB" else "Connected"
+        PairingFlow.PcState.CONNECTING -> "Connecting…"
+        PairingFlow.PcState.ERROR -> error ?: "Couldn't connect"
+        PairingFlow.PcState.STANDBY -> "Standby · wakes this phone when it needs your key"
+    }
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .then(
+                if (canConnect) Modifier.clickable(onClickLabel = "Connect to ${row.name}") { onConnect(row.hostId) }
+                else Modifier,
+            )
+            .padding(horizontal = 20.dp, vertical = 14.dp)
+            .semantics(mergeDescendants = true) {},
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        PresenceDot(
+            when (row.state) {
+                PairingFlow.PcState.CONNECTED -> HomeStatus.CONNECTED
+                PairingFlow.PcState.CONNECTING -> HomeStatus.CONNECTING
+                PairingFlow.PcState.ERROR -> HomeStatus.ERROR
+                PairingFlow.PcState.STANDBY -> HomeStatus.UNPAIRED
+            },
+        )
+        Column(Modifier.weight(1f)) {
+            Text(
+                row.name,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                detail,
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (row.state == PairingFlow.PcState.ERROR) MaterialTheme.colorScheme.error
+                else MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (canConnect) {
+            Text(
+                if (row.state == PairingFlow.PcState.ERROR) "Retry" else "Connect",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+            )
+        }
+    }
 }
