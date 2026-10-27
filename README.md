@@ -4,7 +4,7 @@
 
 Some security keys and smart cards come as NFC cards, rings or implants: you use them by tapping them on something. Computers almost never have a place to tap. Phones do.
 
-With tapbridge you tap your card on your Android phone, and your computer acts as if the card were plugged right in. Use it to sign in to websites with a passkey. On a Mac you can even log in to the computer itself with your card.
+With tapbridge you tap your card on your Android phone, and your computer acts as if the card were plugged right in. Use it to sign in to websites with a passkey. On a Mac you can even log in to the computer itself with your card, and on Linux `sudo` can ask for a tap instead of your password.
 
 Your card does all the secret work. Your phone and computer only pass messages between each other, over a private, encrypted connection. Nothing stays connected while you aren't using it, so it won't drain your phone's battery.
 
@@ -20,26 +20,29 @@ Your card does all the secret work. Your phone and computer only pass messages b
 - **Wakes your phone for you.** The phone app doesn't need to be open. Your computer sends a notification when it needs your card.
 - **Log in to your Mac with your card.** tapbridge walks you through it step by step: check the card, create its login certificate on your phone, then link it to your Mac account.
 - **Your cards stay in sync.** Name a card on your phone or your computer and both know it. Both show what each card can do.
-- **Easy pairing.** Scan a code on your computer with your phone, then tap a card to check that everything works.
-- **One phone, many computers.** Pair the same phone with your desktop and your laptop.
+- **Easy pairing.** Scan a code on your computer with your phone. The phone shows when the computer has accepted it, then you tap a card to check that everything works.
+- **One phone, many computers.** Pair the same phone with your desktop and your laptop. The phone's home screen lists them all and shows which one it's talking to; tap another to switch.
 - **Careful with your card.** tapbridge never replaces certificates already on your card unless you clearly ask it to, and it never guesses your PIN.
 - **Mac security settings in one place.** Use your card for `sudo`, `su` and SSH, lock the screen when the card goes away, or turn off passwords entirely.
+- **`sudo` with a tap on Linux.** Register a card's security key for `sudo` and `su` from Settings, or let the NixOS module's `pam.sudo` / `pam.su` options set it up.
 - **Install the PC app from your phone.** Plug the phone into a Windows PC, turn on USB tethering, and download the installer from the phone in the PC's browser (Settings → Install tapbridge on a PC).
-- **Works on macOS and Windows.** The phone app is for Android phones with NFC.
+- **Works on macOS, Windows and Linux.** On Linux it's packaged for Nix, with NixOS and Home Manager modules. The phone app is for Android phones with NFC.
 
 ## Status
 
-What works today, and on which platforms. Last checked by hand in October 2026.
+What works today, and on which platforms. macOS and Android last checked by hand in October 2026. Linux runs end to end in a NixOS VM test on every push (a scripted phone answering through the real pcscd reader and the kernel's virtual FIDO key), but hasn't been tried with a real phone yet.
 
-| | macOS | Windows | Android |
-|---|---|---|---|
-| Passkeys / security keys in the browser, with PIN | ✅ (Safari, incl. Google sign-in) | ❓ not tested in a while | ✅ |
-| Pairing, unpairing, wake-up notifications | ✅ | ❓ | ✅ |
-| Create a login certificate on your card (from the phone) | ✅ | – | ✅ |
-| Log in, unlock and approve prompts with your card (instead of Touch ID) | ✅ | 🔜 | – |
-| Connect over a USB cable | 🧪 new, barely tested | 🧪 | 🧪 |
-| Mac security settings, nix-darwin module | 🧪 new, barely tested | – | – |
-| Signed / store builds | 🔜 signed | 🔜 | 🔜 Play Store |
+| | macOS | Windows | Linux | Android |
+|---|---|---|---|---|
+| Passkeys / security keys in the browser, with PIN | ✅ (Safari, incl. Google sign-in) | ❓ not tested in a while | 🧪 virtual FIDO key | ✅ |
+| Smart card reader for PIV / OpenSC (PC/SC) | ✅ | ❓ | 🧪 | – |
+| Pairing, unpairing, wake-up notifications | ✅ | ❓ | 🧪 | ✅ |
+| Create a login certificate on your card (from the phone) | ✅ | – | – | ✅ |
+| Log in, unlock and approve prompts with your card (instead of Touch ID) | ✅ | 🔜 | – | – |
+| `sudo` / `su` with a tap | 🧪 Mac security settings | – | 🧪 | – |
+| Connect over a USB cable | 🧪 new, barely tested | 🧪 | 🧪 | 🧪 |
+| Nix modules | 🧪 nix-darwin | – | 🧪 NixOS, Home Manager | – |
+| Signed / store builds | 🔜 signed | 🔜 | Nix flake only | 🔜 Play Store |
 
 ✅ works · 🧪 built, needs testing · ❓ might work · 🔜 planned · – doesn't apply
 
@@ -76,6 +79,7 @@ nix develop
 | Build the Mac installer only | `build-and-run-macos-pkg --no-install` → `dist/tapbridge-<version>-macos.pkg` |
 | Desktop windows with sample data | `cargo run -p tapbridge-desktop -- --preview-ui` (set `TAPBRIDGE_PREVIEW_DIALOG` to `new`, `paired` or `about` for other screens) |
 | README screenshots (`docs/screenshots/`) | `scripts/screenshots.sh` |
+| Linux package, and the NixOS VM test | `nix build .#tapbridge`, `nix build .#checks.x86_64-linux.vm -L` |
 | Android tests and debug APK | `build-android testDebugUnitTest assembleDebug` |
 | Install the APK on a phone | `adb install -r android/app/build/outputs/apk/debug/app-debug.apk` |
 | Play bundle (AAB) | in `android/`: `./gradlew bundleRelease` |
@@ -108,4 +112,4 @@ You need Rust 1.91+, LLVM clang, the MSVC build tools (x64 and arm64 libraries) 
 
 ### CI
 
-`.github/workflows/build.yml` runs the tests and builds the Mac installer, the Windows installers (x64 and arm64) and the Android APK on every push.
+`.github/workflows/build.yml` runs on every push: tests and clippy on each platform, the Mac installer, the Windows installers (x64 and arm64), the Android APK, the Linux Nix package with its NixOS VM test, and a check that the generated Nix option docs are up to date.
