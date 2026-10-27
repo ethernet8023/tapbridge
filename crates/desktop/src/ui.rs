@@ -1014,6 +1014,10 @@ pub enum SettingsAction {
     RemoveLogin(Vec<u8>),
     /// Close the status of the card action (or stop waiting for it).
     DismissCardTask,
+    /// Linux: make this card's FIDO key for sudo and su (pam_u2f).
+    RegisterKey(Vec<u8>),
+    /// Linux: take this card's key out of pam_u2f's key file.
+    RemoveKey(Vec<u8>),
 }
 
 impl SettingsAction {
@@ -1034,6 +1038,8 @@ impl SettingsAction {
             Self::SetUpLogin(_) => "set up login",
             Self::RemoveLogin(_) => "remove login",
             Self::DismissCardTask => "dismiss card task",
+            Self::RegisterKey(_) => "register sudo key",
+            Self::RemoveKey(_) => "remove sudo key",
         }
     }
 }
@@ -1062,6 +1068,9 @@ pub struct CardRow {
     pub task_dismissable: bool,
     /// Offer "Set up login" (this PC supports card login).
     pub offer_login: bool,
+    /// Linux: the "Approve sudo and su" step (Done: registered; Locked: the
+    /// card has no FIDO applet). `None` where unsupported.
+    pub sudo_key: Option<StepState>,
 }
 
 /// The overall state shown at the top of Settings (mirrors the tray icon).
@@ -1544,6 +1553,11 @@ fn card_details<V: ChecklistHost>(
             .child(div().h(px(1.0)).bg(rgba(0xFFFFFF1F)))
             .child(render_checklist(host, index, card, checklist, busy, cx));
     }
+    if let Some(state) = card.sudo_key {
+        details = details
+            .child(div().h(px(1.0)).bg(rgba(0xFFFFFF1F)))
+            .child(render_sudo_key(host, index, card, state, busy, cx));
+    }
     if let Some(task) = &card.task {
         details = details.child(
             div()
@@ -1553,6 +1567,67 @@ fn card_details<V: ChecklistHost>(
         );
     }
     details
+}
+
+/// Linux: one step, "Approve sudo and su with this card". Register makes a
+/// FIDO key on the card (through tapbridge's own virtual key) and files it
+/// where pam_u2f looks; Remove takes it out again.
+fn render_sudo_key<V: ChecklistHost>(
+    host: &V,
+    index: usize,
+    card: &CardRow,
+    state: StepState,
+    busy: bool,
+    cx: &mut Context<V>,
+) -> gpui::Div {
+    let _ = host;
+    let uid = card.uid.clone();
+    let mut actions = div().flex().flex_row().flex_wrap().gap(px(8.0));
+    if !busy {
+        match state {
+            StepState::Todo => {
+                actions = actions.child(
+                    card_button("step-sudo-add", index, "Register", ACCENT, 0.6, cx).on_click(
+                        cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
+                            view.checklist_action(SettingsAction::RegisterKey(uid.clone()), cx)
+                        }),
+                    ),
+                );
+            }
+            StepState::Done => {
+                actions = actions.child(
+                    card_button("step-sudo-remove", index, "Remove", 0xFFFFFF, 0.06, cx).on_click(
+                        cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {
+                            view.checklist_action(SettingsAction::RemoveKey(uid.clone()), cx)
+                        }),
+                    ),
+                );
+            }
+            _ => {}
+        }
+    }
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(14.0))
+        .child(
+            div()
+                .text_size(px(15.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(rgb(TEXT))
+                .child("Approve sudo and su with this card"),
+        )
+        .child(step_row(
+            1,
+            "Security key registered",
+            match state {
+                StepState::Done => "A tap of this card on your phone approves sudo and su.",
+                StepState::Locked => "Needs a card with a passkey (FIDO) applet.",
+                _ => "Makes a key on the card for pam_u2f. Hold the card to your phone first.",
+            },
+            state,
+            actions,
+        ))
 }
 
 /// The three login steps: applet, certificates, OS login. Each button
@@ -1864,11 +1939,35 @@ fn card_button(
         .child(label.into())
 }
 
-/// The nix-darwin guide in the tapbridge repo.
+/// The guide for the Nix setup that manages the settings, in the tapbridge repo.
+#[cfg(not(target_os = "linux"))]
 pub const MANAGED_GUIDE: &str =
     "https://github.com/ethernet8023/tapbridge/blob/main/docs/nix-darwin.md";
+#[cfg(target_os = "linux")]
+pub const MANAGED_GUIDE: &str = "https://github.com/ethernet8023/tapbridge/blob/main/docs/nixos.md";
 
-/// Shown above the (grayed out) settings when nix-darwin manages them.
+/// What manages the settings, as the notice names it.
+#[cfg(not(target_os = "linux"))]
+const MANAGED_BY: &str = "nix-darwin";
+#[cfg(target_os = "linux")]
+const MANAGED_BY: &str = "Nix";
+
+#[cfg(not(target_os = "linux"))]
+const MANAGED_WHERE: &str = "programs.tapbridge in your nix-darwin config";
+#[cfg(target_os = "linux")]
+const MANAGED_WHERE: &str = "services.tapbridge (NixOS) or programs.tapbridge (Home Manager)";
+
+/// Under the grayed-out "Start at login" when Nix manages it: the option that
+/// decides it. Whether the app starts is the Nix unit's business, so the
+/// toggle only reports it.
+#[cfg(not(target_os = "linux"))]
+const MANAGED_START_AT_LOGIN: &str =
+    "Set by programs.tapbridge.startAtLogin in your nix-darwin config.";
+#[cfg(target_os = "linux")]
+const MANAGED_START_AT_LOGIN: &str =
+    "Set by startAtLogin in services.tapbridge (NixOS) or programs.tapbridge (Home Manager).";
+
+/// Shown above the (grayed out) settings when Nix manages them.
 fn managed_notice(cx: &mut App) -> impl IntoElement {
     glass::panel("managed", 14.0, cx)
         .id("managed")
@@ -1882,13 +1981,15 @@ fn managed_notice(cx: &mut App) -> impl IntoElement {
             div()
                 .text_size(px(15.0))
                 .font_weight(gpui::FontWeight::MEDIUM)
-                .child("Managed by nix-darwin"),
+                .child(format!("Managed by {MANAGED_BY}")),
         )
         .child(
             div()
                 .text_size(px(12.5))
                 .text_color(rgb(ACCENT_SOFT))
-                .child("Change these settings in programs.tapbridge in your nix-darwin config. Open the guide →"),
+                .child(format!(
+                    "Change these settings in {MANAGED_WHERE}. Open the guide →"
+                )),
         )
         .on_click(|_, _, cx| cx.open_url(MANAGED_GUIDE))
 }
@@ -2037,7 +2138,11 @@ impl Render for SettingsView {
                     autostart,
                     !managed,
                     "Start at login",
-                    String::new(),
+                    if managed {
+                        MANAGED_START_AT_LOGIN.to_owned()
+                    } else {
+                        String::new()
+                    },
                     cx,
                 )
                 .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _, cx| {

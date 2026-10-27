@@ -204,11 +204,36 @@ fn invalid() -> io::Error {
     )
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+/// Linux: sealed by the Secret Service when one is running, else a plain
+/// 0600 file (like an ssh key). Tests never touch the user's keyring.
+#[cfg(target_os = "linux")]
+fn protect(data: &[u8]) -> io::Result<Vec<u8>> {
+    if cfg!(test) {
+        return Ok(data.to_vec());
+    }
+    match crate::secret_service::seal(data) {
+        Ok(sealed) => Ok(sealed),
+        Err(error) => {
+            eprintln!("tapbridge: identity stored unsealed (0600 file): {error}");
+            Ok(data.to_vec())
+        }
+    }
+}
+/// A sealed record is never opened without its key, so a missing Secret
+/// Service fails loudly instead of re-keying.
+#[cfg(target_os = "linux")]
+fn unprotect(data: &[u8]) -> io::Result<Vec<u8>> {
+    if data.starts_with(crate::secret_service::MAGIC) {
+        crate::secret_service::open(data)
+    } else {
+        Ok(data.to_vec())
+    }
+}
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
 fn protect(data: &[u8]) -> io::Result<Vec<u8>> {
     Ok(data.to_vec())
 }
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
 fn unprotect(data: &[u8]) -> io::Result<Vec<u8>> {
     Ok(data.to_vec())
 }

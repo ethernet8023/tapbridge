@@ -1,13 +1,15 @@
-//! macOS virtual FIDO security key: browsers (Safari included) see a USB
-//! security key; every CTAP request is relayed to the card on the phone
-//! over the live session. Keys never leave the card.
+//! Virtual FIDO security key (macOS and Linux): browsers see a USB security
+//! key; every CTAP request is relayed to the card on the phone over the live
+//! session. Keys never leave the card.
 //!
 //! Layers: [`tapbridge_host::ctaphid::Engine`] (HID framing),
 //! [`run_request`] (wait for a card, wake the phone, relay with
-//! [`tapbridge_host::ctap_nfc::relay`]), and [`hid`] (the IOKit virtual
-//! device). Creating the device needs Apple's restricted
-//! `com.apple.developer.hid.virtual.device` entitlement; without it the
-//! device is simply not created and the rest of the app runs as before.
+//! [`tapbridge_host::ctap_nfc::relay`]), and [`hid`] (the virtual device:
+//! IOKit on macOS, `/dev/uhid` on Linux). If the OS refuses the device
+//! (macOS without Apple's restricted
+//! `com.apple.developer.hid.virtual.device` entitlement; Linux without
+//! access to `/dev/uhid`) it is simply not created and the rest of the app
+//! runs as before.
 
 use std::{
     sync::{
@@ -240,14 +242,22 @@ impl Shared {
 
 enum Input {
     Report(Vec<u8>),
-    Done { cid: u32, reply: Vec<u8> },
-    Status { cid: u32, status: u8 },
+    /// The last program closed the device: whatever it was waiting for is
+    /// moot, so a pending tap request must not keep the phone waiting.
+    Released,
+    Done {
+        cid: u32,
+        reply: Vec<u8>,
+    },
+    Status {
+        cid: u32,
+        status: u8,
+    },
 }
 
 /// Creates the virtual security key and serves it on background threads.
 /// `wake` asks the phone for a tap (the tray's request-tap path). Returns
-/// an error (and changes nothing) when macOS refuses the device, e.g.
-/// without the HID virtual device entitlement.
+/// an error (and changes nothing) when the OS refuses the device.
 pub fn spawn(
     service: ServiceHandle,
     wake: impl Fn() + Send + Sync + 'static,
@@ -264,12 +274,30 @@ fn spawn_with_card(
     card: Arc<dyn Card + Send + Sync>,
     log: Arc<dyn Fn(&str) + Send + Sync>,
 ) -> Result<(), String> {
+    start(hid::Device::create, card, log)
+}
+
+/// [`spawn_with_card`] with the device factory as a parameter, so tests can
+/// back the key with a fake kernel side instead of the real OS device.
+fn start<D>(
+    create: impl FnOnce(Box<dyn Fn(&[u8]) + Send>, Box<dyn Fn() + Send>) -> Result<D, String>,
+    card: Arc<dyn Card + Send + Sync>,
+    log: Arc<dyn Fn(&str) + Send + Sync>,
+) -> Result<(), String>
+where
+    D: Send + 'static + Sink,
+{
     let (tx, rx) = mpsc::channel::<Input>();
     let reports = tx.clone();
-    let device = hid::Device::create(move |report| {
-        let _ = reports.send(Input::Report(report.to_vec()));
-    })
-    .ok_or("macOS refused the virtual HID device (missing entitlement?)")?;
+    let released = tx.clone();
+    let device = create(
+        Box::new(move |report| {
+            let _ = reports.send(Input::Report(report.to_vec()));
+        }),
+        Box::new(move || {
+            let _ = released.send(Input::Released);
+        }),
+    )?;
     std::thread::Builder::new()
         .name("security-key".into())
         .spawn(move || drive(device, rx, tx, card, log))
@@ -277,10 +305,15 @@ fn spawn_with_card(
     Ok(())
 }
 
+/// The part of a virtual device the driver loop uses.
+trait Sink {
+    fn send(&self, report: &[u8]);
+}
+
 /// The driver loop: owns the engine and the device; one worker thread per
 /// CTAP request.
 fn drive(
-    device: hid::Device,
+    device: impl Sink,
     rx: mpsc::Receiver<Input>,
     tx: mpsc::Sender<Input>,
     card: Arc<dyn Card + Send + Sync>,
@@ -352,6 +385,12 @@ fn drive(
                     });
                 }
             }
+            Ok(Input::Released) => {
+                if let Some(flag) = cancel_flag.take() {
+                    log("security key: device closed, cancelling the pending request");
+                    flag.store(true, Ordering::SeqCst);
+                }
+            }
             Ok(Input::Status { cid, status }) => {
                 if engine.busy_cid() == Some(cid) {
                     engine.set_status(status);
@@ -376,138 +415,14 @@ fn drive(
     }
 }
 
-/// The IOKit virtual HID device (`IOHIDUserDevice`), FIDO report
-/// descriptor, 64-byte reports both ways.
-mod hid {
-    use block2::RcBlock;
-    use core_foundation::{
-        base::{CFType, TCFType},
-        data::CFData,
-        dictionary::CFDictionary,
-        number::CFNumber,
-        string::CFString,
-    };
-    use dispatch2::{DispatchQueue, DispatchRetained};
-    use std::ffi::c_void;
-
-    /// FIDO HID report descriptor (CTAP 2.2 §11.2.8.1): usage page 0xF1D0,
-    /// 64-byte input and output reports, no report IDs.
-    const DESCRIPTOR: [u8; 34] = [
-        0x06, 0xD0, 0xF1, 0x09, 0x01, 0xA1, 0x01, // FIDO page, U2F device, app collection
-        0x09, 0x20, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x40, 0x81, 0x02, // input
-        0x09, 0x21, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x40, 0x91,
-        0x02, // output
-        0xC0,
-    ];
-    /// pid.codes test VID; distinct PID from the IFD reader's.
-    const VENDOR_ID: i32 = 0x1209;
-    const PRODUCT_ID: i32 = 0x7A72;
-    const OUTPUT_REPORT: u32 = 1; // kIOHIDReportTypeOutput
-
-    type Ref = *mut c_void;
-
-    #[link(name = "IOKit", kind = "framework")]
-    unsafe extern "C" {
-        fn IOHIDUserDeviceCreateWithProperties(
-            allocator: *const c_void,
-            properties: *const c_void,
-            options: u32,
-        ) -> Ref;
-        fn IOHIDUserDeviceRegisterSetReportBlock(device: Ref, block: *mut c_void);
-        fn IOHIDUserDeviceSetDispatchQueue(device: Ref, queue: *mut c_void);
-        fn IOHIDUserDeviceActivate(device: Ref);
-        fn IOHIDUserDeviceHandleReportWithTimeStamp(
-            device: Ref,
-            timestamp: u64,
-            report: *const u8,
-            length: isize,
-        ) -> i32;
-    }
-    unsafe extern "C" {
-        fn mach_absolute_time() -> u64;
-    }
-
-    pub struct Device {
-        raw: Ref,
-        _queue: DispatchRetained<DispatchQueue>,
-        _block: RcBlock<dyn Fn(u32, u32, *const u8, isize) -> i32>,
-    }
-
-    // SAFETY: IOHIDUserDevice is a CF object; handle-report calls are
-    // thread-safe per IOKit, and the set-report block runs on our queue.
-    unsafe impl Send for Device {}
-
-    impl Device {
-        /// Creates and activates the device; `on_output` receives each
-        /// output report (on a private dispatch queue). None when macOS
-        /// refuses (no entitlement).
-        pub fn create(on_output: impl Fn(&[u8]) + 'static) -> Option<Self> {
-            let number = |n: i32| CFNumber::from(n).as_CFType();
-            let text = |s: &str| CFString::new(s).as_CFType();
-            let properties: CFDictionary<CFString, CFType> = CFDictionary::from_CFType_pairs(&[
-                (
-                    CFString::new("ReportDescriptor"),
-                    CFData::from_buffer(&DESCRIPTOR).as_CFType(),
-                ),
-                (CFString::new("VendorID"), number(VENDOR_ID)),
-                (CFString::new("ProductID"), number(PRODUCT_ID)),
-                (CFString::new("Transport"), text("USB")),
-                (CFString::new("Product"), text("tapbridge security key")),
-                (CFString::new("Manufacturer"), text("tapbridge")),
-                (CFString::new("SerialNumber"), text("tapbridge-1")),
-            ]);
-            // SAFETY: valid CFDictionary; returns a +1 ref or null.
-            let raw = unsafe {
-                IOHIDUserDeviceCreateWithProperties(
-                    std::ptr::null(),
-                    properties.as_concrete_TypeRef() as *const c_void,
-                    0,
-                )
-            };
-            if raw.is_null() {
-                return None;
-            }
-            let block = RcBlock::new(
-                move |kind: u32, _id: u32, report: *const u8, length: isize| -> i32 {
-                    if kind == OUTPUT_REPORT && !report.is_null() && length > 0 {
-                        // SAFETY: IOKit passes a buffer of `length` bytes.
-                        on_output(unsafe { std::slice::from_raw_parts(report, length as usize) });
-                    }
-                    0 // kIOReturnSuccess
-                },
-            );
-            let queue = DispatchQueue::new("computer.ethernet.tapbridge.security-key", None);
-            // SAFETY: registration before activation, as the header requires;
-            // the block and queue outlive the device (owned by `Device`).
-            unsafe {
-                IOHIDUserDeviceRegisterSetReportBlock(raw, RcBlock::as_ptr(&block).cast());
-                IOHIDUserDeviceSetDispatchQueue(
-                    raw,
-                    (&*queue as *const DispatchQueue).cast_mut().cast(),
-                );
-                IOHIDUserDeviceActivate(raw);
-            }
-            Some(Self {
-                raw,
-                _queue: queue,
-                _block: block,
-            })
-        }
-
-        /// Delivers one input report to the host.
-        pub fn send(&self, report: &[u8]) {
-            // SAFETY: live device; the report buffer is valid for the call.
-            unsafe {
-                IOHIDUserDeviceHandleReportWithTimeStamp(
-                    self.raw,
-                    mach_absolute_time(),
-                    report.as_ptr(),
-                    report.len() as isize,
-                );
-            }
-        }
-    }
-}
+#[cfg(target_os = "macos")]
+mod iokit;
+#[cfg(target_os = "linux")]
+mod uhid;
+#[cfg(target_os = "macos")]
+use iokit as hid;
+#[cfg(target_os = "linux")]
+use uhid as hid;
 
 #[cfg(test)]
 mod tests {
@@ -520,9 +435,11 @@ mod tests {
     /// registry. Needs the entitlement (sign the test binary with
     /// packaging/macos/tapbridge.entitlements; AMFI off or a profile).
     #[test]
+    #[cfg(target_os = "macos")]
     #[ignore = "needs the HID virtual device entitlement"]
     fn virtual_device_registers_with_iokit() {
-        let device = hid::Device::create(|_| {}).expect("device created (entitlement present?)");
+        let device =
+            hid::Device::create(|_| {}, || {}).expect("device created (entitlement present?)");
         let listing = std::process::Command::new("ioreg")
             .args(["-r", "-c", "IOHIDUserDevice", "-l"])
             .output()
@@ -625,31 +542,31 @@ print("max_msg_size", info.max_msg_size)
     /// Taps power-cycle the card and bump the generation; `lose_at` makes
     /// the n-th APDU fail (the card left mid-request) and leaves the
     /// phone without a card until the next `request_tap`.
-    struct SimCard {
+    pub(super) struct SimCard {
         inner: Mutex<Sim>,
     }
 
-    struct Sim {
+    pub(super) struct Sim {
         card: Authenticator,
         generation: u64,
-        present: bool,
+        pub(super) present: bool,
         apdus: usize,
         lose_at: Vec<usize>,
         /// Whether a requested tap actually happens (the user taps).
-        user_taps: bool,
+        pub(super) user_taps: bool,
         /// Silent re-tap right after the n-th APDU was answered.
         retap_after: Vec<usize>,
         /// A lost card keeps showing as present (same generation) until
         /// the next real tap: the stale flag of the live failure.
         stale_presence: bool,
         stale_presence_on_loss: bool,
-        taps: usize,
+        pub(super) taps: usize,
         retaps: usize,
         states: Vec<u8>,
     }
 
     impl SimCard {
-        fn new(card: Authenticator) -> Self {
+        pub(super) fn new(card: Authenticator) -> Self {
             Self {
                 inner: Mutex::new(Sim {
                     card,
@@ -668,7 +585,7 @@ print("max_msg_size", info.max_msg_size)
             }
         }
 
-        fn sim(&self) -> std::sync::MutexGuard<'_, Sim> {
+        pub(super) fn sim(&self) -> std::sync::MutexGuard<'_, Sim> {
             self.inner.lock().unwrap()
         }
 
@@ -1050,5 +967,229 @@ print("retries after", pin.get_pin_retries()[0])
         shared.resync(7);
         shared.tick(Instant::now());
         assert!(!shared.proxy.lock().unwrap().has_session());
+    }
+}
+
+/// The whole key against a fake `/dev/uhid` kernel: HID reports in and out
+/// through the real `Engine`, the PIN proxy and a simulated card.
+#[cfg(all(test, target_os = "linux"))]
+mod uhid_driver_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use tapbridge_host::ctap_pin::fake::Authenticator;
+
+    const EVENT: usize = 4 + 4372;
+
+    struct Kernel(UnixStream);
+
+    impl Kernel {
+        fn send_event(&mut self, kind: u32, body: &[u8]) {
+            let mut buffer = vec![0u8; EVENT];
+            buffer[..4].copy_from_slice(&kind.to_le_bytes());
+            buffer[4..4 + body.len()].copy_from_slice(body);
+            self.0.write_all(&buffer).unwrap();
+        }
+
+        /// A hidraw write: report ID 0 plus the 64-byte report.
+        fn write_report(&mut self, report: &[u8; 64]) {
+            let mut body = vec![0u8; 4099];
+            body[1..65].copy_from_slice(report);
+            body[4096..4098].copy_from_slice(&65u16.to_le_bytes());
+            self.send_event(6, &body);
+        }
+
+        /// Next event of `kind`, skipping others (CREATE2, DESTROY...).
+        fn next_event(&mut self, kind: u32) -> Vec<u8> {
+            loop {
+                let mut buffer = vec![0u8; EVENT];
+                self.0.read_exact(&mut buffer).unwrap();
+                if u32::from_le_bytes(buffer[..4].try_into().unwrap()) == kind {
+                    return buffer[4..].to_vec();
+                }
+            }
+        }
+
+        /// Reads input reports until a message (any command but KEEPALIVE)
+        /// is complete; returns (cmd, payload).
+        fn read_message(&mut self) -> (u8, Vec<u8>) {
+            let (mut cmd, mut want, mut data) = (0u8, 0usize, Vec::new());
+            loop {
+                let body = self.next_event(12); // UHID_INPUT2
+                let size = u16::from_le_bytes([body[0], body[1]]) as usize;
+                assert_eq!(size, 64);
+                let report = &body[2..2 + size];
+                if report[4] & 0x80 != 0 {
+                    if report[4] & 0x7F == ctaphid::CMD_KEEPALIVE {
+                        continue;
+                    }
+                    cmd = report[4] & 0x7F;
+                    want = u16::from_be_bytes([report[5], report[6]]) as usize;
+                    data = report[7..].to_vec();
+                } else {
+                    data.extend_from_slice(&report[5..]);
+                }
+                if data.len() >= want {
+                    data.truncate(want);
+                    return (cmd, data);
+                }
+            }
+        }
+    }
+
+    fn init_report(cid: u32, cmd: u8, payload: &[u8]) -> [u8; 64] {
+        let mut report = [0u8; 64];
+        report[..4].copy_from_slice(&cid.to_be_bytes());
+        report[4] = 0x80 | cmd;
+        report[5..7].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+        report[7..7 + payload.len()].copy_from_slice(payload);
+        report
+    }
+
+    struct Wired {
+        kernel: Kernel,
+        cid: u32,
+        card: Arc<super::tests::SimCard>,
+    }
+
+    fn wire_up(card: super::tests::SimCard) -> Wired {
+        let (kernel, ours) = UnixStream::pair().unwrap();
+        let card = Arc::new(card);
+        let log: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|_| {});
+        start(
+            move |on_output, on_release| {
+                hid::Device::from_streams(
+                    Box::new(ours.try_clone().unwrap()),
+                    Box::new(ours),
+                    on_output,
+                    on_release,
+                )
+            },
+            card.clone(),
+            log,
+        )
+        .unwrap();
+        let mut kernel = Kernel(kernel);
+        kernel.send_event(4, &[]); // UHID_OPEN
+        kernel.write_report(&init_report(
+            ctaphid::BROADCAST_CID,
+            ctaphid::CMD_INIT,
+            &[9; 8],
+        ));
+        let (cmd, payload) = kernel.read_message();
+        assert_eq!(cmd, ctaphid::CMD_INIT);
+        assert_eq!(&payload[..8], &[9; 8], "nonce echoed");
+        let cid = u32::from_be_bytes(payload[8..12].try_into().unwrap());
+        Wired { kernel, cid, card }
+    }
+
+    #[test]
+    fn a_browser_gets_info_through_the_virtual_key() {
+        let mut wired = wire_up(super::tests::SimCard::new(Authenticator::new(None, &[2])));
+        let cid = wired.cid;
+        // CTAPHID_CBOR authenticatorGetInfo (0x04).
+        wired
+            .kernel
+            .write_report(&init_report(cid, ctaphid::CMD_CBOR, &[0x04]));
+        let (cmd, reply) = wired.kernel.read_message();
+        assert_eq!(cmd, ctaphid::CMD_CBOR);
+        assert_eq!(reply[0], 0x00, "CTAP2_OK from the card");
+        assert!(reply.len() > 8, "a CBOR GetInfo map follows the status");
+        assert_eq!(
+            wired.card.sim().taps,
+            0,
+            "the card was already on the phone"
+        );
+    }
+
+    #[test]
+    fn closing_the_device_cancels_a_request_waiting_for_a_tap() {
+        let card = super::tests::SimCard::new(Authenticator::new(None, &[2]));
+        {
+            let mut sim = card.sim();
+            sim.present = false;
+            sim.user_taps = false;
+        }
+        let mut wired = wire_up(card);
+        let cid = wired.cid;
+        wired
+            .kernel
+            .write_report(&init_report(cid, ctaphid::CMD_CBOR, &[0x04]));
+        while wired.card.sim().taps == 0 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        wired.kernel.send_event(5, &[]); // UHID_CLOSE: the browser went away
+        let (cmd, reply) = wired.kernel.read_message();
+        assert_eq!(cmd, ctaphid::CMD_CBOR);
+        assert_eq!(reply, vec![CTAP2_ERR_KEEPALIVE_CANCEL]);
+    }
+}
+
+/// Against the real kernel and a real FIDO client. Both need root (for
+/// `/dev/uhid`) and libfido2's `fido2-token`, so they only run on purpose:
+/// the NixOS VM test (`nix flake check`) runs them as root.
+#[cfg(all(test, target_os = "linux"))]
+mod uhid_live_tests {
+    use super::*;
+    use tapbridge_host::ctap_pin::fake::Authenticator;
+
+    /// The `/dev/hidrawN` of the virtual key, once the kernel has made it.
+    fn wait_for_hidraw() -> String {
+        for _ in 0..100 {
+            for entry in std::fs::read_dir("/sys/class/hidraw")
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let uevent =
+                    std::fs::read_to_string(entry.path().join("device/uevent")).unwrap_or_default();
+                if uevent.contains("HID_NAME=tapbridge security key") {
+                    return format!("/dev/{}", entry.file_name().to_string_lossy());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("no hidraw node named \"tapbridge security key\" appeared");
+    }
+
+    #[test]
+    #[ignore = "needs root (/dev/uhid) and fido2-token (libfido2) on PATH"]
+    fn libfido2_reads_get_info_through_the_real_kernel() {
+        let card = Arc::new(super::tests::SimCard::new(Authenticator::new(None, &[2])));
+        let log: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|line| eprintln!("{line}"));
+        start(hid::Device::create, card, log).expect("create the virtual key (root?)");
+        let path = wait_for_hidraw();
+        let output = std::process::Command::new("fido2-token")
+            .args(["-I", &path])
+            .output()
+            .expect("run fido2-token");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("FIDO_2_0"),
+            "versions in the GetInfo reply: {stdout}"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs root (/dev/uhid) and fido2-token (libfido2) on PATH"]
+    fn libfido2_lists_the_virtual_key() {
+        let card = Arc::new(super::tests::SimCard::new(Authenticator::new(None, &[2])));
+        let log: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|line| eprintln!("{line}"));
+        start(hid::Device::create, card, log).expect("create the virtual key (root?)");
+        let path = wait_for_hidraw();
+        let listing = std::process::Command::new("fido2-token")
+            .arg("-L")
+            .output()
+            .expect("run fido2-token");
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        assert!(
+            listing.contains(&path) && listing.contains("vendor=0x1209, product=0x7a73"),
+            "fido2-token -L: {listing}"
+        );
     }
 }

@@ -5,13 +5,19 @@
 //! the relay, and shows pairing/status windows through gpui. On macOS the
 //! same service stack backs a PC/SC reader (see `macos`), with PIV/cert
 //! flows only — WebAuthn is Track B.
+#[cfg(target_os = "linux")]
+mod fido_login;
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod mac_login;
 #[cfg(target_os = "macos")]
 mod mac_security;
 #[cfg(target_os = "macos")]
 mod macos;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
+mod pcsc_reader;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod security_key;
 
 mod about;
@@ -52,9 +58,9 @@ fn state_dir() -> PathBuf {
     {
         macos::state_dir()
     }
-    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[cfg(target_os = "linux")]
     {
-        PathBuf::from("tapbridge-state")
+        linux::state_dir()
     }
 }
 

@@ -1,0 +1,11 @@
+# tapbridge: USB cable link, device access for the logged-in user (systemd "uaccess").
+# Installed by the Nix modules; copy to /etc/udev/rules.d/ elsewhere.
+
+# A phone to switch into Android Open Accessory mode (the USB cable link):
+# MTP and PTP phones (flagged by systemd's hwdb / libmtp / gphoto rules, which
+# run before this file) and ADB-enabled ones.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_MTP_DEVICE}=="1", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_GPHOTO2}=="1", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:ff4201:*", TAG+="uaccess"
+# ...and the phone once it is in accessory mode.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d0[0-5]", TAG+="uaccess"

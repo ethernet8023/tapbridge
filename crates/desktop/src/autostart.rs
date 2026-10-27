@@ -103,4 +103,15 @@ mod imp {
     }
 }
 
+#[cfg(target_os = "linux")]
+mod imp {
+    pub fn is_enabled() -> bool {
+        crate::linux::autostart_is_enabled()
+    }
+
+    pub fn set_enabled(enabled: bool) -> Result<(), String> {
+        crate::linux::autostart_set_enabled(enabled)
+    }
+}
+
 pub use imp::{is_enabled, set_enabled};

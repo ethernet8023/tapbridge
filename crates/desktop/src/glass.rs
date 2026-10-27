@@ -4,16 +4,21 @@
 //! Glass only looks like glass over something to bend, so every window paints
 //! [`backdrop`] first: the brand gradient plus a few soft colour orbs. Panels
 //! and buttons painted on top refract it.
+//!
+//! Windows draws with GPUI's DirectX renderer, which can't run the glass
+//! shader (a wgpu backdrop hook), so there the same surfaces fall back to a
+//! plain frosted look: a native backdrop blur, the tint, and a hairline rim
+//! standing in for the glass edge light.
+#[cfg(not(windows))]
+use gpui::canvas;
 use gpui::{
-    AnyElement, App, Div, Global, IntoElement, ParentElement, Styled, canvas, div,
-    linear_color_stop, linear_gradient, px, rgb, rgba,
+    AnyElement, App, Div, Global, IntoElement, ParentElement, Styled, div, linear_color_stop,
+    linear_gradient, px, rgb, rgba,
 };
-use gpui_glass::{GlassContour, GlassDraw, GlassParams, GlassRenderer, Shape};
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-    sync::Arc,
-};
+#[cfg(not(windows))]
+use gpui_glass::{GlassContour, GlassDraw, Shape};
+use gpui_glass::{GlassParams, GlassRenderer};
+use std::sync::Arc;
 
 /// One renderer for the whole app: it caches per-surface GPU state by ID.
 struct SharedGlass(Arc<GlassRenderer>);
@@ -27,7 +32,12 @@ fn renderer(cx: &mut App) -> Arc<GlassRenderer> {
 }
 
 /// Stable surface ID from a string key; must be unique per visible surface.
+#[cfg(not(windows))]
 fn surface_id(key: &str) -> u64 {
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+    };
     let mut hash = DefaultHasher::new();
     key.hash(&mut hash);
     hash.finish()
@@ -70,8 +80,40 @@ fn rgb_f(hex: u32) -> [f32; 3] {
     ]
 }
 
+/// The edge light's stand-in on Windows: a white hairline.
+#[cfg(windows)]
+const RIM: u32 = 0xFFFFFF2E;
+
+/// Windows: a frosted surface with the glass's tint, blur and a rim, since
+/// DirectX can't run the glass shader. Same shape and placement as the glass.
+#[cfg(windows)]
+fn frost(params: &GlassParams) -> Div {
+    let [r, g, b] = params.tint_color;
+    div()
+        .absolute()
+        .inset_0()
+        .backdrop_blur(px(params.blur))
+        .bg(gpui::Rgba::new(r, g, b, params.opacity))
+}
+
+#[cfg(windows)]
+fn layer(
+    _renderer: Arc<GlassRenderer>,
+    _key: &str,
+    params: GlassParams,
+    radius: Option<f32>,
+) -> AnyElement {
+    let surface = frost(&params).border_1().border_color(rgba(RIM));
+    match radius {
+        None => surface.rounded_full(),
+        Some(radius) => surface.rounded(px(radius)),
+    }
+    .into_any_element()
+}
+
 /// Glass behind whatever is laid out in the parent: a squircle with `radius`,
 /// or a capsule. Absolute and full-size, so add it as the parent's first child.
+#[cfg(not(windows))]
 fn layer(
     renderer: Arc<GlassRenderer>,
     key: &str,
@@ -155,10 +197,8 @@ pub fn dialog(key: &str, radius: f32, cx: &mut App) -> Div {
     ))
 }
 
-/// Full-window glass scrim under a dialog: blurs and dims the window.
-/// Absolute and full-size.
-pub fn scrim(key: &str, cx: &mut App) -> Div {
-    let params = GlassParams {
+fn scrim_params() -> GlassParams {
+    GlassParams {
         tint_color: [0.04, 0.03, 0.07],
         opacity: 0.35,
         blur: 18.0,
@@ -167,20 +207,32 @@ pub fn scrim(key: &str, cx: &mut App) -> Div {
         dispersion: 0.0,
         light: 0.0,
         ..panel_params()
-    };
+    }
+}
+
+/// Full-window glass scrim under a dialog: blurs and dims the window.
+/// Absolute and full-size.
+#[cfg(not(windows))]
+pub fn scrim(key: &str, cx: &mut App) -> Div {
     div().absolute().inset_0().child(
         gpui_glass::glass_layer(
             renderer(cx),
             surface_id(key),
             GlassParams {
                 dynamic_shape: true,
-                ..params
+                ..scrim_params()
             },
             Shape::Rectangle,
         )
         .absolute()
         .inset_0(),
     )
+}
+
+/// Full-window frosted scrim under a dialog (no rim: it has no edge).
+#[cfg(windows)]
+pub fn scrim(_key: &str, _cx: &mut App) -> Div {
+    div().absolute().inset_0().child(frost(&scrim_params()))
 }
 
 /// A capsule glass button tinted `tint` (a 0xRRGGBB brand colour).

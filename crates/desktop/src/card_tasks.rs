@@ -21,6 +21,9 @@ pub enum Effect {
     RunPairing,
     /// Remove the login pairing now: the card is on the phone.
     RunUnpairing,
+    /// Register the card's FIDO credential for sudo/su now (Linux): the card
+    /// is on the phone.
+    RunRegistration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,6 +46,8 @@ pub enum Step {
     Pairing,
     /// `sc_auth unpair` is running.
     Unpairing,
+    /// `pamu2fcfg` is making the credential (Linux).
+    Registering,
     Finished {
         ok: bool,
         text: String,
@@ -55,6 +60,8 @@ pub struct CardTask {
     pub step: Step,
     /// A login task removes the pairing instead of adding it.
     pub unpair: bool,
+    /// A sudo/su key registration (Linux) instead of a login pairing.
+    pub register: bool,
 }
 
 impl CardTask {
@@ -65,6 +72,7 @@ impl CardTask {
                 uid,
                 step: Step::OnPhone,
                 unpair: false,
+                register: false,
             },
             Effect::SendSetup,
         )
@@ -118,6 +126,7 @@ impl CardTask {
                 uid,
                 step,
                 unpair: false,
+                register: false,
             },
             effect,
         )
@@ -136,14 +145,38 @@ impl CardTask {
                 uid,
                 step,
                 unpair: true,
+                register: false,
             },
             effect,
         )
     }
 
-    /// The pairing (or unpairing) finished.
+    /// "Register" for sudo and su (Linux): like the login, it runs at once
+    /// when the card is on the phone and otherwise asks for a tap first.
+    #[cfg(any(target_os = "linux", test))]
+    pub fn register(uid: Vec<u8>, present: bool, now: Instant) -> (Self, Effect) {
+        let (step, effect) = if present {
+            (Step::Registering, Effect::RunRegistration)
+        } else {
+            (Step::WaitingCard { since: now }, Effect::RequestTap)
+        };
+        (
+            Self {
+                uid,
+                step,
+                unpair: false,
+                register: true,
+            },
+            effect,
+        )
+    }
+
+    /// The pairing, unpairing or key registration finished.
     pub fn paired(&mut self, ok: bool, text: String) {
-        if matches!(self.step, Step::Pairing | Step::Unpairing) {
+        if matches!(
+            self.step,
+            Step::Pairing | Step::Unpairing | Step::Registering
+        ) {
             self.step = Step::Finished { ok, text };
         }
     }
@@ -158,7 +191,10 @@ impl CardTask {
                 None
             }
             Step::WaitingCard { .. } if present_uid == self.uid.as_slice() => {
-                if self.unpair {
+                if self.register {
+                    self.step = Step::Registering;
+                    Some(Effect::RunRegistration)
+                } else if self.unpair {
                     self.step = Step::Unpairing;
                     Some(Effect::RunUnpairing)
                 } else {
@@ -181,7 +217,10 @@ impl CardTask {
 
     /// Whether this step can be dismissed (nothing is running behind it).
     pub fn dismissable(&self) -> bool {
-        !matches!(self.step, Step::Pairing | Step::Unpairing)
+        !matches!(
+            self.step,
+            Step::Pairing | Step::Unpairing | Step::Registering
+        )
     }
 
     /// The status line under the card.
@@ -197,7 +236,20 @@ impl CardTask {
                 "Removing it from your {} login\u{2026}",
                 crate::login::OS_NAME
             ),
+            Step::Registering => "Registering with sudo and su\u{2026}".into(),
             Step::Finished { text, .. } => text.clone(),
+        }
+    }
+
+    /// A result with nothing running behind it (for a task finished without
+    /// a tap, like removing a key).
+    #[cfg(any(target_os = "linux", test))]
+    pub fn done(uid: Vec<u8>, ok: bool, text: String) -> Self {
+        Self {
+            uid,
+            step: Step::Finished { ok, text },
+            unpair: false,
+            register: false,
         }
     }
 
@@ -492,6 +544,40 @@ mod tests {
         assert_eq!(task.text(), "gone");
         let (task, effect) = CardTask::unpair(UID.to_vec(), true, now);
         assert_eq!((task.step, effect), (Step::Unpairing, Effect::RunUnpairing));
+    }
+
+    #[test]
+    fn register_waits_for_the_right_card_then_runs_once() {
+        let now = Instant::now();
+        let (mut task, effect) = CardTask::register(UID.to_vec(), false, now);
+        assert_eq!(effect, Effect::RequestTap);
+        assert_eq!(task.tick(now, true, &[4, 9, 9, 9]), None);
+        assert_eq!(task.tick(now, true, &UID), Some(Effect::RunRegistration));
+        assert!(!task.dismissable() && task.busy());
+        assert_eq!(task.tick(now, true, &UID), None);
+        task.paired(true, "ok".into());
+        assert_eq!(task.text(), "ok");
+        assert!(!task.busy() && !task.failed());
+        let (task, effect) = CardTask::register(UID.to_vec(), true, now);
+        assert_eq!(
+            (task.step, effect),
+            (Step::Registering, Effect::RunRegistration)
+        );
+    }
+
+    #[test]
+    fn register_gives_up_without_a_tap() {
+        let now = Instant::now();
+        let (mut task, _) = CardTask::register(UID.to_vec(), false, now);
+        task.tick(now + CARD_WAIT, true, &[]);
+        assert!(task.failed() && task.dismissable());
+    }
+
+    #[test]
+    fn a_task_finished_without_a_tap_shows_its_result() {
+        let task = CardTask::done(UID.to_vec(), false, "nope".into());
+        assert!(task.failed() && !task.busy() && task.dismissable());
+        assert_eq!(task.text(), "nope");
     }
 
     #[test]

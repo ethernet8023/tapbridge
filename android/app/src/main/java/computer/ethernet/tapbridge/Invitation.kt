@@ -28,8 +28,9 @@ object Invitation {
 
 /**
  * Process-wide pending invitation. Set by the UI, consumed on connect. The
- * secret-bearing text is cleared as soon as the connect worker takes it
- * (single consume); it never lingers past one connection attempt.
+ * connect worker moves it into the service's [PairingFlow.Pairing], which
+ * keeps it only while that pairing retries (or until "Try again"/Cancel
+ * after a failure) and drops it once the PC accepts the phone.
  */
 object PairingState {
     private val slot = arrayOfNulls<String>(1)
@@ -47,4 +48,7 @@ object PairingState {
     fun clear() {
         synchronized(slot) { slot[0] = null }
     }
+
+    /** A scanned invitation is waiting for the connect worker. */
+    fun hasPending(): Boolean = synchronized(slot) { slot[0] != null }
 }

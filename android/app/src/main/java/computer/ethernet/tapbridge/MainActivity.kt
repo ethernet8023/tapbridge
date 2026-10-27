@@ -55,6 +55,7 @@ import computer.ethernet.tapbridge.ui.CardsScreen
 import computer.ethernet.tapbridge.ui.LoginTarget
 import computer.ethernet.tapbridge.ui.PendingCard
 import computer.ethernet.tapbridge.ui.PairScreen
+import computer.ethernet.tapbridge.ui.PairingScreen
 import computer.ethernet.tapbridge.ui.PivPrompt
 import computer.ethernet.tapbridge.ui.PivSetupDialogs
 import computer.ethernet.tapbridge.ui.SettingsScreen
@@ -132,6 +133,10 @@ class MainActivity : ComponentActivity() {
         var usbPrompt by mutableStateOf<TapBridgeService.UsbPrompt?>(null)
         /** Why the USB link was refused or failed, shown once. */
         var usbNotice by mutableStateOf<String?>(null)
+        /** Host the latest network attempt dials; its home row shows that attempt. */
+        var dialingHost by mutableStateOf<String?>(null)
+        /** The QR pairing on the pairing screen; null when none. */
+        var pairing by mutableStateOf<PairingFlow.View?>(null)
     }
 
     /** A new card's PIV state, offered for setup once the card is named. */
@@ -159,6 +164,7 @@ class MainActivity : ComponentActivity() {
                     it.hostPlatform = if (connected) service?.hostPlatform ?: -1 else -1
                     it.hostPivLogin = connected && service?.hostPivLogin == true
                     it.viaUsb = connected && service?.viaUsb == true
+                    it.dialingHost = service?.dialingHost
                     if (!connected) it.loginBusy = null
                 }
             }
@@ -177,6 +183,9 @@ class MainActivity : ComponentActivity() {
         }
         override fun onUsbPairRequest(prompt: TapBridgeService.UsbPrompt?) {
             runOnUiThread { state?.usbPrompt = prompt }
+        }
+        override fun onPairing(pairing: PairingFlow.View?) {
+            runOnUiThread { state?.pairing = pairing }
         }
         override fun onUsbNotice(text: String) {
             runOnUiThread { state?.usbNotice = text }
@@ -211,6 +220,8 @@ class MainActivity : ComponentActivity() {
             state?.hostPivLogin = service?.takeIf { it.status == TapBridgeService.Status.CONNECTED }?.hostPivLogin == true
             state?.viaUsb = service?.takeIf { it.status == TapBridgeService.Status.CONNECTED }?.viaUsb == true
             state?.usbPrompt = service?.usbPrompt
+            state?.dialingHost = service?.dialingHost
+            state?.pairing = service?.pairingView
             deliverForwardedTag()
             if (resumed) service?.takePendingPivSetup()?.let { startHostPivSetup(it) }
         }
@@ -617,6 +628,27 @@ class MainActivity : ComponentActivity() {
         if (hasFocus && startDeferred) startTapService()
     }
 
+    /** Home screen: connect to this paired PC instead of the current one. */
+    internal fun connectTo(hostId: String) {
+        val i = Intent(this, TapBridgeService::class.java)
+            .setAction(TapBridgeService.ACTION_START)
+            .putExtra(TapBridgeService.EXTRA_HOST, hostId)
+        runCatching { if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i) }
+    }
+
+    /** Pairing screen: "Try again" with the same code. */
+    internal fun retryPairing() {
+        service?.retryPairing()
+        startTapService()
+    }
+
+    /** Pairing screen closed (Cancel, Done, back). */
+    internal fun endPairing() {
+        PairingState.clear()
+        service?.endPairing()
+        state?.pairing = null
+    }
+
     internal fun stopTapService() {
         startService(Intent(this, TapBridgeService::class.java).setAction(TapBridgeService.ACTION_STOP))
     }
@@ -745,6 +777,13 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
                 android.Manifest.permission.POST_NOTIFICATIONS,
             )
         }
+        // Stay on a progress screen until the PC really accepts the phone.
+        ui.pairing = null
+        screen = "pairing"
+    }
+    val closePairing: () -> Unit = {
+        activity.endPairing()
+        hosts = IdentityStore.pairedHosts(context)
         screen = "home"
     }
     ui.linkInvitation?.let { invitation ->
@@ -774,7 +813,13 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
     }
 
     // System back (and predictive back) returns to home from any sub-screen.
-    BackHandler(enabled = screen != "home") { screen = if (screen == "installer") "settings" else "home" }
+    BackHandler(enabled = screen != "home") {
+        when (screen) {
+            "installer" -> screen = "settings"
+            "pairing" -> closePairing()
+            else -> screen = "home"
+        }
+    }
 
     AnimatedContent(
         targetState = screen,
@@ -788,6 +833,12 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
         // stays inside them.
         Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
             when (route) {
+                "pairing" -> PairingScreen(
+                    pairing = ui.pairing,
+                    onRetry = { activity.retryPairing() },
+                    onClose = closePairing,
+                    Modifier.fillMaxSize(),
+                )
                 "pair" -> PairScreen(
                     onPaired = { pair(it) },
                     onBack = { screen = "home" },
@@ -850,6 +901,7 @@ private fun App(ui: MainActivity.UiState, activity: MainActivity) {
                 else -> HomeScreen(
                     ui = ui,
                     onStartPair = { screen = "pair" },
+                    onConnect = { hostId -> activity.connectTo(hostId) },
                     onKeys = { hosts = IdentityStore.pairedHosts(context); screen = "cards" },
                     // Pairing completes in the background after the scan,
                     // so read the list fresh each time Settings opens.
