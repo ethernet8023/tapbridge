@@ -48,13 +48,19 @@ in
 
   deps = { nixpkgs, ... }: lib.mapAttrs (_: lib.mkDefault) {
     inherit (nixpkgs)
-      stdenv pkg-config rustPlatform patchelf jq
+      stdenv pkg-config rustPlatform patchelf jq perl
       dbus udev openssl fontconfig freetype
       wayland libxkbcommon vulkan-loader libxcb libx11 libxcursor libxi libxrandr;
   };
 
   # The workspace tests need a network and pcscd: CI and the NixOS VM test run them.
   rust-crane.runTests = false;
+  # crane (v0.19, pinned by dream2nix) strips references to the vendored
+  # crate sources with ONE GNU sed whose regex alternates a few hundred
+  # store hashes; over the release binary that gets OOM-killed on CI
+  # ("xargs: sed: terminated by signal 9"). postInstall does the same
+  # rewrite with perl, which handles the alternation in bounded memory.
+  package-func.args.doNotRemoveReferencesToVendorDir = true;
   rust-crane.depsDrv.mkDerivation = toolchain;
   rust-crane.depsDrv.package-func.args.extraDummyScript = ''
     rm -rf $out/third_party/gpui-glass/vendor/gpui-ce
@@ -64,7 +70,7 @@ in
 
   mkDerivation = toolchain // {
     inherit src;
-    nativeBuildInputs = toolchain.nativeBuildInputs ++ [ config.deps.patchelf ];
+    nativeBuildInputs = toolchain.nativeBuildInputs ++ [ config.deps.patchelf config.deps.perl ];
 
     postBuild = ''
       bash crates/desktop/ifd_shim/build.sh
@@ -78,6 +84,21 @@ in
         install -Dm644 crates/desktop/assets/icons/app-$size.png \
           $out/share/icons/hicolor/''${size}x''${size}/apps/tapbridge.png
       done
+
+      # crane's removeReferencesToVendoredSources (see doNotRemove... above),
+      # same targets and replacement: the vendor dir and every crate source
+      # it links to, rewritten to an all-e hash so the closure keeps none.
+      hashes=$(
+        { echo "$cargoVendorDir"
+          find -L "$cargoVendorDir" -mindepth 1 -maxdepth 1 -type d -print0 |
+            xargs -0 -I DIR find -H DIR -type l -exec readlink '{}' \;
+        } | grep -o "$NIX_STORE/[a-z0-9]\{32\}" | sed "s|^$NIX_STORE/||" | sort -u | paste -sd'|' -
+      )
+      if [ -n "$hashes" ]; then
+        echo "stripping references to $(echo "$hashes" | tr '|' '\n' | wc -l) vendored sources"
+        find "$out" -type f -print0 |
+          xargs -0 perl -0777 -pi -e "s!\Q$NIX_STORE\E/(?:$hashes)!$NIX_STORE/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee!g"
+      fi
     '';
 
     # After the fixup phase's RPATH shrink, which drops every entry the binary
